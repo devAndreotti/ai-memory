@@ -22,6 +22,14 @@ pub(crate) async fn handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let page_count = pages.len();
+    let last_updated_relative = pages
+        .iter()
+        .map(|p| p.updated_at.as_str())
+        .max()
+        .map(humanize)
+        .unwrap_or_default();
+
     // Build sidebar folder tree (group by first path segment).
     let mut folder_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
     for p in &pages {
@@ -48,8 +56,16 @@ pub(crate) async fn handler(
     }
     let folders: Vec<Folder> = folder_map
         .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
+        .map(|(name, pages)| {
+            let page_count_label = pages.len().to_string();
+            Folder {
+                name,
+                page_count_label,
+                pages,
+            }
+        })
         .collect();
+    let folder_count = folders.len();
 
     // Recent pages: sort by updated_at desc, take 20.
     let mut sorted = pages.clone();
@@ -69,6 +85,9 @@ pub(crate) async fn handler(
     let html = ProjectView {
         workspace,
         project,
+        page_count_label: page_count.to_string(),
+        folder_count_label: folder_count.to_string(),
+        last_updated_relative,
         folders,
         recent,
     }

@@ -150,6 +150,8 @@ pub(crate) struct PageRow {
 pub(crate) struct Folder {
     /// Folder name (first path segment, without trailing slash).
     pub name: String,
+    /// Number of pages in this folder as display text.
+    pub page_count_label: String,
     /// Pages inside this folder.
     pub pages: Vec<PageRow>,
 }
@@ -162,6 +164,12 @@ pub(crate) struct ProjectView {
     pub workspace: String,
     /// Project name.
     pub project: String,
+    /// Total latest-page count as display text.
+    pub page_count_label: String,
+    /// Folder count as display text.
+    pub folder_count_label: String,
+    /// Humanised timestamp for the most recent page update, or empty string.
+    pub last_updated_relative: String,
     /// Sidebar folder tree.
     pub folders: Vec<Folder>,
     /// N most-recent pages for the right column.
