@@ -118,6 +118,14 @@ pub(crate) struct ProjectCard {
 pub(crate) struct ProjectsView {
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
+    /// Total project count as display text.
+    pub project_count_label: String,
+    /// Total latest-page count as display text.
+    pub page_count_label: String,
+    /// Number of projects with at least one page as display text.
+    pub active_project_count_label: String,
+    /// Humanised timestamp for the most recent project update, or empty string.
+    pub last_updated_relative: String,
 }
 
 // ---------------------------------------------------------------------------
