@@ -751,7 +751,8 @@ fn hook_command(
             if let Some(s) = context.project_strategy {
                 prefix.push_str(&format!("AI_MEMORY_PROJECT_STRATEGY={} ", shell_quote(s)));
             }
-            format!("{prefix}{}", shell_quote(&script.to_string_lossy()))
+            let script_path = script.to_string_lossy().replace('\\', "/");
+            format!("{prefix}{}", shell_quote(&script_path))
         }
         HookCommandPlatform::Windows => {
             let mut setup = format!("$env:AI_MEMORY_HOOK_URL={}", powershell_quote(server_url));
@@ -1500,7 +1501,10 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        let expected = root.join("session-start.sh").to_string_lossy().to_string();
+        let expected = root
+            .join("session-start.sh")
+            .to_string_lossy()
+            .replace('\\', "/");
         assert!(
             cmd.contains(&expected),
             "command should contain the absolute script path: {cmd}"
