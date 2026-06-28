@@ -31,6 +31,7 @@ import { SearchExplorer } from "./components/SearchExplorer";
 import {
   getProjectBriefing,
   getProjectGraph,
+  getMemoryHealth,
   listApiScenarios,
   listDriftIssues,
   listPages,
@@ -39,10 +40,10 @@ import {
   readPage,
   searchMemory,
 } from "./lib/api-contract";
-import { health, pages as mockPages } from "./mocks/memory";
 import type {
   ApiScenario,
   BriefingSnapshot,
+  MemoryHealth,
   MemoryDriftIssue,
   PageHit,
   PageSummary,
@@ -66,7 +67,9 @@ export default function App() {
   const [query, setQuery] = useState("paytime");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [briefing, setBriefing] = useState<BriefingSnapshot | null>(null);
+  const [memoryHealth, setMemoryHealth] = useState<MemoryHealth | null>(null);
   const [projectPages, setProjectPages] = useState<PageSummary[]>([]);
+  const [pagesByProject, setPagesByProject] = useState<Record<string, PageSummary[]>>({});
   const [hits, setHits] = useState<PageHit[]>([]);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [page, setPage] = useState<ReaderPage | null>(null);
@@ -90,21 +93,28 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    Promise.all([
-      listProjects(),
-      getProjectBriefing(),
-      listPages(selectedProject),
-      readPage(selectedProject, selectedPagePath || undefined),
-      searchMemory(query),
-      listSearchResults(query),
-      listApiScenarios(),
-      getProjectGraph(),
-      listDriftIssues(),
-    ]).then(([projectResp, briefingResp, pagesResp, pageResp, searchResp, searchResultsResp, scenarioResp, graphResp, driftResp]) => {
+    async function load() {
+      const [projectResp, briefingResp, healthResp, pageResp, searchResp, searchResultsResp, scenarioResp, graphResp, driftResp] = await Promise.all([
+        listProjects(),
+        getProjectBriefing(),
+        getMemoryHealth(),
+        readPage(selectedProject, selectedPagePath || undefined),
+        searchMemory(query),
+        listSearchResults(query),
+        listApiScenarios(),
+        getProjectGraph(),
+        listDriftIssues(),
+      ]);
+      const pageEntries = await Promise.all(
+        projectResp.projects.map(async (project) => [project.project_name, (await listPages(project.project_name)).pages] as const),
+      );
       if (!alive) return;
+      const nextPagesByProject = Object.fromEntries(pageEntries);
       setProjects(projectResp.projects);
       setBriefing(briefingResp);
-      setProjectPages(pagesResp.pages);
+      setMemoryHealth(healthResp);
+      setProjectPages(nextPagesByProject[selectedProject] ?? []);
+      setPagesByProject(nextPagesByProject);
       setPage(pageResp);
       setHits(searchResp.hits);
       setSearchResults(searchResultsResp.results);
@@ -112,6 +122,9 @@ export default function App() {
       setGraphEdges(graphResp.edges);
       setDriftIssues(driftResp.issues);
       setLoading(false);
+    }
+    load().catch(() => {
+      if (alive) setLoading(false);
     });
     return () => {
       alive = false;
@@ -120,7 +133,7 @@ export default function App() {
 
   const openProject = (projectName: string) => {
     setSelectedProject(projectName);
-    setSelectedPagePath(mockPages[projectName]?.[0]?.path ?? "");
+    setSelectedPagePath(pagesByProject[projectName]?.[0]?.path ?? "");
     setView("project");
   };
 
@@ -141,7 +154,7 @@ export default function App() {
   const openEmptyProject = () => openProject("scriply-old-746d84d");
 
   const projectForPath = (path: string) => {
-    return Object.entries(mockPages).find(([, pages]) => pages.some((page) => page.path === path))?.[0] ?? selectedProject;
+    return Object.entries(pagesByProject).find(([, pages]) => pages.some((page) => page.path === path))?.[0] ?? selectedProject;
   };
 
   const togglePinnedProject = (projectName: string) => {
@@ -161,7 +174,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <CommandPalette open={paletteOpen} projects={projects} pagesByProject={mockPages} hits={hits} onOpenChange={setPaletteOpen} onNavigate={navigateFromPalette} />
+      <CommandPalette open={paletteOpen} projects={projects} pagesByProject={pagesByProject} hits={hits} onOpenChange={setPaletteOpen} onNavigate={navigateFromPalette} />
 
       <aside className="sidebar" aria-label="Workspace navigation">
         <button className="brand" type="button" onClick={() => setView("home")} title="Home">
@@ -237,6 +250,7 @@ export default function App() {
         {!loading && view === "home" && briefing && (
           <HomeView
             briefing={briefing}
+            health={memoryHealth}
             projects={projects}
             pinnedProjectNames={pinnedProjectNames}
             onOpenProject={openProject}
@@ -295,6 +309,7 @@ export default function App() {
 
 function HomeView({
   briefing,
+  health,
   projects,
   pinnedProjectNames,
   onOpenProject,
@@ -303,6 +318,7 @@ function HomeView({
   onTogglePinnedProject,
 }: {
   briefing: BriefingSnapshot;
+  health: MemoryHealth | null;
   projects: ProjectSummary[];
   pinnedProjectNames: string[];
   onOpenProject: (project: string) => void;
@@ -363,9 +379,9 @@ function HomeView({
       <aside className="side-rail">
         <Panel title="Memory quality" icon={Gauge}>
           <div className="quality-grid">
-            <QualityCell label="Stale" value={health.stale_count} />
-            <QualityCell label="Duplicate" value={health.duplicate_count} />
-            <QualityCell label="Orphan" value={health.orphan_count} />
+            <QualityCell label="Stale" value={health?.stale_count ?? 0} />
+            <QualityCell label="Duplicate" value={health?.duplicate_count ?? 0} />
+            <QualityCell label="Orphan" value={health?.orphan_count ?? 0} />
           </div>
         </Panel>
         <Panel title="Recent memory" icon={Clock3}>

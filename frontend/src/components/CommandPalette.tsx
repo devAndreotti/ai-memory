@@ -31,8 +31,36 @@ export function CommandPalette({ open, projects, pagesByProject, hits, onOpenCha
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pendingEnterQuery = useRef<string | null>(null);
   const items = buildItems(projects, pagesByProject, hits);
+  const latestState = useRef({ activeIndex: 0, items, query: "" });
   const filtered = filterItems(items, query).slice(0, 12);
+
+  const selectActive = (queryOverride = query) => {
+    const currentFiltered = filterItems(latestState.current.items, queryOverride).slice(0, 12);
+    const item = currentFiltered[latestState.current.activeIndex] ?? currentFiltered[0];
+    if (!item) {
+      pendingEnterQuery.current = queryOverride.trim() ? queryOverride : null;
+      return;
+    }
+    pendingEnterQuery.current = null;
+    onNavigate(item.target);
+    onOpenChange(false);
+  };
+
+  useEffect(() => {
+    latestState.current = { activeIndex, items, query };
+  }, [activeIndex, items, query]);
+
+  useEffect(() => {
+    if (!open || !pendingEnterQuery.current) return;
+    const currentFiltered = filterItems(items, pendingEnterQuery.current).slice(0, 12);
+    const item = currentFiltered[activeIndex] ?? currentFiltered[0];
+    if (!item) return;
+    pendingEnterQuery.current = null;
+    onNavigate(item.target);
+    onOpenChange(false);
+  }, [activeIndex, items, onNavigate, onOpenChange, open]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -56,14 +84,18 @@ export function CommandPalette({ open, projects, pagesByProject, hits, onOpenCha
     setActiveIndex(0);
   }, [query]);
 
-  if (!open) return null;
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Enter" || event.defaultPrevented) return;
+      event.preventDefault();
+      selectActive(inputRef.current?.value ?? latestState.current.query);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open]);
 
-  const selectActive = () => {
-    const item = filtered[activeIndex];
-    if (!item) return;
-    onNavigate(item.target);
-    onOpenChange(false);
-  };
+  if (!open) return null;
 
   return (
     <div className="palette-backdrop" role="presentation" onMouseDown={() => onOpenChange(false)}>
@@ -88,7 +120,7 @@ export function CommandPalette({ open, projects, pagesByProject, hits, onOpenCha
               }
               if (event.key === "Enter") {
                 event.preventDefault();
-                selectActive();
+                selectActive(event.currentTarget.value);
               }
             }}
           />
