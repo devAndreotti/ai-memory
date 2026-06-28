@@ -1,0 +1,624 @@
+import {
+  AlertTriangle,
+  ArrowLeft,
+  BookOpenText,
+  Boxes,
+  Clock3,
+  Command,
+  Database,
+  FileText,
+  Gauge,
+  GitBranch,
+  History,
+  Loader2,
+  LucideIcon,
+  Network,
+  Pin,
+  PinOff,
+  Search,
+  ShieldAlert,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import { ApiStatePanels } from "./components/ApiStatePanels";
+import { CommandPalette, type PaletteTarget } from "./components/CommandPalette";
+import { DriftAudit } from "./components/DriftAudit";
+import { ProjectGraph } from "./components/ProjectGraph";
+import { headingId, ReaderEnhancements } from "./components/ReaderEnhancements";
+import { ReaderAgentView, ReaderModeSwitch, type ReaderMode } from "./components/ReaderModeSwitch";
+import { SearchExplorer } from "./components/SearchExplorer";
+import {
+  getProjectBriefing,
+  getProjectGraph,
+  listApiScenarios,
+  listDriftIssues,
+  listPages,
+  listProjects,
+  listSearchResults,
+  readPage,
+  searchMemory,
+} from "./lib/api-contract";
+import { health, pages as mockPages } from "./mocks/memory";
+import type {
+  ApiScenario,
+  BriefingSnapshot,
+  MemoryDriftIssue,
+  PageHit,
+  PageSummary,
+  ProjectGraphEdge,
+  ProjectSummary,
+  ReaderLink,
+  ReaderPage,
+  SearchResult,
+  View,
+} from "./types";
+
+const primaryProject = "onemob-app";
+const primaryPage = "notes/paytime-integration.md";
+const pinnedStorageKey = "ai-memory:pinned-projects";
+const defaultPinnedProjects = ["onemob-app", "feed-dispatch", "quality-gate", "orbitaly"];
+
+export default function App() {
+  const [view, setView] = useState<View>("home");
+  const [selectedProject, setSelectedProject] = useState(primaryProject);
+  const [selectedPagePath, setSelectedPagePath] = useState(primaryPage);
+  const [query, setQuery] = useState("paytime");
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [briefing, setBriefing] = useState<BriefingSnapshot | null>(null);
+  const [projectPages, setProjectPages] = useState<PageSummary[]>([]);
+  const [hits, setHits] = useState<PageHit[]>([]);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [page, setPage] = useState<ReaderPage | null>(null);
+  const [scenarios, setScenarios] = useState<ApiScenario[]>([]);
+  const [activeScenarioId, setActiveScenarioId] = useState("401-auth");
+  const [graphEdges, setGraphEdges] = useState<ProjectGraphEdge[]>([]);
+  const [driftIssues, setDriftIssues] = useState<MemoryDriftIssue[]>([]);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [pinnedProjectNames, setPinnedProjectNames] = useState<string[]>(() => {
+    const saved = window.localStorage.getItem(pinnedStorageKey);
+    if (!saved) return defaultPinnedProjects;
+    try {
+      const parsed = JSON.parse(saved);
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : defaultPinnedProjects;
+    } catch {
+      return defaultPinnedProjects;
+    }
+  });
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    Promise.all([
+      listProjects(),
+      getProjectBriefing(),
+      listPages(selectedProject),
+      readPage(selectedProject, selectedPagePath || undefined),
+      searchMemory(query),
+      listSearchResults(query),
+      listApiScenarios(),
+      getProjectGraph(),
+      listDriftIssues(),
+    ]).then(([projectResp, briefingResp, pagesResp, pageResp, searchResp, searchResultsResp, scenarioResp, graphResp, driftResp]) => {
+      if (!alive) return;
+      setProjects(projectResp.projects);
+      setBriefing(briefingResp);
+      setProjectPages(pagesResp.pages);
+      setPage(pageResp);
+      setHits(searchResp.hits);
+      setSearchResults(searchResultsResp.results);
+      setScenarios(scenarioResp.scenarios);
+      setGraphEdges(graphResp.edges);
+      setDriftIssues(driftResp.issues);
+      setLoading(false);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [selectedProject, selectedPagePath, query]);
+
+  const openProject = (projectName: string) => {
+    setSelectedProject(projectName);
+    setSelectedPagePath(mockPages[projectName]?.[0]?.path ?? "");
+    setView("project");
+  };
+
+  const openPage = (projectName = selectedProject, path = selectedPagePath || primaryPage) => {
+    setSelectedProject(projectName);
+    setSelectedPagePath(path);
+    setView("page");
+  };
+
+  const openReaderLink = (link: ReaderLink) => openPage(link.project, link.path);
+
+  const openMissingPage = () => {
+    setSelectedProject(primaryProject);
+    setSelectedPagePath("notes/callback-contract.md");
+    setView("page");
+  };
+
+  const openEmptyProject = () => openProject("scriply-old-746d84d");
+
+  const projectForPath = (path: string) => {
+    return Object.entries(mockPages).find(([, pages]) => pages.some((page) => page.path === path))?.[0] ?? selectedProject;
+  };
+
+  const togglePinnedProject = (projectName: string) => {
+    setPinnedProjectNames((current) => {
+      const next = current.includes(projectName) ? current.filter((item) => item !== projectName) : [projectName, ...current];
+      window.localStorage.setItem(pinnedStorageKey, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const navigateFromPalette = (target: PaletteTarget) => {
+    if (target.query) setQuery(target.query);
+    if (target.view === "project" && target.project) return openProject(target.project);
+    if (target.view === "page") return openPage(target.project ?? selectedProject, target.path ?? selectedPagePath);
+    setView(target.view);
+  };
+
+  return (
+    <div className="app-shell">
+      <CommandPalette open={paletteOpen} projects={projects} pagesByProject={mockPages} hits={hits} onOpenChange={setPaletteOpen} onNavigate={navigateFromPalette} />
+
+      <aside className="sidebar" aria-label="Workspace navigation">
+        <button className="brand" type="button" onClick={() => setView("home")} title="Home">
+          <span className="brand-mark">
+            <Sparkles size={18} />
+          </span>
+          <span>
+            <strong>ai-memory</strong>
+            <small>read-only cockpit</small>
+          </span>
+        </button>
+
+        <nav className="nav-stack">
+          <NavButton active={view === "home"} icon={Boxes} label="Projects" onClick={() => setView("home")} />
+          <NavButton active={view === "search"} icon={Search} label="Search" onClick={() => setView("search")} />
+          <NavButton active={view === "page"} icon={BookOpenText} label="Reader" onClick={() => setView("page")} />
+          <NavButton active={view === "graph"} icon={Network} label="Graph" onClick={() => setView("graph")} />
+          <NavButton active={view === "states"} icon={Gauge} label="States" onClick={() => setView("states")} />
+          <NavButton active={view === "audit"} icon={ShieldAlert} label="Audit" onClick={() => setView("audit")} />
+        </nav>
+
+        <div className="sidebar-section">
+          <div className="sidebar-label">Pinned projects</div>
+          {projects.filter((project) => pinnedProjectNames.includes(project.project_name)).length === 0 ? (
+            <div className="empty-note">No pinned projects.</div>
+          ) : (
+            projects
+              .filter((project) => pinnedProjectNames.includes(project.project_name))
+              .map((project) => (
+                <div className={`project-pill ${selectedProject === project.project_name ? "is-selected" : ""}`} key={project.project_name}>
+                  <button className="project-pill-main" type="button" onClick={() => openProject(project.project_name)}>
+                    <span className={`dot dot-${project.accent}`} />
+                    <span>{project.project_name}</span>
+                    <small>{project.page_count}</small>
+                  </button>
+                  <button className="pin-toggle" type="button" title={`Unpin ${project.project_name}`} onClick={() => togglePinnedProject(project.project_name)}>
+                    <PinOff size={14} />
+                  </button>
+                </div>
+              ))
+          )}
+        </div>
+
+        <div className="sidebar-footer">
+          <span>default</span>
+          <strong>{projects.length || 0} projects</strong>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="topbar">
+          <div>
+            <p className="section-kicker">default workspace</p>
+            <h1>{titleFor(view, selectedProject)}</h1>
+          </div>
+          <form
+            className="command-bar"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setView("search");
+            }}
+          >
+            <Search size={18} />
+            <input aria-label="Search memory" value={query} onChange={(event) => setQuery(event.target.value)} />
+            <button type="button" title="Open command palette" onClick={() => setPaletteOpen(true)}>
+              <Command size={16} />
+            </button>
+          </form>
+        </header>
+
+        {loading && <LoadingOverlay />}
+
+        {!loading && view === "home" && briefing && (
+          <HomeView
+            briefing={briefing}
+            projects={projects}
+            pinnedProjectNames={pinnedProjectNames}
+            onOpenProject={openProject}
+            onOpenPage={(item) => openPage(projectForPath(item.path), item.path)}
+            onOpenGraph={() => setView("graph")}
+            onTogglePinnedProject={togglePinnedProject}
+          />
+        )}
+
+        {!loading && view === "project" && (
+          <ProjectView
+            project={projects.find((item) => item.project_name === selectedProject)}
+            pages={projectPages}
+            pinned={pinnedProjectNames.includes(selectedProject)}
+            onBack={() => setView("home")}
+            onOpenPage={(item) => openPage(selectedProject, item.path)}
+            onTogglePinned={() => togglePinnedProject(selectedProject)}
+          />
+        )}
+
+        {!loading && view === "page" && page && <PageReader page={page} onBack={() => setView("project")} onOpenLink={openReaderLink} />}
+
+        {!loading && view === "search" && (
+          <SearchExplorer
+            query={query}
+            results={searchResults}
+            onOpenProject={openProject}
+            onOpenResult={(result) => openPage(result.project, result.path ?? selectedPagePath)}
+          />
+        )}
+
+        {!loading && view === "states" && (
+          <ApiStatePanels
+            scenarios={scenarios}
+            activeId={activeScenarioId}
+            onSelect={(scenario) => setActiveScenarioId(scenario.id)}
+            onOpenMissingPage={openMissingPage}
+            onOpenEmptyProject={openEmptyProject}
+          />
+        )}
+
+        {!loading && view === "graph" && <ProjectGraph projects={projects} edges={graphEdges} onOpenProject={openProject} />}
+
+        {!loading && view === "audit" && (
+          <DriftAudit
+            issues={driftIssues}
+            onOpenMissingPage={openMissingPage}
+            onOpenProject={openProject}
+            onOpenPage={(project, path) => openPage(project, path)}
+          />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function HomeView({
+  briefing,
+  projects,
+  pinnedProjectNames,
+  onOpenProject,
+  onOpenPage,
+  onOpenGraph,
+  onTogglePinnedProject,
+}: {
+  briefing: BriefingSnapshot;
+  projects: ProjectSummary[];
+  pinnedProjectNames: string[];
+  onOpenProject: (project: string) => void;
+  onOpenPage: (page: PageSummary) => void;
+  onOpenGraph: () => void;
+  onTogglePinnedProject: (project: string) => void;
+}) {
+  return (
+    <div className="dashboard-grid">
+      <section className="metrics-strip" aria-label="Memory metrics">
+        <Metric icon={FileText} label="Latest pages" value={briefing.counts.pages_latest.toString()} tone="cyan" />
+        <Metric icon={History} label="Sessions" value={briefing.counts.sessions.toString()} tone="amber" />
+        <Metric icon={Database} label="Observations" value={briefing.counts.observations.toString()} tone="green" />
+        <Metric icon={ShieldCheck} label="Open handoffs" value={briefing.pending_handoff_count.toString()} tone="rose" />
+      </section>
+
+      <section className="project-wall">
+        <div className="section-head">
+          <div>
+            <p className="section-kicker">project map</p>
+            <h2>Memory buckets</h2>
+          </div>
+          <button className="small-action" type="button" onClick={onOpenGraph}>
+            <Network size={15} />
+            Open graph
+          </button>
+        </div>
+        <div className="project-grid">
+          {projects.map((project) => (
+            <article
+              className={`project-card accent-${project.accent}`}
+              key={project.project_name}
+            >
+              <div className="project-card-top">
+                <small>{project.workspace_name}</small>
+                <button
+                  className={`pin-toggle ${pinnedProjectNames.includes(project.project_name) ? "is-pinned" : ""}`}
+                  type="button"
+                  title={`${pinnedProjectNames.includes(project.project_name) ? "Unpin" : "Pin"} ${project.project_name}`}
+                  onClick={() => onTogglePinnedProject(project.project_name)}
+                >
+                  {pinnedProjectNames.includes(project.project_name) ? <PinOff size={15} /> : <Pin size={15} />}
+                </button>
+              </div>
+              <button className="project-card-main" type="button" onClick={() => onOpenProject(project.project_name)}>
+                <strong>{project.project_name}</strong>
+                <span className="project-meta">
+                  <span>{project.page_count} pages</span>
+                  <span>{project.activity}</span>
+                </span>
+                <span className="activity-line" />
+              </button>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <aside className="side-rail">
+        <Panel title="Memory quality" icon={Gauge}>
+          <div className="quality-grid">
+            <QualityCell label="Stale" value={health.stale_count} />
+            <QualityCell label="Duplicate" value={health.duplicate_count} />
+            <QualityCell label="Orphan" value={health.orphan_count} />
+          </div>
+        </Panel>
+        <Panel title="Recent memory" icon={Clock3}>
+          <div className="timeline">
+            {briefing.recent_pages.map((item) => (
+              <button className="timeline-item" key={item.path} type="button" onClick={() => onOpenPage(item)}>
+                <span className={`kind-chip kind-${item.kind}`}>{item.kind}</span>
+                <strong>{item.title}</strong>
+                <small>{item.path}</small>
+              </button>
+            ))}
+          </div>
+        </Panel>
+        <Panel title="Rules" icon={ShieldCheck}>
+          <div className="rule-stack">
+            {briefing.rules.map((item) => (
+              <button className="rule-row" key={item.path} type="button" onClick={() => onOpenPage(item)}>
+                <GitBranch size={15} />
+                <span>{item.title}</span>
+              </button>
+            ))}
+          </div>
+        </Panel>
+      </aside>
+    </div>
+  );
+}
+
+function ProjectView({
+  project,
+  pages,
+  pinned,
+  onBack,
+  onOpenPage,
+  onTogglePinned,
+}: {
+  project?: ProjectSummary;
+  pages: PageSummary[];
+  pinned: boolean;
+  onBack: () => void;
+  onOpenPage: (page: PageSummary) => void;
+  onTogglePinned: () => void;
+}) {
+  if (!project) {
+    return <StatePanel icon={AlertTriangle} title="Project missing" body="This mock project is not present in the current fixture." tone="error" />;
+  }
+
+  return (
+    <div className="content-flow">
+      <button className="text-command" type="button" onClick={onBack}>
+        <ArrowLeft size={16} />
+        Projects
+      </button>
+      <section className="project-hero">
+        <div>
+          <p className="section-kicker">{project.workspace_name}</p>
+          <h2>{project.project_name}</h2>
+        </div>
+        <div className="project-hero-metrics">
+          <button className={`small-action pin-action ${pinned ? "is-pinned" : ""}`} type="button" onClick={onTogglePinned}>
+            {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+            {pinned ? "Unpin" : "Pin"}
+          </button>
+          <Metric icon={FileText} label="Pages" value={project.page_count.toString()} tone={project.accent} />
+          <Metric icon={Clock3} label="Activity" value={project.activity} tone="amber" />
+        </div>
+      </section>
+      <section className="table-panel">
+        <div className="section-head">
+          <div>
+            <p className="section-kicker">latest pages</p>
+            <h2>Project index</h2>
+          </div>
+          <span>{pages.length} rows</span>
+        </div>
+        <div className="page-table" role="table" aria-label="Project pages">
+          <div className="page-row table-head" role="row">
+            <span>Title</span>
+            <span>Kind</span>
+            <span>Tier</span>
+            <span>Path</span>
+          </div>
+          {pages.length === 0 ? (
+            <StatePanel icon={FileText} title="Empty project" body="Project exists, but no latest pages are indexed yet." tone="empty" />
+          ) : (
+            pages.map((item) => (
+              <button className="page-row" key={item.path} type="button" role="row" onClick={() => onOpenPage(item)}>
+                <strong>{item.title}</strong>
+                <span className={`kind-chip kind-${item.kind}`}>{item.kind}</span>
+                <span>{item.tier}</span>
+                <code>{item.path}</code>
+              </button>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PageReader({ page, onBack, onOpenLink }: { page: ReaderPage; onBack: () => void; onOpenLink: (link: ReaderLink) => void }) {
+  const [mode, setMode] = useState<ReaderMode>("human");
+  return (
+    <div className={`reader-layout ${page.missing ? "is-missing" : ""}`}>
+      <article className="reader">
+        <button className="text-command" type="button" onClick={onBack}>
+          <ArrowLeft size={16} />
+          Project
+        </button>
+        {page.missing && <StatePanel icon={AlertTriangle} title="Page missing on disk" body="Index found this path, but mock disk read returned 404." tone="error" />}
+        <div className="reader-head">
+          <div>
+            <p className="section-kicker">{page.project}</p>
+            <div className="reader-title-line">
+              <h2>{page.title}</h2>
+              <span className={`kind-chip reader-kind-chip kind-${page.kind}`}>{page.kind}</span>
+            </div>
+            <code>{page.path}</code>
+          </div>
+          <ReaderModeSwitch mode={mode} onChange={setMode} />
+        </div>
+        {mode === "agent" ? <ReaderAgentView page={page} onOpenLink={onOpenLink} /> : <Markdown body={page.body} onOpenLink={onOpenLink} />}
+      </article>
+      <ReaderEnhancements page={page} onOpenLink={onOpenLink} />
+    </div>
+  );
+}
+
+function NavButton({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`nav-button ${active ? "is-active" : ""}`} type="button" onClick={onClick}>
+      <Icon size={17} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function Metric({ icon: Icon, label, value, tone }: { icon: LucideIcon; label: string; value: string; tone: string }) {
+  return (
+    <div className={`metric tone-${tone}`}>
+      <Icon size={18} />
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function Panel({ title, icon: Icon, children }: { title: string; icon: LucideIcon; children: React.ReactNode }) {
+  return (
+    <section className="panel">
+      <div className="panel-title">
+        <Icon size={16} />
+        <h3>{title}</h3>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function QualityCell({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="quality-cell">
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function StatePanel({ icon: Icon, title, body, tone }: { icon: LucideIcon; title: string; body: string; tone: string }) {
+  return (
+    <section className={`state-panel state-${tone}`}>
+      <Icon size={24} />
+      <strong>{title}</strong>
+      <span>{body}</span>
+    </section>
+  );
+}
+
+function LoadingOverlay() {
+  return (
+    <div className="loading-shell">
+      <Loader2 size={24} />
+      <span>Loading memory cockpit</span>
+    </div>
+  );
+}
+
+function Markdown({ body, onOpenLink }: { body: string; onOpenLink: (link: ReaderLink) => void }) {
+  return (
+    <div className="markdown">
+      {body.split("\n").map((line, index) => {
+        if (line.startsWith("# ")) return <h1 key={index}>{line.slice(2)}</h1>;
+        if (line.startsWith("## ")) {
+          const text = line.slice(3);
+          return (
+            <h2 id={headingId(text)} key={index}>
+              {text}
+            </h2>
+          );
+        }
+        if (line.startsWith("- ")) {
+          return (
+            <p className="markdown-list-item" key={index}>
+              {renderInline(line.slice(2), onOpenLink)}
+            </p>
+          );
+        }
+        if (!line.trim()) return <br key={index} />;
+        return <p key={index}>{renderInline(line, onOpenLink)}</p>;
+      })}
+    </div>
+  );
+}
+
+function renderInline(text: string, onOpenLink: (link: ReaderLink) => void) {
+  const parts: React.ReactNode[] = [];
+  const pattern = /\[\[([^/\]]+)\/([^\]|]+)(?:\|([^\]]+))?\]\]/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text))) {
+    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    const project = match[1];
+    const path = match[2];
+    const label = match[3] ?? `${project}/${path}`;
+    parts.push(
+      <button className="inline-wikilink" key={`${match.index}-${project}-${path}`} type="button" onClick={() => onOpenLink({ label, project, path, status: "resolved" })}>
+        {label}
+      </button>,
+    );
+    lastIndex = pattern.lastIndex;
+  }
+
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts.length ? parts : text;
+}
+
+function titleFor(view: View, project: string) {
+  if (view === "project") return project;
+  if (view === "page") return "Page reader";
+  if (view === "search") return "Search memory";
+  if (view === "states") return "System states";
+  if (view === "graph") return "Project graph";
+  if (view === "audit") return "Memory audit";
+  return "Projects";
+}
