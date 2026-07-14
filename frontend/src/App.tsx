@@ -28,6 +28,7 @@ import { headingId, ReaderEnhancements } from "./components/ReaderEnhancements";
 import { ReaderAgentView, ReaderModeSwitch, type ReaderMode } from "./components/ReaderModeSwitch";
 import { SearchExplorer } from "./components/SearchExplorer";
 import {
+  getHandoff,
   getProjectBriefing,
   getProjectGraph,
   getMemoryHealth,
@@ -40,6 +41,7 @@ import {
 } from "./lib/api-contract";
 import type {
   BriefingSnapshot,
+  Handoff,
   MemoryHealth,
   MemoryDriftIssue,
   PageHit,
@@ -68,6 +70,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [briefing, setBriefing] = useState<BriefingSnapshot | null>(null);
+  const [handoff, setHandoff] = useState<Handoff | null>(null);
   const [memoryHealth, setMemoryHealth] = useState<MemoryHealth | null>(null);
   const [projectPages, setProjectPages] = useState<PageSummary[]>([]);
   const [pagesByProject, setPagesByProject] = useState<Record<string, PageSummary[]>>({});
@@ -93,9 +96,10 @@ export default function App() {
     let alive = true;
     setLoading(true);
     async function load() {
-      const [projectResp, briefingResp, healthResp, pageResp, searchResp, searchResultsResp, graphResp, driftResp] = await Promise.all([
+      const [projectResp, briefingResp, handoffResp, healthResp, pageResp, searchResp, searchResultsResp, graphResp, driftResp] = await Promise.all([
         listProjects(),
         getProjectBriefing(),
+        getHandoff(),
         getMemoryHealth(),
         readPage(selectedProject, selectedPagePath || undefined),
         searchMemory(query),
@@ -110,6 +114,7 @@ export default function App() {
       const nextPagesByProject = Object.fromEntries(pageEntries);
       setProjects(projectResp.projects);
       setBriefing(briefingResp);
+      setHandoff(handoffResp);
       setMemoryHealth(healthResp);
       setProjectPages(nextPagesByProject[selectedProject] ?? []);
       setPagesByProject(nextPagesByProject);
@@ -248,6 +253,7 @@ export default function App() {
         {!loading && view === "home" && briefing && (
           <HomeView
             briefing={briefing}
+            handoff={handoff}
             health={memoryHealth}
             projects={projects}
             pinnedProjectNames={pinnedProjectNames}
@@ -303,6 +309,49 @@ export default function App() {
         )}
       </main>
     </div>
+  );
+}
+
+function HandoffBanner({ handoff, onOpenProject }: { handoff: Handoff; onOpenProject: (project: string) => void }) {
+  const when = handoff.at ? new Date(handoff.at).toLocaleString() : "";
+  return (
+    <section className="handoff-banner" aria-label="Where we left off">
+      <div className="handoff-head">
+        <span className="handoff-badge">
+          <ShieldCheck size={15} />
+          Where we left off
+        </span>
+        <button className="handoff-project" type="button" onClick={() => onOpenProject(handoff.project)}>
+          {handoff.project}
+        </button>
+        {when && <small className="handoff-when">{when}</small>}
+      </div>
+
+      <p className="handoff-summary">{handoff.summary}</p>
+
+      <div className="handoff-cols">
+        {handoff.next_steps.length > 0 && (
+          <div className="handoff-col">
+            <h4>Next steps</h4>
+            <ul>
+              {handoff.next_steps.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {handoff.open_questions.length > 0 && (
+          <div className="handoff-col">
+            <h4>Open questions</h4>
+            <ul>
+              {handoff.open_questions.map((q, i) => (
+                <li key={i}>{q}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -451,6 +500,7 @@ function StatusView({
 
 function HomeView({
   briefing,
+  handoff,
   health,
   projects,
   pinnedProjectNames,
@@ -460,6 +510,7 @@ function HomeView({
   onTogglePinnedProject,
 }: {
   briefing: BriefingSnapshot;
+  handoff: Handoff | null;
   health: MemoryHealth | null;
   projects: ProjectSummary[];
   pinnedProjectNames: string[];
@@ -470,6 +521,8 @@ function HomeView({
 }) {
   return (
     <div className="dashboard-grid">
+      {handoff && <HandoffBanner handoff={handoff} onOpenProject={onOpenProject} />}
+
       <section className="metrics-strip" aria-label="Memory metrics">
         <Metric icon={FileText} label="Latest pages" value={briefing.counts.pages_latest.toString()} tone="cyan" />
         <Metric icon={History} label="Sessions" value={briefing.counts.sessions.toString()} tone="amber" />

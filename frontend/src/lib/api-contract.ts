@@ -1,6 +1,7 @@
 import type {
   ApiScenario,
   BriefingSnapshot,
+  Handoff,
   MemoryDriftIssue,
   MemoryHealth,
   PageHit,
@@ -82,6 +83,7 @@ interface ApiGraphEdge {
 }
 
 interface ApiOverview {
+  handoff?: Handoff | null;
   briefing: BriefingSnapshot;
   health: {
     stale: number;
@@ -108,6 +110,16 @@ export async function getProjectBriefing(): Promise<BriefingSnapshot> {
   if (demoMode) return delayed(briefing);
   const overview = await apiGet<ApiOverview>(`/workspaces/${encodeSegment(workspaceName)}/overview?limit=10`);
   return normalizeBriefing(overview.briefing);
+}
+
+// The latest open handoff for the workspace — "where we left off". The
+// overview endpoint already returns it; the UI just needs to surface it.
+// Cached the same as the overview call, so this is not a second round-trip
+// in practice.
+export async function getHandoff(): Promise<Handoff | null> {
+  if (demoMode) return null;
+  const overview = await apiGet<ApiOverview>(`/workspaces/${encodeSegment(workspaceName)}/overview?limit=10`);
+  return overview.handoff ?? null;
 }
 
 export async function getMemoryHealth(): Promise<MemoryHealth> {

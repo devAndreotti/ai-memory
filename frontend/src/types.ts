@@ -100,6 +100,15 @@ export interface MemoryHealth {
   orphan_count: number;
 }
 
+export interface Handoff {
+  agent: string;
+  at: string;
+  project: string;
+  summary: string;
+  open_questions: string[];
+  next_steps: string[];
+}
+
 export type ApiScenarioTone = "auth" | "offline" | "empty" | "missing" | "loading";
 
 export interface ApiScenario {

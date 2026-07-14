@@ -2657,3 +2657,83 @@ mark {
   color: var(--muted);
   font-size: 14px;
 }
+
+/* Handoff banner — the "where we left off" hero on Home. Full-width,
+   accented so it reads as the primary signal, not another quiet card. */
+.handoff-banner {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(34, 199, 197, 0.35);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(34, 199, 197, 0.08), rgba(23, 27, 24, 0.6));
+  padding: 18px 20px;
+  display: grid;
+  gap: 12px;
+}
+
+.handoff-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.handoff-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+.handoff-project {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.handoff-when {
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.handoff-summary {
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.handoff-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 18px;
+}
+
+.handoff-col h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.handoff-col ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+}
+
+.handoff-col li {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+}
