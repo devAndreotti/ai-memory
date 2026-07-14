@@ -43,6 +43,7 @@ import type {
   MemoryHealth,
   MemoryDriftIssue,
   PageHit,
+  PageKind,
   PageSummary,
   ProjectGraphEdge,
   ProjectSummary,
@@ -149,13 +150,6 @@ export default function App() {
   };
 
   const openReaderLink = (link: ReaderLink) => openPage(link.project, link.path);
-
-  const openMissingPage = () => {
-    setSelectedProject(primaryProject);
-    setSelectedPagePath("notes/callback-contract.md");
-    setView("page");
-  };
-
 
   const projectForPath = (path: string) => {
     return Object.entries(pagesByProject).find(([, pages]) => pages.some((page) => page.path === path))?.[0] ?? selectedProject;
@@ -287,7 +281,15 @@ export default function App() {
         )}
 
         {!loading && view === "states" && briefing && (
-          <StatusView briefing={briefing} health={memoryHealth} projects={projects} driftIssues={driftIssues} />
+          <StatusView
+            briefing={briefing}
+            health={memoryHealth}
+            projects={projects}
+            driftIssues={driftIssues}
+            pagesByProject={pagesByProject}
+            onOpenProject={openProject}
+            onOpenPage={(item) => openPage(projectForPath(item.path), item.path)}
+          />
         )}
 
         {!loading && view === "graph" && <ProjectGraph projects={projects} edges={graphEdges} onOpenProject={openProject} />}
@@ -295,7 +297,6 @@ export default function App() {
         {!loading && view === "audit" && (
           <DriftAudit
             issues={driftIssues}
-            onOpenMissingPage={openMissingPage}
             onOpenProject={openProject}
             onOpenPage={(project, path) => openPage(project, path)}
           />
@@ -305,16 +306,51 @@ export default function App() {
   );
 }
 
+const KIND_TONE: Record<PageKind, string> = {
+  rule: "var(--cyan)",
+  decision: "var(--amber)",
+  gotcha: "var(--rose)",
+  fact: "var(--green)",
+};
+
+function StatusBars({ rows }: { rows: { label: string; value: number; tone?: string }[] }) {
+  const max = Math.max(1, ...rows.map((r) => r.value));
+  return (
+    <div className="status-bars">
+      {rows.map((row) => (
+        <div className="status-bar-row" key={row.label}>
+          <span className="status-bar-label" title={row.label}>
+            {row.label}
+          </span>
+          <span className="status-bar-track">
+            <span
+              className="status-bar-fill"
+              style={{ width: `${Math.round((row.value / max) * 100)}%`, background: row.tone ?? "var(--cyan)" }}
+            />
+          </span>
+          <span className="status-bar-value">{row.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StatusView({
   briefing,
   health,
   projects,
   driftIssues,
+  pagesByProject,
+  onOpenProject,
+  onOpenPage,
 }: {
   briefing: BriefingSnapshot;
   health: MemoryHealth | null;
   projects: ProjectSummary[];
   driftIssues: MemoryDriftIssue[];
+  pagesByProject: Record<string, PageSummary[]>;
+  onOpenProject: (project: string) => void;
+  onOpenPage: (page: PageSummary) => void;
 }) {
   const totalPages = projects.reduce((sum, p) => sum + p.page_count, 0);
   const emptyProjects = projects.filter((p) => p.page_count === 0).length;
@@ -323,6 +359,20 @@ function StatusView({
     ? new Date(briefing.last_observation_at).toLocaleString()
     : "no activity recorded";
 
+  const projectRows = [...projects]
+    .filter((p) => p.page_count > 0)
+    .sort((a, b) => b.page_count - a.page_count)
+    .slice(0, 8)
+    .map((p) => ({ label: p.project_name, value: p.page_count }));
+
+  const kindCounts: Record<PageKind, number> = { rule: 0, decision: 0, fact: 0, gotcha: 0 };
+  for (const pages of Object.values(pagesByProject)) {
+    for (const page of pages) kindCounts[page.kind] = (kindCounts[page.kind] ?? 0) + 1;
+  }
+  const kindRows = (Object.keys(kindCounts) as PageKind[])
+    .map((kind) => ({ label: kind, value: kindCounts[kind], tone: KIND_TONE[kind] }))
+    .sort((a, b) => b.value - a.value);
+
   return (
     <div className="dashboard-grid">
       <section className="metrics-strip" aria-label="Server status metrics">
@@ -330,6 +380,38 @@ function StatusView({
         <Metric icon={Database} label="All versions" value={briefing.counts.pages_all.toString()} tone="green" />
         <Metric icon={History} label="Sessions" value={briefing.counts.sessions.toString()} tone="amber" />
         <Metric icon={ShieldCheck} label="Open handoffs" value={briefing.pending_handoff_count.toString()} tone="rose" />
+      </section>
+
+      <section className="status-main">
+        <Panel title="Pages by project" icon={Boxes}>
+          {projectRows.length > 0 ? (
+            <button className="status-clickable-bars" type="button" onClick={() => onOpenProject(projectRows[0].label)}>
+              <StatusBars rows={projectRows} />
+            </button>
+          ) : (
+            <p className="status-freshness">No pages stored yet.</p>
+          )}
+        </Panel>
+
+        <Panel title="Pages by kind" icon={Gauge}>
+          <StatusBars rows={kindRows} />
+        </Panel>
+
+        <Panel title="Recent activity" icon={Clock3}>
+          <div className="timeline">
+            {briefing.recent_pages.length > 0 ? (
+              briefing.recent_pages.map((item) => (
+                <button className="timeline-item" key={`${item.path}-${item.title}`} type="button" onClick={() => onOpenPage(item)}>
+                  <span className={`kind-chip kind-${item.kind}`}>{item.kind}</span>
+                  <strong>{item.title}</strong>
+                  <small>{item.path}</small>
+                </button>
+              ))
+            ) : (
+              <p className="status-freshness">No recent pages.</p>
+            )}
+          </div>
+        </Panel>
       </section>
 
       <aside className="side-rail">

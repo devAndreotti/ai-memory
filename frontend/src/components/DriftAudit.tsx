@@ -4,7 +4,6 @@ import type { DriftIssueType, MemoryDriftIssue } from "../types";
 
 interface DriftAuditProps {
   issues: MemoryDriftIssue[];
-  onOpenMissingPage: () => void;
   onOpenProject: (project: string) => void;
   onOpenPage: (project: string, path: string) => void;
 }
@@ -20,7 +19,7 @@ const TYPE_META: Record<DriftIssueType, { label: string; icon: LucideIcon }> = {
 
 const TYPE_ORDER: DriftIssueType[] = ["missing-page", "empty-project", "orphan", "broken-backlink", "duplicate", "stale"];
 
-export function DriftAudit({ issues, onOpenMissingPage, onOpenProject, onOpenPage }: DriftAuditProps) {
+export function DriftAudit({ issues, onOpenProject, onOpenPage }: DriftAuditProps) {
   const [typeFilter, setTypeFilter] = useState<DriftIssueType | "all">("all");
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState("");
@@ -50,8 +49,10 @@ export function DriftAudit({ issues, onOpenMissingPage, onOpenProject, onOpenPag
   };
 
   const openIssue = (issue: MemoryDriftIssue) => {
-    if (issue.type === "missing-page") return onOpenMissingPage();
     if (issue.type === "empty-project") return onOpenProject(issue.project);
+    // Missing-on-disk opens the real page: the reader shows a clean
+    // "page not found" state for it (the file is gone but the index row
+    // remains). No hardcoded demo path.
     return onOpenPage(issue.project, issue.path);
   };
 

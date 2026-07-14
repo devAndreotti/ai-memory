@@ -132,15 +132,38 @@ export async function listPages(project: string): Promise<{ pages: PageSummary[]
   }
 }
 
-export async function readPage(project = pageBody.project, path = pageBody.path): Promise<ReaderPage> {
+// Clean missing-page shell for the real API path — no mock fixture (which
+// carries demo backlinks and "mock disk read" wording). Used when the index
+// still lists a page but its file is gone, or a project has no pages yet.
+function realMissingPage(project: string, path: string): ReaderPage {
+  const emptyProject = path === "";
+  return {
+    project,
+    path,
+    title: emptyProject ? "No pages yet" : "Page not found",
+    kind: "fact",
+    tier: "working",
+    updated_at: "",
+    frontmatter: { tags: [], pinned: false },
+    body: emptyProject
+      ? "This project has no pages yet."
+      : "The index lists this path, but the page could not be read.",
+    links: [],
+    backlinks: [],
+    missing: true,
+  };
+}
+
+export async function readPage(project = "", path = ""): Promise<ReaderPage> {
   if (demoMode) {
     const key = `${project}/${path}`;
     const summary = pages[project]?.find((page) => page.path === path);
     return delayed(pageBodies[key] ?? (summary ? genericPage(project, summary) : missingPage(project, path || pageBody.path)));
   }
 
+  if (!project) return realMissingPage("", "");
   const resolvedPath = path || (await listPages(project)).pages[0]?.path;
-  if (!resolvedPath) return missingPage(project, "empty-project.md");
+  if (!resolvedPath) return realMissingPage(project, "");
 
   try {
     const page = await apiGet<ApiReaderPage>(
@@ -148,7 +171,7 @@ export async function readPage(project = pageBody.project, path = pageBody.path)
     );
     return mapReaderPage(page);
   } catch (error) {
-    if (isNotFound(error)) return missingPage(project, resolvedPath);
+    if (isNotFound(error)) return realMissingPage(project, resolvedPath);
     throw error;
   }
 }

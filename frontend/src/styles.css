@@ -2594,3 +2594,66 @@ mark {
     margin-left: 0;
   }
 }
+
+/* Server status — full-width main column with real-data bar charts. */
+.status-main {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.status-bars {
+  display: grid;
+  gap: 11px;
+}
+
+.status-clickable-bars {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.status-bar-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.status-bar-label {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
+.status-bar-track {
+  height: 9px;
+  border-radius: 999px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.status-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  min-width: 3px;
+}
+
+.status-bar-value {
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-freshness {
+  color: var(--muted);
+  font-size: 14px;
+}
