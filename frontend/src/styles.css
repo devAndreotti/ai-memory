@@ -2737,3 +2737,31 @@ mark {
   font-size: 14px;
   line-height: 1.45;
 }
+
+/* Skeleton loading — CSS-only, mirrors the dashboard shape. */
+.sk-col {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.sk-block {
+  border-radius: 8px;
+  background: linear-gradient(100deg, var(--panel) 30%, var(--panel-2) 50%, var(--panel) 70%);
+  background-size: 200% 100%;
+  animation: sk-shimmer 1.4s ease-in-out infinite;
+}
+
+.sk-banner { height: 118px; }
+.sk-metric { height: 84px; }
+.sk-panel { height: 220px; }
+.sk-panel-sm { height: 120px; }
+
+@keyframes sk-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sk-block { animation: none; }
+}

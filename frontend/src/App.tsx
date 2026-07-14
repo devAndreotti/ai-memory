@@ -10,7 +10,6 @@ import {
   Gauge,
   GitBranch,
   History,
-  Loader2,
   LucideIcon,
   Network,
   Pin,
@@ -765,11 +764,26 @@ function StatePanel({ icon: Icon, title, body, tone }: { icon: LucideIcon; title
   );
 }
 
+// CSS-only skeleton (no library, no runtime cost) that mirrors the Home
+// dashboard shape so the layout doesn't jump when data arrives.
 function LoadingOverlay() {
   return (
-    <div className="loading-shell">
-      <Loader2 size={24} />
-      <span>Loading memory cockpit</span>
+    <div className="dashboard-grid" aria-busy="true" aria-label="Loading">
+      <div className="sk-block sk-banner" style={{ gridColumn: "1 / -1" }} />
+      <div className="metrics-strip">
+        {[0, 1, 2, 3].map((i) => (
+          <div className="sk-block sk-metric" key={i} />
+        ))}
+      </div>
+      <div className="sk-col">
+        <div className="sk-block sk-panel" />
+        <div className="sk-block sk-panel" />
+      </div>
+      <div className="sk-col">
+        <div className="sk-block sk-panel-sm" />
+        <div className="sk-block sk-panel-sm" />
+        <div className="sk-block sk-panel-sm" />
+      </div>
     </div>
   );
 }
