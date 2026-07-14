@@ -55,16 +55,19 @@ import type {
   View,
 } from "./types";
 
-const primaryProject = "onemob-app";
-const primaryPage = "notes/paytime-integration.md";
+// Neutral defaults: the app boots on the Home view and lets the first
+// real project (loaded from /api/v1) drive selection, rather than shipping
+// one developer's personal project/query baked into the bundle.
+const primaryProject = "";
+const primaryPage = "";
 const pinnedStorageKey = "ai-memory:pinned-projects";
-const defaultPinnedProjects = ["onemob-app", "feed-dispatch", "quality-gate", "orbitaly"];
+const defaultPinnedProjects: string[] = [];
 
 export default function App() {
   const [view, setView] = useState<View>("home");
   const [selectedProject, setSelectedProject] = useState(primaryProject);
   const [selectedPagePath, setSelectedPagePath] = useState(primaryPage);
-  const [query, setQuery] = useState("paytime");
+  const [query, setQuery] = useState("");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [briefing, setBriefing] = useState<BriefingSnapshot | null>(null);
   const [memoryHealth, setMemoryHealth] = useState<MemoryHealth | null>(null);
@@ -130,6 +133,15 @@ export default function App() {
       alive = false;
     };
   }, [selectedProject, selectedPagePath, query]);
+
+  // Once real projects load, adopt the first one if nothing is selected yet
+  // (neutral defaults boot empty). Keeps Reader/Project views from opening
+  // on an empty selection without hardcoding a project name.
+  useEffect(() => {
+    if (!selectedProject && projects.length > 0) {
+      setSelectedProject(projects[0].project_name);
+    }
+  }, [projects, selectedProject]);
 
   const openProject = (projectName: string) => {
     setSelectedProject(projectName);
