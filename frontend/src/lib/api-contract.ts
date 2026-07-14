@@ -90,6 +90,8 @@ interface ApiOverview {
     stale_pages?: ApiRelatedPage[];
     duplicate_pages?: ApiRelatedPage[];
     orphan_pages?: ApiRelatedPage[];
+    broken_link_pages?: ApiRelatedPage[];
+    missing_on_disk_pages?: ApiRelatedPage[];
   };
 }
 
@@ -209,12 +211,30 @@ export async function listSearchResults(q: string): Promise<{ results: SearchRes
 
 export async function listDriftIssues(): Promise<{ issues: MemoryDriftIssue[] }> {
   if (demoMode) return delayed({ issues: driftIssues });
-  const overview = await apiGet<ApiOverview>(`/workspaces/${encodeSegment(workspaceName)}/overview?limit=50`);
+  const [overview, projectsResp] = await Promise.all([
+    apiGet<ApiOverview>(`/workspaces/${encodeSegment(workspaceName)}/overview?limit=50`),
+    listProjects(),
+  ]);
+  const emptyProjects: MemoryDriftIssue[] = projectsResp.projects
+    .filter((project) => project.page_count === 0)
+    .map((project) => ({
+      action: "open-project",
+      explanation: "Project exists but holds no pages",
+      id: `empty-project:${project.workspace_name}:${project.project_name}`,
+      path: "",
+      project: project.project_name,
+      severity: "low",
+      title: project.project_name,
+      type: "empty-project",
+    }));
   return {
     issues: [
-      ...mapHealthIssues("stale", overview.health.stale_pages ?? []),
-      ...mapHealthIssues("duplicate", overview.health.duplicate_pages ?? []),
+      ...mapHealthIssues("missing-page", overview.health.missing_on_disk_pages ?? []),
+      ...emptyProjects,
       ...mapHealthIssues("orphan", overview.health.orphan_pages ?? []),
+      ...mapHealthIssues("broken-backlink", overview.health.broken_link_pages ?? []),
+      ...mapHealthIssues("duplicate", overview.health.duplicate_pages ?? []),
+      ...mapHealthIssues("stale", overview.health.stale_pages ?? []),
     ],
   };
 }
@@ -314,11 +334,16 @@ function normalizeBriefing(snapshot: BriefingSnapshot): BriefingSnapshot {
   };
 }
 
-function mapHealthIssues(type: "stale" | "duplicate" | "orphan", pages: ApiRelatedPage[]): MemoryDriftIssue[] {
+function mapHealthIssues(
+  type: "stale" | "duplicate" | "orphan" | "broken-backlink" | "missing-page",
+  pages: ApiRelatedPage[],
+): MemoryDriftIssue[] {
   const config = {
     duplicate: ["duplicate", "Near-duplicate page", "medium"] as const,
     orphan: ["orphan", "Orphan page with no inbound links", "low"] as const,
     stale: ["stale", "Stale page past freshness window", "medium"] as const,
+    "broken-backlink": ["broken-backlink", "Page links to a target that does not exist yet", "low"] as const,
+    "missing-page": ["missing-page", "Indexed page whose markdown file is gone from disk", "high"] as const,
   }[type];
   return pages.map((page) => ({
     action: "open-reader",

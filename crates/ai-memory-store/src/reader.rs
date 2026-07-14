@@ -614,6 +614,43 @@ pub struct HealthDetail {
     pub duplicates: Vec<HealthPage>,
     /// Latest pages with no incoming or outgoing links.
     pub orphans: Vec<HealthPage>,
+    /// Latest pages with at least one unresolved outgoing link
+    /// (`to_page_id IS NULL`). One row per page regardless of how many
+    /// of its links are unresolved. Unlike the three lists above there is
+    /// no separate authoritative counter — an unresolved link can also be
+    /// an intentional forward reference, so this is informational.
+    pub broken_links: Vec<HealthPage>,
+}
+
+/// A latest page plus the project id needed to resolve its on-disk
+/// location (`Wiki::project_root(ws, project_id).join(path)`). Returned
+/// by [`ReaderPool::latest_pages_with_project_ids`] for disk-drift checks.
+#[derive(Debug, Clone)]
+pub struct PageDiskRef {
+    /// Owning project id (the caller already knows the workspace id).
+    pub project_id: ProjectId,
+    /// Identity + kind, ready to surface as a health drill-down row.
+    pub page: HealthPage,
+}
+
+/// One entry in the append-only `audit_log` (page writes, purges,
+/// renames, and other attributable operations). Returned by
+/// [`ReaderPool::recent_audit_log_for_project`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditLogEntry {
+    /// Microseconds since epoch.
+    pub at: i64,
+    /// Operation kind (e.g. `create_page`, `purge_project`, `rename_project`).
+    pub op: String,
+    /// Relative wiki path of the affected page, when the entry is
+    /// page-scoped and that page is still the latest version.
+    pub page_path: Option<String>,
+    /// Username of the attributed actor, if known.
+    pub author_username: Option<String>,
+    /// Display name of the attributed actor, if known.
+    pub author_name: Option<String>,
+    /// Free-form JSON detail captured at write time.
+    pub detail: String,
 }
 
 /// Cheap, cloneable read-only connection pool handle.
@@ -2668,11 +2705,144 @@ impl ReaderPool {
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
+            // Params: ws, [proj], limit. One row per source page via EXISTS —
+            // a page with three unresolved links must not appear three times.
+            let broken_sql = format!(
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                   AND EXISTS ( \
+                       SELECT 1 FROM links l \
+                       WHERE l.from_page_id = pg.id AND l.to_page_id IS NULL \
+                   ) \
+                 ORDER BY pg.updated_at DESC LIMIT ?"
+            );
+            let mut broken_stmt = conn.prepare(&broken_sql)?;
+            let broken_links = broken_stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    health_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
             Ok(HealthDetail {
                 stale,
                 duplicates,
                 orphans,
+                broken_links,
             })
+        })
+        .await
+    }
+
+    /// Latest pages in a workspace (optionally one project), each carrying
+    /// its project id so the caller can resolve the page's on-disk path.
+    /// Capped at `limit` rows — disk-drift checks stat one file per row,
+    /// so the cap bounds filesystem work, not just payload size.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_pages_with_project_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageDiskRef>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
+            let clause = if proj.is_some() {
+                " AND pg.project_id = ?"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT w.name, p.name, pg.path, pg.title, \
+                        COALESCE( \
+                            json_extract(pg.frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ), \
+                        pg.project_id \
+                 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                 ORDER BY pg.updated_at DESC LIMIT ?"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(Value::Blob(workspace_id.as_bytes().to_vec()))
+                            .chain(proj)
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    |row| {
+                        let page = health_page_from_row(row)?;
+                        let bytes: Vec<u8> = row.get(5)?;
+                        Ok((page, bytes))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(page, bytes)| {
+                    let project_id = ProjectId::from_slice(&bytes)?;
+                    Ok(PageDiskRef { project_id, page })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Recent `audit_log` entries for a project, newest first.
+    ///
+    /// Covers every attributable write path (page create/update, purge,
+    /// rename, ...) — `op` distinguishes them. `page_path` resolves only
+    /// when the entry is page-scoped and that page is still the latest
+    /// version; a purge/rename entry (or a superseded page) legitimately
+    /// carries `page_path = None`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_audit_log_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<AuditLogEntry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT al.at, al.op, pg.path, au.username, au.name, al.detail \
+                 FROM audit_log al \
+                 LEFT JOIN pages pg ON pg.id = al.page_id AND pg.is_latest = 1 \
+                 LEFT JOIN users au ON au.id = al.author_id \
+                 WHERE al.workspace_id = ?1 AND al.project_id = ?2 \
+                 ORDER BY al.at DESC LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
+                    |row| {
+                        Ok(AuditLogEntry {
+                            at: row.get(0)?,
+                            op: row.get(1)?,
+                            page_path: row.get(2)?,
+                            author_username: row.get(3)?,
+                            author_name: row.get(4)?,
+                            detail: row.get(5)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
         .await
     }
