@@ -21,7 +21,6 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { ApiStatePanels } from "./components/ApiStatePanels";
 import { CommandPalette, type PaletteTarget } from "./components/CommandPalette";
 import { DriftAudit } from "./components/DriftAudit";
 import { ProjectGraph } from "./components/ProjectGraph";
@@ -32,7 +31,6 @@ import {
   getProjectBriefing,
   getProjectGraph,
   getMemoryHealth,
-  listApiScenarios,
   listDriftIssues,
   listPages,
   listProjects,
@@ -41,7 +39,6 @@ import {
   searchMemory,
 } from "./lib/api-contract";
 import type {
-  ApiScenario,
   BriefingSnapshot,
   MemoryHealth,
   MemoryDriftIssue,
@@ -76,8 +73,6 @@ export default function App() {
   const [hits, setHits] = useState<PageHit[]>([]);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [page, setPage] = useState<ReaderPage | null>(null);
-  const [scenarios, setScenarios] = useState<ApiScenario[]>([]);
-  const [activeScenarioId, setActiveScenarioId] = useState("401-auth");
   const [graphEdges, setGraphEdges] = useState<ProjectGraphEdge[]>([]);
   const [driftIssues, setDriftIssues] = useState<MemoryDriftIssue[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -97,14 +92,13 @@ export default function App() {
     let alive = true;
     setLoading(true);
     async function load() {
-      const [projectResp, briefingResp, healthResp, pageResp, searchResp, searchResultsResp, scenarioResp, graphResp, driftResp] = await Promise.all([
+      const [projectResp, briefingResp, healthResp, pageResp, searchResp, searchResultsResp, graphResp, driftResp] = await Promise.all([
         listProjects(),
         getProjectBriefing(),
         getMemoryHealth(),
         readPage(selectedProject, selectedPagePath || undefined),
         searchMemory(query),
         listSearchResults(query),
-        listApiScenarios(),
         getProjectGraph(),
         listDriftIssues(),
       ]);
@@ -121,7 +115,6 @@ export default function App() {
       setPage(pageResp);
       setHits(searchResp.hits);
       setSearchResults(searchResultsResp.results);
-      setScenarios(scenarioResp.scenarios);
       setGraphEdges(graphResp.edges);
       setDriftIssues(driftResp.issues);
       setLoading(false);
@@ -163,7 +156,6 @@ export default function App() {
     setView("page");
   };
 
-  const openEmptyProject = () => openProject("scriply-old-746d84d");
 
   const projectForPath = (path: string) => {
     return Object.entries(pagesByProject).find(([, pages]) => pages.some((page) => page.path === path))?.[0] ?? selectedProject;
@@ -204,7 +196,7 @@ export default function App() {
           <NavButton active={view === "search"} icon={Search} label="Search" onClick={() => setView("search")} />
           <NavButton active={view === "page"} icon={BookOpenText} label="Reader" onClick={() => setView("page")} />
           <NavButton active={view === "graph"} icon={Network} label="Graph" onClick={() => setView("graph")} />
-          <NavButton active={view === "states"} icon={Gauge} label="States" onClick={() => setView("states")} />
+          <NavButton active={view === "states"} icon={Gauge} label="Status" onClick={() => setView("states")} />
           <NavButton active={view === "audit"} icon={ShieldAlert} label="Audit" onClick={() => setView("audit")} />
         </nav>
 
@@ -294,14 +286,8 @@ export default function App() {
           />
         )}
 
-        {!loading && view === "states" && (
-          <ApiStatePanels
-            scenarios={scenarios}
-            activeId={activeScenarioId}
-            onSelect={(scenario) => setActiveScenarioId(scenario.id)}
-            onOpenMissingPage={openMissingPage}
-            onOpenEmptyProject={openEmptyProject}
-          />
+        {!loading && view === "states" && briefing && (
+          <StatusView briefing={briefing} health={memoryHealth} projects={projects} driftIssues={driftIssues} />
         )}
 
         {!loading && view === "graph" && <ProjectGraph projects={projects} edges={graphEdges} onOpenProject={openProject} />}
@@ -315,6 +301,68 @@ export default function App() {
           />
         )}
       </main>
+    </div>
+  );
+}
+
+function StatusView({
+  briefing,
+  health,
+  projects,
+  driftIssues,
+}: {
+  briefing: BriefingSnapshot;
+  health: MemoryHealth | null;
+  projects: ProjectSummary[];
+  driftIssues: MemoryDriftIssue[];
+}) {
+  const totalPages = projects.reduce((sum, p) => sum + p.page_count, 0);
+  const emptyProjects = projects.filter((p) => p.page_count === 0).length;
+  const missingOnDisk = driftIssues.filter((i) => i.type === "missing-page").length;
+  const lastActivity = briefing.last_observation_at
+    ? new Date(briefing.last_observation_at).toLocaleString()
+    : "no activity recorded";
+
+  return (
+    <div className="dashboard-grid">
+      <section className="metrics-strip" aria-label="Server status metrics">
+        <Metric icon={FileText} label="Latest pages" value={briefing.counts.pages_latest.toString()} tone="cyan" />
+        <Metric icon={Database} label="All versions" value={briefing.counts.pages_all.toString()} tone="green" />
+        <Metric icon={History} label="Sessions" value={briefing.counts.sessions.toString()} tone="amber" />
+        <Metric icon={ShieldCheck} label="Open handoffs" value={briefing.pending_handoff_count.toString()} tone="rose" />
+      </section>
+
+      <aside className="side-rail">
+        <Panel title="Last 7 days" icon={Clock3}>
+          <div className="quality-grid">
+            <QualityCell label="Pages updated" value={briefing.activity_7d.pages_updated} />
+            <QualityCell label="Sessions" value={briefing.activity_7d.sessions} />
+            <QualityCell label="Observations" value={briefing.activity_7d.observations} />
+          </div>
+        </Panel>
+
+        <Panel title="Storage" icon={Boxes}>
+          <div className="quality-grid">
+            <QualityCell label="Projects" value={projects.length} />
+            <QualityCell label="Total pages" value={totalPages} />
+            <QualityCell label="Empty projects" value={emptyProjects} />
+          </div>
+        </Panel>
+
+        <Panel title="Integrity" icon={ShieldAlert}>
+          <div className="quality-grid">
+            <QualityCell label="Missing on disk" value={missingOnDisk} />
+            <QualityCell label="Duplicate" value={health?.duplicate_count ?? 0} />
+            <QualityCell label="Orphan" value={health?.orphan_count ?? 0} />
+          </div>
+        </Panel>
+
+        <Panel title="Freshness" icon={Clock3}>
+          <p className="status-freshness">
+            Last recorded activity: <strong>{lastActivity}</strong>
+          </p>
+        </Panel>
+      </aside>
     </div>
   );
 }
@@ -645,7 +693,7 @@ function titleFor(view: View, project: string) {
   if (view === "project") return project;
   if (view === "page") return "Page reader";
   if (view === "search") return "Search memory";
-  if (view === "states") return "System states";
+  if (view === "states") return "Server status";
   if (view === "graph") return "Project graph";
   if (view === "audit") return "Memory audit";
   return "Projects";

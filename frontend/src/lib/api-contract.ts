@@ -223,7 +223,7 @@ export async function listDriftIssues(): Promise<{ issues: MemoryDriftIssue[] }>
       id: `empty-project:${project.workspace_name}:${project.project_name}`,
       path: "",
       project: project.project_name,
-      severity: "low",
+      severity: "medium",
       title: project.project_name,
       type: "empty-project",
     }));
@@ -338,10 +338,14 @@ function mapHealthIssues(
   type: "stale" | "duplicate" | "orphan" | "broken-backlink" | "missing-page",
   pages: ApiRelatedPage[],
 ): MemoryDriftIssue[] {
+  // Severity ranks the actionable issues first: a missing file is real
+  // corruption (high); the rest are hygiene/informational (low) — an
+  // unresolved backlink is often an intentional forward reference, and
+  // duplicate/orphan/stale are soft signals on a small curated store.
   const config = {
-    duplicate: ["duplicate", "Near-duplicate page", "medium"] as const,
+    duplicate: ["duplicate", "Near-duplicate page", "low"] as const,
     orphan: ["orphan", "Orphan page with no inbound links", "low"] as const,
-    stale: ["stale", "Stale page past freshness window", "medium"] as const,
+    stale: ["stale", "Stale page past freshness window", "low"] as const,
     "broken-backlink": ["broken-backlink", "Page links to a target that does not exist yet", "low"] as const,
     "missing-page": ["missing-page", "Indexed page whose markdown file is gone from disk", "high"] as const,
   }[type];

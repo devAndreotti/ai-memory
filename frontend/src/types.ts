@@ -89,6 +89,7 @@ export interface BriefingSnapshot {
     pages_updated: number;
   };
   pending_handoff_count: number;
+  last_observation_at?: string | null;
   rules: PageSummary[];
   recent_pages: PageSummary[];
 }
