@@ -2738,7 +2738,16 @@ mark {
   line-height: 1.45;
 }
 
-/* Skeleton loading — CSS-only, mirrors the dashboard shape. */
+/* Skeleton loading — CSS-only, view-shaped, with soft fade + shimmer. */
+.view-swap {
+  animation: view-fade-in 0.28s ease both;
+}
+
+@keyframes view-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
 .sk-col {
   display: grid;
   gap: 14px;
@@ -2746,22 +2755,43 @@ mark {
 }
 
 .sk-block {
+  position: relative;
+  overflow: hidden;
   border-radius: 8px;
-  background: linear-gradient(100deg, var(--panel) 30%, var(--panel-2) 50%, var(--panel) 70%);
-  background-size: 200% 100%;
-  animation: sk-shimmer 1.4s ease-in-out infinite;
+  background: var(--panel);
+  opacity: 0.9;
+}
+
+/* Shimmer as a moving highlight overlay — softer than a full-block gradient. */
+.sk-block::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.045) 45%,
+    rgba(255, 255, 255, 0.07) 50%,
+    rgba(255, 255, 255, 0.045) 55%,
+    transparent 80%
+  );
+  transform: translateX(-100%);
+  animation: sk-shimmer 1.6s ease-in-out infinite;
 }
 
 .sk-banner { height: 118px; }
 .sk-metric { height: 84px; }
 .sk-panel { height: 220px; }
 .sk-panel-sm { height: 120px; }
+.sk-reader { height: 520px; }
+.sk-searchbar { height: 52px; }
+.sk-row { height: 66px; }
 
 @keyframes sk-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+  100% { transform: translateX(100%); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sk-block { animation: none; }
+  .sk-block::after { animation: none; }
+  .view-swap { animation: none; }
 }

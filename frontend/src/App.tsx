@@ -247,7 +247,8 @@ export default function App() {
           </form>
         </header>
 
-        {loading && <LoadingOverlay />}
+        <div className="view-swap" key={loading ? "sk" : view}>
+        {loading && <LoadingOverlay view={view} />}
 
         {!loading && view === "home" && briefing && (
           <HomeView
@@ -306,6 +307,7 @@ export default function App() {
             onOpenPage={(project, path) => openPage(project, path)}
           />
         )}
+        </div>
       </main>
     </div>
   );
@@ -764,9 +766,37 @@ function StatePanel({ icon: Icon, title, body, tone }: { icon: LucideIcon; title
   );
 }
 
-// CSS-only skeleton (no library, no runtime cost) that mirrors the Home
-// dashboard shape so the layout doesn't jump when data arrives.
-function LoadingOverlay() {
+// CSS-only skeleton (no library, no runtime cost) shaped to the view being
+// loaded, so the layout doesn't jump when data arrives. Fades in/out via
+// the keyed `.view-swap` wrapper.
+function LoadingOverlay({ view }: { view: View }) {
+  if (view === "page") {
+    return (
+      <div className="reader-layout" aria-busy="true" aria-label="Loading">
+        <div className="sk-col">
+          <div className="sk-block sk-reader" />
+        </div>
+        <div className="sk-col">
+          <div className="sk-block sk-panel-sm" />
+          <div className="sk-block sk-panel-sm" />
+          <div className="sk-block sk-panel-sm" />
+        </div>
+      </div>
+    );
+  }
+
+  if (view === "search") {
+    return (
+      <div className="sk-col" aria-busy="true" aria-label="Loading">
+        <div className="sk-block sk-searchbar" />
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div className="sk-block sk-row" key={i} />
+        ))}
+      </div>
+    );
+  }
+
+  // home / status / project / graph / audit — dashboard shape.
   return (
     <div className="dashboard-grid" aria-busy="true" aria-label="Loading">
       <div className="sk-block sk-banner" style={{ gridColumn: "1 / -1" }} />
