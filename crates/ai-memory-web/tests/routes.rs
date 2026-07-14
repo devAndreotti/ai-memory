@@ -2012,3 +2012,63 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
          (would otherwise let stale caches hide attribution flips)"
     );
 }
+
+/// Regression: the `/api/v1/search` JSON snippet must HTML-escape raw
+/// page-body content, leaving only the fixed `<mark>` highlight tags.
+/// SQLite's `snippet()` splices `<mark>` into the *unescaped* body, so an
+/// unescaped path would ship page-body HTML verbatim to the React cockpit,
+/// which renders snippets client-side — a stored/DOM XSS. Guards against a
+/// future refactor dropping the `escape_snippet` call on the JSON path.
+#[tokio::test]
+async fn api_search_snippet_escapes_body_html() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            proj,
+            "xss.md",
+            "XSS Page",
+            "<img src=x onerror=alert(1)> xssuniqueterm payload",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=xssuniqueterm")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let snippet = json[0]["snippet"].as_str().unwrap();
+
+    assert!(
+        !snippet.contains("<img"),
+        "raw body HTML must not survive into the JSON snippet: {snippet:?}"
+    );
+    assert!(
+        snippet.contains("&lt;img"),
+        "body HTML must be entity-escaped in the JSON snippet: {snippet:?}"
+    );
+    // The highlight tags the frontend relies on must still pass through raw.
+    assert!(
+        snippet.contains("<mark>") && snippet.contains("</mark>"),
+        "the fixed <mark> highlight tags must be preserved: {snippet:?}"
+    );
+}

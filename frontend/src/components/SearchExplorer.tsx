@@ -1,6 +1,32 @@
 import { FileText, Filter, FolderOpen, FolderTree, LucideIcon, Search, TextSearch } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import type { MemoryTier, PageKind, SearchResult, SearchResultType } from "../types";
+
+// Decode the five HTML entities the server's `escape_snippet` can emit.
+// `&amp;` is decoded last so `&amp;lt;` round-trips to the literal `&lt;`
+// rather than collapsing to `<`.
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+// Render an FTS snippet WITHOUT `dangerouslySetInnerHTML`. The only markup
+// the snippet is allowed to carry is the fixed `<mark>` highlight pair;
+// everything else is treated as text and rendered through React (which
+// auto-escapes), so page-body HTML can never execute here — defense in
+// depth even if the server ever stops escaping. Segments are entity-decoded
+// so escaped bodies still display their literal characters correctly.
+function renderSnippet(snippet: string): ReactNode {
+  return snippet.split(/<\/?mark>/).map((segment, i) => {
+    const text = decodeEntities(segment);
+    // Odd indices are the spans that sat between <mark> and </mark>.
+    return i % 2 === 1 ? <mark key={i}>{text}</mark> : <Fragment key={i}>{text}</Fragment>;
+  });
+}
 
 interface SearchExplorerProps {
   query: string;
@@ -101,7 +127,7 @@ export function SearchExplorer({ query, results, onOpenProject, onOpenResult }: 
                         <span className="search-result-main">
                           <strong>{result.title}</strong>
                           <small>{result.detail}</small>
-                          {result.snippet && <span className="search-snippet" dangerouslySetInnerHTML={{ __html: result.snippet }} />}
+                          {result.snippet && <span className="search-snippet">{renderSnippet(result.snippet)}</span>}
                         </span>
                         <span className="search-result-tags">
                           {result.kind && <span className={`kind-chip kind-${result.kind}`}>{result.kind}</span>}

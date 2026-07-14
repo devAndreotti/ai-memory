@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::markdown;
 use crate::state::WebState;
 
 /// Cache TTL for page-list, workspace, search, and summary endpoints.
@@ -655,7 +656,15 @@ async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSear
                 path: meta.path,
                 project: meta.project_name,
                 rank: hit.rank,
-                snippet: hit.snippet,
+                // HTML-escape the raw FTS snippet, preserving only the
+                // fixed `<mark>` highlight tags. The SQLite `snippet()`
+                // function splices `<mark>` into the *unescaped* page body,
+                // so without this any HTML in a page body reaches a JSON
+                // consumer verbatim — and the React cockpit renders the
+                // snippet via `dangerouslySetInnerHTML`, which would then
+                // execute it (stored/DOM XSS). The server-rendered search
+                // route already escapes here; the JSON path must match.
+                snippet: markdown::escape_snippet(&hit.snippet),
                 title: hit.title,
                 workspace: meta.workspace_name,
             });
