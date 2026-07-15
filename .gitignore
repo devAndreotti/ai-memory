@@ -27,6 +27,7 @@
 *.log
 flamegraph.svg
 perf.data*
+/outputs/
 
 # Sandbox marker (not project content).
 .ai-jail

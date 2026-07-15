@@ -17,7 +17,6 @@ use ai_memory_store::{AutoImproveProposalOperation, NewAutoImproveProposal, Stag
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -158,6 +157,12 @@ asks about a handoff and the SessionStart auto-fetched block is already \
 in your context, answer from it; do NOT re-call the tool to look for it \
 in another project.\n\
 \n\
+This default assumes the MCP client can identify the current agent \
+session. Static MCP clients in parallel sessions for the same user \
+cannot forward the real agent session id automatically; pass explicit \
+`workspace` + `project` / `scopes`, or use a session-aware bridge that \
+forwards the lifecycle-hook session id on MCP calls.\n\
+\n\
 Lifecycle hooks already capture every prompt + tool call automatically \
 — you do NOT need to write routine notes by hand. When the user \
 explicitly asks to remember a permanent annotation/fact/rule, write a \
@@ -169,7 +174,10 @@ the conversation calls for them:\n\
   to propose architecture (always check first). Defaults to the \
   current project; pass `scopes` to search named sibling projects, \
   or `global=true` to search EVERY project at once when you don't \
-  know where the knowledge lives.\n\
+  know where the knowledge lives. Default-scoped calls also return \
+  `global_scope_hits` — standing user/team preferences from the \
+  reserved `_global` scope; treat them as context that applies to \
+  every project.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
@@ -219,7 +227,11 @@ should be proposed from a completed session, or at explicit wrap-up \
   do NOT use `memory_handoff_begin` for permanent annotations. \
   Put the title as a `# H1` on the first line of `body` and omit the \
   `title` argument — ai-memory derives the title automatically and \
-  passing `title` is a known JSON-escape footgun (issue #67).\n\
+  passing `title` is a known JSON-escape footgun (issue #67). When the \
+  fact is a standing user/team preference that should apply to EVERY \
+  project ('always use pnpm', 'never force-push', code style rules), \
+  pass `scope: \"global\"` so it lands in the reserved `_global` scope \
+  instead of the current project.\n\
 - `memory_read_page` — when the user asks to read, open, or show the \
   full content of a specific page. Accepts a `query` (searches FTS5 and \
   returns the top hit's full body) or a `path` (direct lookup). Pass \
@@ -414,6 +426,13 @@ struct MemoryQueryResponse {
     /// carrying its workspace + project name.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     global_hits: Vec<ai_memory_store::PageHitWithMeta>,
+    /// Standing user/team context from the reserved `_global` preferences
+    /// scope, unioned into default-scoped queries alongside the current
+    /// project's `hits` (issue #154). Empty when the scope doesn't exist or
+    /// the query was explicitly scoped (`workspace`/`project`/`scopes`/
+    /// `global=true`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    global_scope_hits: Vec<ai_memory_store::PageHit>,
 }
 
 #[derive(Debug, Serialize)]
@@ -621,13 +640,28 @@ struct ExploreArgs {
     workspace: Option<String>,
 }
 
+// The `anyOf` encodes the "you MUST pass exactly one of path/query"
+// contract in the machine-readable schema (issue #155): each branch
+// demands the key's PRESENCE via `required` AND a non-null `type`, because
+// clients that null-fill defaulted args (OpenCode) would satisfy a bare
+// `required` with `path: null` and still hit the runtime error. Encoding
+// it here lets schema-respecting clients refuse the invalid call before
+// it ever reaches the server.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(extend("anyOf" = [
+    {"required": ["path"], "properties": {"path": {"type": "string"}}},
+    {"required": ["query"], "properties": {"query": {"type": "string"}}},
+]))]
 struct ReadPageArgs {
-    /// FTS5 query to find the page (searches and returns the top hit's full body).
-    /// Ignored when `path` is provided.
+    /// FTS5 query to find the page (searches and returns the top hit's full
+    /// body). You MUST pass exactly one of `query` or `path` — never neither,
+    /// and never `null`. Ignored when `path` is provided.
     #[serde(default, alias = "q", alias = "search")]
     query: Option<String>,
-    /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
+    /// Exact wiki path (e.g. `notes/foo.md`), typically taken verbatim from a
+    /// `memory_recent` or `memory_query` hit. You MUST pass exactly one of
+    /// `path` or `query` — never neither, and never `null`. Takes precedence
+    /// over `query`.
     #[serde(default)]
     path: Option<String>,
     /// Project to read from. Omit to target the project you're currently
@@ -698,6 +732,12 @@ struct WritePageArgs {
     /// `project`; created if it doesn't exist. Omit for the current workspace.
     #[serde(default)]
     workspace: Option<String>,
+    /// Set to `"global"` to write into the reserved `_global` preferences
+    /// scope — standing user/team context (tech preferences, code style,
+    /// durable decisions) that default `memory_query` reads union into
+    /// every project. Cannot be combined with `workspace`/`project`.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[tool_router]
@@ -927,6 +967,31 @@ impl AiMemoryServer {
             .map_err(Self::scope_error)
     }
 
+    /// Human-readable `workspace/project` label for a resolved scope. Makes
+    /// not-found errors diagnosable — especially under cross-project
+    /// scope-bleed, where a scoped-implicit read resolves to a different
+    /// scope than a concurrent write landed in. Degrades to a placeholder
+    /// when a name lookup fails so it never turns a not-found into a harder
+    /// error.
+    async fn scope_label(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> String {
+        let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
+        let proj_name = self
+            .reader
+            .project_name_by_id(ws, proj)
+            .await
+            .ok()
+            .flatten();
+        format!(
+            "{}/{}",
+            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
+            proj_name.as_deref().unwrap_or("<unknown-project>")
+        )
+    }
+
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let Some(embedder) = &self.embedder else {
             return None;
@@ -1026,8 +1091,10 @@ impl AiMemoryServer {
         self
     }
 
-    /// Search the compiled wiki via FTS5/vector/graph retrieval. Falls back
-    /// to bounded raw observation search when no compiled page matches.
+    /// Search the compiled wiki via FTS5/vector/graph retrieval. Default,
+    /// explicit project, and explicit `scopes` searches fall back to bounded
+    /// raw observation search when no compiled page matches; `global=true`
+    /// searches compiled wiki pages across projects only.
     #[tool(description = "Search the project's long-term memory wiki — \
         prior sessions, decisions, gotchas, architecture notes captured \
         by ai-memory across earlier runs. Call this BEFORE proposing \
@@ -1036,19 +1103,41 @@ impl AiMemoryServer {
         FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
-        If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches. Set `global=true` to search EVERY \
+        If compiled wiki search misses in default/project/`scopes` mode, \
+        `raw_hits` contains bounded raw observation fallback matches; \
+        `global=true` searches compiled wiki pages only and returns no raw \
+        fallback. Default-scoped calls also return \
+        `global_scope_hits`: standing user/team preferences from the \
+        reserved `_global` scope that apply across projects. Set \
+        `global=true` to search EVERY \
         project at once (cross-project) when you don't know which project \
         holds the knowledge — each hit then carries its workspace + \
         project name.")]
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
-        if args.global.unwrap_or(false) {
+        // A repo that opted into `[recall] default_global` (published on the
+        // ActiveProject by the hook) makes a query with NO explicit scoping
+        // behave as `global=true`. Precedence is strict: an explicit
+        // `global` / `scopes` / `workspace` / `project` arg always wins, so
+        // this only fires when the caller passed none of them.
+        let explicit_scoping = !args.scopes.is_empty()
+            || args
+                .workspace
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || args
+                .project
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+        let recall_global = !explicit_scoping
+            && !args.global.unwrap_or(false)
+            && self.active_project.default_global_for(&aps_actor);
+        if args.global.unwrap_or(false) || recall_global {
             if !args.scopes.is_empty()
                 || args
                     .workspace
@@ -1073,6 +1162,7 @@ impl AiMemoryServer {
                 hits: Vec::new(),
                 raw_hits: Vec::new(),
                 global_hits,
+                global_scope_hits: Vec::new(),
             });
         }
         if !args.scopes.is_empty()
@@ -1093,20 +1183,14 @@ impl AiMemoryServer {
 
         let query = args.query.clone();
         let query_vec = self.embed_query(&args.query).await;
-        let hits = if args.scopes.is_empty() {
-            let (ws, proj) = self
-                .effective_ids_for_read_args_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                )
-                .await?;
-            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
-                .await
+        let resolved_scopes = if args.scopes.is_empty() {
+            None
         } else {
-            let scopes = self.resolve_query_scopes(&args.scopes).await?;
+            Some(self.resolve_query_scopes(&args.scopes).await?)
+        };
+        let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
-            for (ws, proj) in scopes {
+            for &(ws, proj) in scopes {
                 let hits = self
                     .search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
                     .await
@@ -1130,12 +1214,44 @@ impl AiMemoryServer {
             });
             hits.truncate(limit);
             Ok(hits)
+        } else {
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        // Raw-observation fallback only applies to a single resolved
-        // project; for multi-scope queries there is no single (ws, proj).
-        let raw_hits = if hits.is_empty() && args.scopes.is_empty() {
+        // Raw-observation fallback when compiled-page search misses. Works
+        // for a single resolved project (default / workspace+project) AND
+        // for explicit `scopes` — the recommended scope-bleed mitigation —
+        // by searching observations in each resolved (ws, proj) and
+        // rank-merging, so the fallback isn't lost on the scoped path.
+        let raw_hits = if !hits.is_empty() {
+            Vec::new()
+        } else if let Some(scopes) = &resolved_scopes {
+            let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
+            for &(ws, proj) in scopes {
+                let mut scope_obs = self
+                    .reader
+                    .search_observations_for_project(ws, proj, query.clone(), limit)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                obs.append(&mut scope_obs);
+            }
+            obs.sort_by(|a, b| {
+                a.rank
+                    .partial_cmp(&b.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            obs.truncate(limit);
+            obs
+        } else {
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
                     args.workspace.as_deref(),
@@ -1147,6 +1263,50 @@ impl AiMemoryServer {
                 .search_observations_for_project(ws, proj, query, limit)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+        // Default-scoped queries (no workspace/project/scopes/global args)
+        // also union the reserved `_global` preferences scope, so standing
+        // user/team context travels into every project without the caller
+        // knowing a magic project name (issue #154). Explicit scoping means
+        // the caller asked for exactly those scopes — leave it alone. One
+        // extra scoped search when the scope exists; zero cost when it
+        // doesn't.
+        let default_scoped = args.scopes.is_empty()
+            && args
+                .workspace
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
+        let global_scope_hits = if default_scoped {
+            match ai_memory_store::lookup_global_scope(&self.reader).await {
+                Ok(Some(scope)) => {
+                    // If the current project IS the reserved scope (e.g. the
+                    // actor's active-project pointer lands there after a
+                    // global write), `hits` already covers it — don't search
+                    // it twice.
+                    let current = self
+                        .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                        .await?;
+                    if current == scope.as_tuple() {
+                        Vec::new()
+                    } else {
+                        let hits = self
+                            .search_project(
+                                scope.workspace_id,
+                                scope.project_id,
+                                &args.query,
+                                query_vec.as_deref(),
+                                limit,
+                            )
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
+                        hits
+                    }
+                }
+                Ok(None) => Vec::new(),
+                Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+            }
         } else {
             Vec::new()
         };
@@ -1154,6 +1314,7 @@ impl AiMemoryServer {
             hits,
             raw_hits,
             global_hits: Vec::new(),
+            global_scope_hits,
         };
         ok_json(&response)
     }
@@ -1168,7 +1329,7 @@ impl AiMemoryServer {
     async fn memory_recent(
         &self,
         Parameters(args): Parameters<RecentArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
@@ -1199,7 +1360,7 @@ impl AiMemoryServer {
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -1230,7 +1391,7 @@ impl AiMemoryServer {
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1303,7 +1464,7 @@ impl AiMemoryServer {
     async fn memory_auto_improve(
         &self,
         Parameters(args): Parameters<AutoImproveArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         if args.dry_run.is_some() || args.stage.is_some() || args.mode.is_some() {
             return Err(McpError::invalid_params(
@@ -1545,6 +1706,10 @@ impl AiMemoryServer {
         relative path such as `notes/<topic>.md`, `concepts/<topic>.md`, \
         `decisions/<topic>.md`, or `_rules/<topic>.md`. `tier` defaults \
         to `semantic`; set `pinned=true` for facts that should never decay. \
+        For standing user/team preferences that apply to EVERY project \
+        (tech choices, code style, durable personal rules), pass \
+        `scope: \"global\"` — the page lands in the reserved `_global` \
+        scope and default memory_query calls surface it in every project. \
         \
         **Title convention:** start `body` with a `# Some Title` line — \
         ai-memory derives the title from that H1 automatically. Do NOT \
@@ -1555,7 +1720,7 @@ impl AiMemoryServer {
     async fn memory_write_page(
         &self,
         Parameters(args): Parameters<WritePageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1570,13 +1735,42 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        let (ws, proj) = self
-            .write_target_ids_with_actor(
-                args.workspace.as_deref(),
-                args.project.as_deref(),
-                &aps_actor,
-            )
-            .await?;
+        let (ws, proj) = match args.scope.as_deref().map(str::trim) {
+            None | Some("") => {
+                self.write_target_ids_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?
+            }
+            Some("global") => {
+                if args
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || args
+                        .project
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                {
+                    return Err(McpError::internal_error(
+                        "scope: \"global\" cannot be combined with workspace/project",
+                        None,
+                    ));
+                }
+                ai_memory_store::create_global_scope(&self.writer)
+                    .await
+                    .map_err(Self::scope_error)?
+                    .as_tuple()
+            }
+            Some(other) => {
+                return Err(McpError::internal_error(
+                    format!("unknown scope '{other}': the only supported value is \"global\""),
+                    None,
+                ));
+            }
+        };
 
         let mut fm = serde_json::Map::new();
         if let Some(title) = &args.title {
@@ -1649,24 +1843,27 @@ impl AiMemoryServer {
     }
 
     /// Fetch the full body of a single wiki page.
-    #[tool(description = "Fetch the FULL body of a wiki page for the current \
-        project by default. Pass `workspace` + `project` together only when \
-        the user names a sibling workspace/project. Use this when the user asks to read, open, or show a specific \
-        page by name or topic — not just snippets. \
+    #[tool(description = "Fetch the FULL body of a wiki page. You MUST pass \
+        exactly one of `path` or `query` — a call with neither (or with \
+        nulls) is invalid and will error; do NOT retry it unchanged. \
         \
         Two modes: \
-        (1) pass `query` — runs an FTS5 search and returns the top hit's \
-        complete body (title + markdown, frontmatter stripped); \
-        (2) pass `path` — direct lookup by the page's relative wiki path \
-        (e.g. `notes/budget.md`). `path` takes precedence when both are given. \
+        (1) pass `path` — direct lookup by the page's relative wiki path, \
+        taken verbatim from a `memory_recent`/`memory_query` hit (e.g. \
+        `{\"path\": \"notes/budget.md\"}`); \
+        (2) pass `query` — runs an FTS5 search and returns the top hit's \
+        complete body. `path` takes precedence when both are given. \
         \
-        Returns `{ path, title, body, frontmatter }` (plus `served_from` when \
-        a missing markdown file is served from the DB fallback). Errors if the page is \
-        not found or neither argument is supplied.")]
+        Defaults to the current project; pass `workspace` + `project` \
+        together only when the user names a sibling workspace/project. Use \
+        this when the user asks to read, open, or show a specific page by \
+        name or topic — not just snippets. Returns `{ path, title, body, \
+        frontmatter }` (plus `served_from` when a missing markdown file is \
+        served from the DB fallback). Errors if the page is not found.")]
     async fn memory_read_page(
         &self,
         Parameters(args): Parameters<ReadPageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1685,6 +1882,15 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        // Diagnose cross-project scope-bleed: a read with no explicit scope
+        // resolves to the active project, which may differ from the scope a
+        // concurrent write landed in — the write persists but the by-path
+        // read looks in the wrong bucket and 404s.
+        let auto_scoped = args
+            .workspace
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
@@ -1705,8 +1911,15 @@ impl AiMemoryServer {
                 }
             }
         } else {
+            // Instructive on purpose: looping clients (issue #155 — OpenCode
+            // null-fills both args) read this text. Tell the model exactly
+            // what a valid retry looks like instead of a dead-end.
             return Err(McpError::invalid_params(
-                "provide either `query` or `path`",
+                "memory_read_page requires exactly one of `path` or `query` \
+                 as a non-null string — do not retry with both null. Pass the \
+                 page's path from a memory_recent/memory_query hit, e.g. \
+                 {\"path\": \"notes/topic.md\"}, or search by content with \
+                 {\"query\": \"topic keywords\"}.",
                 None,
             ));
         };
@@ -1752,7 +1965,28 @@ impl AiMemoryServer {
                             "served_from": "db-fallback",
                         }))
                     }
-                    None => Err(McpError::internal_error(disk_err.to_string(), None)),
+                    None => {
+                        // Not on disk and not in the DB under the resolved
+                        // scope. Name the scope (and flag auto-resolution) so
+                        // scope-bleed is diagnosable from the error itself,
+                        // instead of leaking the raw disk error/path.
+                        let scope = self.scope_label(ws, proj).await;
+                        let hint = if auto_scoped {
+                            " — this scope was auto-resolved from the active \
+                             project; pass explicit workspace+project if this \
+                             is a parallel multi-project session where the \
+                             write may have landed in a different scope"
+                        } else {
+                            ""
+                        };
+                        Err(McpError::internal_error(
+                            format!(
+                                "page {} not found in resolved scope {scope}{hint}",
+                                page_path.as_str()
+                            ),
+                            None,
+                        ))
+                    }
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
@@ -1772,7 +2006,7 @@ impl AiMemoryServer {
     async fn memory_delete_page(
         &self,
         Parameters(args): Parameters<DeletePageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1842,7 +2076,7 @@ impl AiMemoryServer {
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         // Handoffs bypass `Wiki::write_page` (they live in their own
@@ -1930,7 +2164,7 @@ impl AiMemoryServer {
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -1969,7 +2203,7 @@ impl AiMemoryServer {
     async fn memory_handoff_cancel(
         &self,
         Parameters(args): Parameters<HandoffCancelArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let handoff_id = HandoffId::from_str(&args.handoff_id)
@@ -2020,7 +2254,7 @@ impl AiMemoryServer {
     async fn memory_status(
         &self,
         Parameters(args): Parameters<StatusArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -2052,7 +2286,7 @@ impl AiMemoryServer {
     async fn memory_briefing(
         &self,
         Parameters(args): Parameters<BriefingArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
@@ -2088,7 +2322,7 @@ impl AiMemoryServer {
     async fn memory_explore(
         &self,
         Parameters(args): Parameters<ExploreArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
@@ -2150,8 +2384,9 @@ impl AiMemoryServer {
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
-        / `<!-- ai-memory:end -->` block or append `markered_block` with \
-        one blank line, then write every `managed_skills` item beneath \
+        / `<!-- ai-memory:end -->` block whose delimiters appear alone on \
+        their own lines, or append `markered_block` with one blank line, \
+        then write every `managed_skills` item beneath \
         the chosen skill root using its `relative_path`. This tool is \
         read-only and is the source of truth for the snippet and skills. \
         Skill files are ai-memory-managed only when they contain the \
@@ -2181,6 +2416,7 @@ impl AiMemoryServer {
                 "cursor": "AGENTS.md",
                 "gemini_cli": "AGENTS.md",
                 "antigravity_cli": "AGENTS.md",
+                "zero": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,
@@ -2201,7 +2437,7 @@ impl AiMemoryServer {
             },
             "notes": [
                 "Pick the filename matching your own agent identity.",
-                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end -->, replace ONLY that block in place; preserve every other line.",
+                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
                 "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
@@ -2393,21 +2629,135 @@ fn build_explore_request(
 /// `prompts/explore_system.md`.
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
+/// Synthetic anonymous request `Parts` for callers arriving without request
+/// parts (for example stdio): no actor headers, so downstream resolves an
+/// anonymous `ActorKey` — the correct identity for a local, unauthenticated
+/// `serve`. Streamable HTTP injects real `Parts` carrying middleware identity;
+/// when those are present, the extractor below preserves them instead.
+fn default_parts() -> axum::http::request::Parts {
+    let mut request = axum::http::Request::new(());
+    *request.method_mut() = axum::http::Method::POST;
+    *request.uri_mut() = axum::http::Uri::from_static("/mcp");
+    request.into_parts().0
+}
+
+/// Tool-handler extractor for the request `Parts`. Unlike rmcp's
+/// `Extension<Parts>` — which fails every `tools/call` with "missing extension
+/// http::request::Parts" when the extension is absent — this yields the real
+/// `Parts` over the streamable-HTTP transport and a synthetic anonymous one
+/// when request parts are absent (the stdio case), so a local stdio `serve`
+/// works while HTTP auth is unchanged when real request parts are present.
+struct OptionalParts(axum::http::request::Parts);
+
+impl OptionalParts {
+    fn from_extensions(extensions: &rmcp::model::Extensions) -> Self {
+        let parts = extensions
+            .get::<axum::http::request::Parts>()
+            .cloned()
+            .unwrap_or_else(default_parts);
+        Self(parts)
+    }
+}
+
+impl<C> rmcp::handler::server::common::FromContextPart<C> for OptionalParts
+where
+    C: rmcp::handler::server::common::AsRequestContext,
+{
+    fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
+        Ok(Self::from_extensions(
+            &context.as_request_context().extensions,
+        ))
+    }
+}
+
 #[cfg(test)]
 fn test_parts_default() -> axum::http::request::Parts {
-    axum::http::Request::builder()
-        .uri("/mcp")
-        .method("POST")
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0
+    default_parts()
+}
+
+#[cfg(test)]
+fn test_optional_parts() -> OptionalParts {
+    OptionalParts(test_parts_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn stdio_default_parts_resolves_to_anonymous_actor() {
+        // The stdio transport injects no `Parts`, so the `OptionalParts`
+        // extractor falls back to `default_parts()`. That synthetic default
+        // must carry no actor identity — a local unauthenticated caller —
+        // rather than error, which is what let tools/call fail on stdio.
+        let key = AiMemoryServer::actor_key_from_parts(Some(&default_parts()));
+        assert!(
+            key.user.is_none() && key.session_id.is_none(),
+            "stdio default must be anonymous"
+        );
+    }
+
+    #[test]
+    fn optional_parts_missing_extension_uses_anonymous_stdio_default() {
+        let extensions = rmcp::model::Extensions::new();
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.method, axum::http::Method::POST);
+        assert_eq!(parts.uri, axum::http::Uri::from_static("/mcp"));
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey::default(),
+            "missing request parts must degrade to anonymous stdio context instead of failing extraction"
+        );
+        assert!(parts.extensions.get::<AuthLevel>().is_none());
+        assert!(parts.extensions.get::<ai_memory_core::UserId>().is_none());
+        assert!(parts.extensions.get::<ActorContext>().is_none());
+    }
+
+    #[test]
+    fn optional_parts_preserves_real_http_parts_and_auth_context() {
+        let user_id = ai_memory_core::UserId::new();
+        let mut real_parts = test_parts_default();
+        real_parts
+            .headers
+            .insert("mcp-session-id", "session-from-header".parse().unwrap());
+        real_parts.extensions.insert(AuthLevel::User);
+        real_parts.extensions.insert(user_id);
+        real_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@example.com".into()),
+            ..ActorContext::default()
+        });
+
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(real_parts);
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.extensions.get::<AuthLevel>(), Some(&AuthLevel::User));
+        assert_eq!(
+            parts.extensions.get::<ai_memory_core::UserId>(),
+            Some(&user_id)
+        );
+        assert_eq!(
+            parts
+                .extensions
+                .get::<ActorContext>()
+                .and_then(|ctx| ctx.user.as_deref()),
+            Some("alice")
+        );
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey {
+                user: Some("alice".into()),
+                session_id: Some("session-from-header".into()),
+            },
+            "real HTTP request parts must preserve auth identity and routing session"
+        );
+    }
 
     use ai_memory_core::{
         ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
@@ -2484,6 +2834,42 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or_else(|| panic!("expected text content"));
         serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON response: {e}\n{text}"))
+    }
+
+    async fn insert_test_observation(
+        store: &Store,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        title: &str,
+        body: &str,
+    ) {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: title.into(),
+                body: body.into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
     }
 
     const MCP_TOOL_NAMES: &[&str] = &[
@@ -2656,8 +3042,9 @@ mod tests {
             "snippet must tell agents to refresh managed skill files"
         );
         assert!(
-            snippet.contains(ai_memory_core::MARKER_START)
-                && snippet.contains(ai_memory_core::MARKER_END),
+            snippet.contains("start/end HTML-comment markers")
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_START)
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_END),
             "snippet must preserve marker replacement guidance"
         );
     }
@@ -2751,6 +3138,30 @@ mod tests {
                 && installed.contains("data-preservation"),
             "installed prompt surface must preserve high-risk retrieval preflight guidance"
         );
+    }
+
+    #[test]
+    fn prompts_warn_static_mcp_parallel_sessions_need_explicit_scope() {
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            let lower = prompt.to_ascii_lowercase();
+            assert!(
+                lower.contains("static mcp") && lower.contains("parallel sessions"),
+                "prompt must warn about static MCP clients in parallel sessions"
+            );
+            assert!(
+                lower.contains("real agent session id")
+                    && (lower.contains("session-aware bridge")
+                        || lower.contains("session aware bridge")),
+                "prompt must distinguish real agent session id from static MCP config"
+            );
+            assert!(
+                lower.contains("explicit")
+                    && lower.contains("workspace")
+                    && lower.contains("project")
+                    && lower.contains("scopes"),
+                "prompt must tell agents to use explicit scope when session id is unavailable"
+            );
+        }
     }
 
     #[test]
@@ -3200,8 +3611,9 @@ mod tests {
                     pinned: false,
                     project: Some("sibling".to_string()),
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -3247,7 +3659,7 @@ mod tests {
                     project: Some("sibling".to_string()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3280,7 +3692,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3289,6 +3701,168 @@ mod tests {
             None => panic!("expected text content"),
         };
         assert!(text.contains("foo.md"), "expected hit; got {text}");
+    }
+
+    // Issue #154: default-scoped queries union the reserved `_global`
+    // preferences scope; explicitly scoped queries do not.
+    #[tokio::test]
+    async fn default_query_unions_global_scope_and_explicit_scope_skips_it() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: global.workspace_id,
+                project_id: global.project_id,
+                path: PagePath::new("preferences/style.md").unwrap(),
+                title: "Style".into(),
+                body: "Karpathy approved standing preference: pnpm always.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+
+        let query = |workspace: Option<&str>, project: Option<&str>| QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            project: project.map(str::to_string),
+            scopes: Vec::new(),
+            workspace: workspace.map(str::to_string),
+            global: None,
+        };
+
+        let result = server
+            .memory_query(
+                Parameters(query(None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            text.text.contains("foo.md"),
+            "current-project hit must remain: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
+            "default query must union the reserved global scope: {}",
+            text.text
+        );
+
+        let result = server
+            .memory_query(
+                Parameters(query(Some("default"), Some("scratch"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            !text.text.contains("preferences/style.md"),
+            "explicitly scoped queries must not union the global scope: {}",
+            text.text
+        );
+    }
+
+    // Issue #154: an absent `_global` scope contributes nothing and is
+    // never created by a read.
+    #[tokio::test]
+    async fn default_query_without_global_scope_is_unchanged() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            !text.text.contains("global_scope_hits"),
+            "no reserved scope -> field elided: {}",
+            text.text
+        );
+        assert_eq!(
+            ai_memory_store::lookup_global_scope(&store.reader)
+                .await
+                .unwrap(),
+            None,
+            "a read must never create the reserved scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_page_scope_global_lands_in_reserved_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+        let write_args = |scope: Option<&str>, project: Option<&str>| WritePageArgs {
+            path: "preferences/pkg.md".to_string(),
+            body: "# Package manager\nAlways pnpm workspaces.".to_string(),
+            title: None,
+            tier: None,
+            tags: Vec::new(),
+            pinned: false,
+            project: project.map(str::to_string),
+            workspace: None,
+            scope: scope.map(str::to_string),
+        };
+
+        server
+            .memory_write_page(
+                Parameters(write_args(Some("global"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let global = ai_memory_store::lookup_global_scope(&store.reader)
+            .await
+            .unwrap()
+            .expect("scope: global write must create the reserved scope");
+        let pages = store
+            .reader
+            .recent_pages_for_project(global.workspace_id, global.project_id, 10)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.path.as_str() == "preferences/pkg.md"),
+            "page must land in the reserved scope; got {:?}",
+            pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+
+        let err = server
+            .memory_write_page(
+                Parameters(write_args(Some("global"), Some("other"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("scope + project must fail closed");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        let err = server
+            .memory_write_page(
+                Parameters(write_args(Some("universe"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("unknown scope values must fail closed");
+        assert!(err.to_string().contains("unknown scope"), "{err}");
     }
 
     #[tokio::test]
@@ -3332,7 +3906,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3349,6 +3923,342 @@ mod tests {
             "expected raw fallback; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_via_explicit_scopes() {
+        // The raw-observation fallback must also fire on the explicit
+        // `scopes` path (the recommended scope-bleed mitigation), not just
+        // default / workspace+project. Regression for a scope with
+        // observations but zero compiled pages.
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let scoped = store
+            .writer
+            .get_or_create_project(ws, "scoped-obs", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "raw prompt".into(),
+                body: "raw fallback contains quokka only detail".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "quokka".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: vec![MemoryScopeArg {
+                        project: "scoped-obs".into(),
+                        workspace: "default".into(),
+                    }],
+                    workspace: None,
+                    global: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .unwrap();
+        let text = match result.content.first().and_then(|c| c.as_text()) {
+            Some(t) => t.text.clone(),
+            None => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("\"hits\": []"),
+            "expected no page hits; got {text}"
+        );
+        assert!(
+            text.contains("raw_hits"),
+            "expected raw fallback via scopes; got {text}"
+        );
+        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_scoped_raw_hits_respect_limit_and_rank_order() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let first = store
+            .writer
+            .get_or_create_project(ws, "rank-first", None)
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .get_or_create_project(ws, "rank-second", None)
+            .await
+            .unwrap();
+        for (project_id, title) in [
+            (first, "first-a"),
+            (first, "first-b"),
+            (second, "second-a"),
+            (second, "second-b"),
+        ] {
+            insert_test_observation(
+                &store,
+                ws,
+                project_id,
+                title,
+                &format!("rank_token appears in {title}"),
+            )
+            .await;
+        }
+
+        let mut expected = store
+            .reader
+            .search_observations_for_project(ws, first, "rank_token".into(), 3)
+            .await
+            .unwrap();
+        expected.extend(
+            store
+                .reader
+                .search_observations_for_project(ws, second, "rank_token".into(), 3)
+                .await
+                .unwrap(),
+        );
+        expected.sort_by(|a, b| {
+            a.rank
+                .partial_cmp(&b.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        expected.truncate(3);
+        assert!(
+            expected.iter().any(|hit| hit.title.starts_with("first-"))
+                && expected.iter().any(|hit| hit.title.starts_with("second-")),
+            "test setup must require merged hits from both scopes: {expected:?}"
+        );
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "rank_token".into(),
+                        limit: Some(3),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "rank-first".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "rank-second".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        let raw_hits = json["raw_hits"].as_array().unwrap();
+        assert_eq!(raw_hits.len(), 3, "raw hits must be truncated: {json}");
+        let titles: Vec<&str> = raw_hits
+            .iter()
+            .map(|hit| hit["title"].as_str().unwrap())
+            .collect();
+        let expected_titles: Vec<&str> = expected.iter().map(|hit| hit.title.as_str()).collect();
+        assert_eq!(
+            titles, expected_titles,
+            "raw hits should match the merged-and-truncated store ranking: {json}"
+        );
+        let ranks: Vec<f64> = raw_hits
+            .iter()
+            .map(|hit| hit["rank"].as_f64().unwrap())
+            .collect();
+        assert!(
+            ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+            "raw hits must be rank-sorted: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_scoped_raw_hits_deduplicate_duplicate_scopes() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let scoped = store
+            .writer
+            .get_or_create_project(ws, "dedupe-obs", None)
+            .await
+            .unwrap();
+        insert_test_observation(
+            &store,
+            ws,
+            scoped,
+            "dedupe raw prompt",
+            "dedupe_token appears once",
+        )
+        .await;
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "dedupe_token".into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "dedupe-obs".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "dedupe-obs".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        let raw_hits = json["raw_hits"].as_array().unwrap();
+        assert_eq!(
+            raw_hits.len(),
+            1,
+            "duplicate scopes must not duplicate raw hits: {json}"
+        );
+        assert_eq!(raw_hits[0]["title"], "dedupe raw prompt");
+    }
+
+    #[tokio::test]
+    async fn memory_query_missing_scope_fails_closed_without_default_raw_fallback() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        insert_test_observation(
+            &store,
+            ws,
+            proj,
+            "default raw prompt",
+            "missing_scope_token exists only in the default project",
+        )
+        .await;
+
+        let err = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "missing_scope_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: vec![MemoryScopeArg {
+                        project: "absent".into(),
+                        workspace: "default".into(),
+                    }],
+                    workspace: None,
+                    global: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("missing explicit scope must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absent") || msg.contains("not found"),
+            "missing scope error should identify the bad scope: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_page_hits_suppress_scoped_raw_fallback() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let pages = store
+            .writer
+            .get_or_create_project(ws, "page-scope", None)
+            .await
+            .unwrap();
+        let raw = store
+            .writer
+            .get_or_create_project(ws, "raw-scope", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: pages,
+                path: PagePath::new("page-hit.md").unwrap(),
+                title: "Page Hit".into(),
+                body: "mixed_scope_token appears in a compiled page".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        insert_test_observation(
+            &store,
+            ws,
+            raw,
+            "raw mixed prompt",
+            "mixed_scope_token also appears only in raw observations",
+        )
+        .await;
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "mixed_scope_token".into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "page-scope".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "raw-scope".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "page-hit.md"),
+            "expected compiled page hit: {json}"
+        );
+        assert!(
+            json.get("raw_hits")
+                .is_none_or(|raw_hits| raw_hits.as_array().is_some_and(Vec::is_empty)),
+            "compiled page hits must suppress raw fallback: {json}"
+        );
     }
 
     #[tokio::test]
@@ -3391,7 +4301,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3402,6 +4312,57 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("patterns.md"), "expected hit; got {text}");
+    }
+
+    // Issue #155: the "exactly one of path/query" contract must live in the
+    // machine-readable schema, with branches demanding presence AND a
+    // non-null type — a bare `required` is satisfied by OpenCode-style
+    // `path: null` filling. Pins against a schemars upgrade silently
+    // dropping the `extend` attribute.
+    #[test]
+    fn read_page_schema_encodes_one_of_path_or_query() {
+        let schema = serde_json::to_value(schemars::schema_for!(ReadPageArgs)).unwrap();
+        let any_of = schema
+            .get("anyOf")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("schema must carry the anyOf constraint: {schema}"));
+        for key in ["path", "query"] {
+            let branch = any_of
+                .iter()
+                .find(|b| b["required"] == serde_json::json!([key]))
+                .unwrap_or_else(|| panic!("missing anyOf branch requiring `{key}`: {schema}"));
+            assert_eq!(
+                branch["properties"][key]["type"],
+                serde_json::json!("string"),
+                "`{key}` branch must demand a non-null string so null-filling \
+                 clients cannot satisfy it"
+            );
+        }
+    }
+
+    // Issue #155: the neither-arg error must teach a looping model what a
+    // valid retry looks like, naming both args and a concrete example.
+    #[tokio::test]
+    async fn memory_read_page_without_args_returns_instructive_error() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let err = server
+            .with_wiki(wiki)
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("neither arg must fail closed");
+        let msg = err.to_string();
+        for needle in ["`path`", "`query`", "notes/topic.md", "do not retry"] {
+            assert!(msg.contains(needle), "error must contain {needle:?}: {msg}");
+        }
     }
 
     #[tokio::test]
@@ -3443,7 +4404,7 @@ mod tests {
                     project: Some("docs".into()),
                     workspace: Some("practice".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3493,7 +4454,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3510,6 +4471,55 @@ mod tests {
         assert!(
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_missing_error_names_the_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Explicit scope: the not-found error names workspace/project and the
+        // relative path (no raw disk error / absolute path leak).
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("missing page must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default/scratch"),
+            "must name the scope; got {msg}"
+        );
+        assert!(
+            msg.contains("does-not-exist.md"),
+            "must name the path; got {msg}"
+        );
+
+        // Auto-scoped read: the error adds the parallel-session hint.
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("missing page must error");
+        assert!(
+            err.to_string().contains("auto-resolved"),
+            "auto-scoped error must hint at scope-bleed; got {err}"
         );
     }
 
@@ -3604,7 +4614,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3673,7 +4683,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3695,6 +4705,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_query_default_global_marker_broadens_unscoped_query() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let ops_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let runbooks = store
+            .writer
+            .get_or_create_project(ops_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path, body) in [
+            (ws, infra, "cluster.md", "recall_token lives in infra"),
+            (
+                ops_ws,
+                runbooks,
+                "deploy.md",
+                "recall_token lives in runbooks",
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // The repo opted into `[recall] default_global` — the hook publishes it
+        // on the ActiveProject (single slot here, matching the empty test actor).
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
+
+        // A query with NO scoping args now behaves as `global=true`.
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("global_hits"),
+            "default_global must route the unscoped query to global: {text}"
+        );
+        assert!(text.contains("cluster.md"), "infra hit expected: {text}");
+        assert!(text.contains("deploy.md"), "runbooks hit expected: {text}");
+
+        // Precedence: an EXPLICIT workspace+project still wins over
+        // default_global — the query scopes to runbooks only (no infra hit).
+        let scoped = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: Some("runbooks".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("ops".into()),
+                    global: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let scoped_text = scoped
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            scoped_text.contains("deploy.md"),
+            "explicit ops/runbooks hit expected: {scoped_text}"
+        );
+        assert!(
+            !scoped_text.contains("cluster.md"),
+            "explicit scope must NOT broaden to infra: {scoped_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_query_global_rejects_explicit_scope() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let err = server
@@ -3707,7 +4824,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -3725,7 +4842,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3748,7 +4865,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3796,7 +4913,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3859,7 +4976,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3911,8 +5028,9 @@ mod tests {
                     pinned: true,
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -3931,7 +5049,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3976,8 +5094,9 @@ mod tests {
                     pinned: false,
                     project: None,
                     workspace: Some("default".into()),
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("workspace-only memory_write_page must fail");
@@ -4041,8 +5160,9 @@ mod tests {
                     pinned: false,
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -4088,8 +5208,9 @@ mod tests {
                     pinned: false,
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4102,7 +5223,7 @@ mod tests {
                     project: Some("typo".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("unknown explicit project must not fall back to scratch");
@@ -4150,8 +5271,9 @@ mod tests {
                     pinned: false,
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4163,7 +5285,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4177,7 +5299,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(read.is_err(), "deleted page must not be readable");
@@ -4192,7 +5314,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4237,8 +5359,9 @@ mod tests {
                     pinned: false,
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4250,7 +5373,7 @@ mod tests {
                     project: Some("typo".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("unknown explicit project must not delete from scratch");
@@ -4267,7 +5390,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(read.is_ok(), "page must survive delete with typo'd project");
@@ -4328,8 +5451,9 @@ mod tests {
                     pinned: false,
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4344,8 +5468,9 @@ mod tests {
                     pinned: false,
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4358,7 +5483,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4372,7 +5497,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -4389,7 +5514,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -4441,8 +5566,9 @@ mod tests {
                     pinned: false,
                     project: Some("other".into()),
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4455,7 +5581,7 @@ mod tests {
                     project: Some("other".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4477,7 +5603,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4517,7 +5643,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4529,7 +5655,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4559,7 +5685,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4579,7 +5705,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4600,7 +5726,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4627,7 +5753,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4639,7 +5765,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4671,7 +5797,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4683,7 +5809,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4730,7 +5856,7 @@ mod tests {
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4743,7 +5869,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4766,7 +5892,7 @@ mod tests {
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4796,7 +5922,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4816,7 +5942,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4835,7 +5961,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4855,7 +5981,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4874,7 +6000,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4940,7 +6066,7 @@ mod tests {
                     max_proposals: None,
                     include_raw_fallback: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("removed dry_run argument must fail closed");
@@ -4970,7 +6096,7 @@ mod tests {
                     max_proposals: None,
                     include_raw_fallback: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("must reject when no LLM provider is configured");
@@ -4994,7 +6120,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("must reject when wiki is not attached");
@@ -5050,8 +6176,9 @@ mod tests {
                     pinned: false,
                     project: Some("audited".into()),
                     workspace: None,
+                    scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5060,10 +6187,7 @@ mod tests {
             let server = &server;
             async move {
                 let out = server
-                    .memory_forget_sweep(
-                        Parameters(args),
-                        rmcp::handler::server::tool::Extension(test_parts_default()),
-                    )
+                    .memory_forget_sweep(Parameters(args), OptionalParts(test_parts_default()))
                     .await
                     .unwrap();
                 let text = out
@@ -5115,7 +6239,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect("empty-queue must be Ok, not Err");
@@ -5150,7 +6274,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -5181,7 +6305,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or

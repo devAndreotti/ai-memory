@@ -8,14 +8,15 @@
 //! basic-memory #763). The agent never blocks on us thanks to the
 //! fire-and-forget client side.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff, NewObservation,
-    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff,
+    NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
+    WorkspaceId,
 };
 use ai_memory_store::WriterHandle;
 use ai_memory_wiki::Wiki;
@@ -31,7 +32,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::log;
-use crate::payload::{HookEnvelope, HookEvent, HookQuery, ProjectStrategy, parse_agent};
+use crate::payload::{
+    HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
+};
 use crate::synth::synthesize_session_page;
 
 /// Default maximum number of hook events allowed to be processing at once.
@@ -49,6 +52,12 @@ pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Cap on scoped session ids tracked as subagents for the
+/// `drop_subagent_captures` tail-drop. Mirrors the project-cache order of
+/// magnitude: enough for high fan-out harnesses, still bounded if a client never
+/// sends a terminal `SessionEnd`.
+const SUBAGENT_SESSIONS_MAX: usize = 4096;
 
 /// Resolved-project cache key:
 /// `(cwd, workspace_override, project_override, project_strategy)`.
@@ -141,6 +150,215 @@ impl ProjectCacheStore {
     }
 }
 
+/// Shared bounded set of scoped session keys known to belong to a SUBAGENT.
+pub type SubagentSessions = Arc<tokio::sync::Mutex<SubagentSessionSet>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SubagentSessionKey {
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+}
+
+/// Tracks the scoped session keys of subagent (nested/spawned) sessions so that
+/// the `drop_subagent_captures` gate can also drop the **unmarked tail** of those
+/// sessions (`user_prompt_submit` / `stop` / `session_end`), which the
+/// per-event marker (`subagentType` / `agent_type`) does not cover. A session
+/// is seeded when a `SubagentStart` or any marker-bearing event arrives, and
+/// forgotten on `SessionEnd` after the tail has been dropped. Bounded LRU so a
+/// missed terminal event cannot leak memory.
+#[derive(Debug)]
+pub struct SubagentSessionSet {
+    ids: HashSet<SubagentSessionKey>,
+    order: VecDeque<SubagentSessionKey>,
+    max: usize,
+}
+
+impl Default for SubagentSessionSet {
+    fn default() -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            max: SUBAGENT_SESSIONS_MAX,
+        }
+    }
+}
+
+impl SubagentSessionSet {
+    /// Mark a scoped session id as a subagent (idempotent). Refreshes recency
+    /// and evicts the oldest id once the cap is exceeded.
+    fn insert(&mut self, key: SubagentSessionKey) {
+        if self.ids.contains(&key) {
+            self.touch(&key);
+            return;
+        }
+        self.ids.insert(key);
+        self.order.push_back(key);
+        while self.ids.len() > self.max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Whether this scoped session id is a known subagent.
+    #[must_use]
+    fn contains(&self, key: &SubagentSessionKey) -> bool {
+        self.ids.contains(key)
+    }
+
+    /// Forget a scoped session id (after `SessionEnd`).
+    fn remove(&mut self, key: &SubagentSessionKey) {
+        if self.ids.remove(key) {
+            self.order.retain(|k| k != key);
+        }
+    }
+
+    fn touch(&mut self, key: &SubagentSessionKey) {
+        self.order.retain(|k| k != key);
+        self.order.push_back(*key);
+    }
+}
+
+/// Cap on distinct rate-limiter keys held in memory. Bounded like
+/// [`SubagentSessionSet`] so a stream of unique keys can't grow unbounded.
+const INGEST_RATE_MAX_KEYS: usize = 4096;
+
+/// One token bucket: `tokens` refills at `refill_per_sec` up to `burst`.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+/// Per-source admission rate limiter. A bounded LRU of token buckets; disabled
+/// (pass-through) when `refill_per_sec <= 0`.
+pub struct IngestRateLimiter {
+    buckets: HashMap<String, TokenBucket>,
+    order: VecDeque<String>,
+    max_keys: usize,
+    refill_per_sec: f64,
+    burst: f64,
+}
+
+impl IngestRateLimiter {
+    /// A disabled (pass-through) limiter — the default for tests and installs
+    /// that don't set the env knobs.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::new(0.0, 0.0)
+    }
+
+    /// `refill_per_sec` tokens/second per key, up to `burst` (min 1).
+    #[must_use]
+    pub fn new(refill_per_sec: f64, burst: f64) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            order: VecDeque::new(),
+            max_keys: INGEST_RATE_MAX_KEYS,
+            refill_per_sec,
+            burst: burst.max(1.0),
+        }
+    }
+
+    /// Try to admit one event for `key` at `now`. `true` when disabled or a
+    /// token was available; `false` when the key is over its burst. O(1)
+    /// amortized; evicts the oldest-inserted key over the cap (a re-inserted
+    /// key just starts full again — a memory bound, not a fairness knob).
+    pub fn try_take(&mut self, key: &str, now: std::time::Instant) -> bool {
+        if self.refill_per_sec <= 0.0 {
+            return true;
+        }
+        let key = bounded_rate_key(key);
+        if !self.buckets.contains_key(&key) {
+            self.buckets.insert(
+                key.clone(),
+                TokenBucket {
+                    tokens: self.burst,
+                    last_refill: now,
+                },
+            );
+            self.order.push_back(key.clone());
+            while self.buckets.len() > self.max_keys {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.buckets.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        let Some(bucket) = self.buckets.get_mut(&key) else {
+            return true;
+        };
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.burst);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of tracked keys (bounded-ness test).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    #[cfg(test)]
+    fn max_stored_key_len(&self) -> usize {
+        self.buckets.keys().map(String::len).max().unwrap_or(0)
+    }
+}
+
+const INGEST_RATE_MAX_KEY_BYTES: usize = 128;
+
+fn bounded_rate_key(raw: &str) -> String {
+    if raw.len() <= INGEST_RATE_MAX_KEY_BYTES {
+        return raw.to_string();
+    }
+    format!("h:{:016x}", fnv1a64(raw.as_bytes()))
+}
+
+fn log_rate_key(raw: &str) -> String {
+    bounded_rate_key(raw)
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn ingest_rate_key(env: &HookEnvelope, actor_user: Option<&str>) -> String {
+    let user = actor_user.unwrap_or("");
+    if let Some(session_id) = env.session_id.as_deref().filter(|s| !s.is_empty()) {
+        return format!("u:{user}\ns:{session_id}");
+    }
+    let fallback = serde_json::to_string(&env.raw).unwrap_or_default();
+    format!(
+        "u:{user}\nmissing:{}:{}:{}:{}:{}:{}:{:016x}",
+        env.agent.as_str(),
+        format_args!("{:?}", env.event),
+        env.cwd.as_deref().unwrap_or(""),
+        env.workspace_override.as_deref().unwrap_or(""),
+        env.project_override.as_deref().unwrap_or(""),
+        env.project_strategy.as_str(),
+        fnv1a64(fallback.as_bytes())
+    )
+}
+
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
 pub struct HookState {
@@ -177,12 +395,23 @@ pub struct HookState {
     /// In-flight hook processing limiter. Requests acquire one permit before
     /// spawning work and return 429 immediately when saturated.
     pub ingest_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-source ingest rate limiter. The global `ingest_semaphore` is acquired
+    /// first for stored events so globally rejected events do not spend source
+    /// tokens. Disabled (pass-through) unless configured by the CLI.
+    pub ingest_rate: Arc<tokio::sync::Mutex<IngestRateLimiter>>,
     /// Opt-in (`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`): when true and a
     /// `consolidator` is present, SessionEnd also runs LLM consolidation on
     /// top of the always-written heuristic session page. Off by default so
     /// session close stays cheap; the LLM checkpoint otherwise happens on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Scoped session keys known to be subagents (seeded by `SubagentStart` / any
+    /// marker-bearing event). For a project that opted into
+    /// `drop_subagent_captures` (via its `.ai-memory.toml`, forwarded as the
+    /// per-event `drop_subagent` flag), every event of a tracked session is
+    /// dropped — closing the unmarked tail
+    /// (`user_prompt_submit`/`stop`/`session_end`) the per-event marker misses.
+    pub subagent_sessions: SubagentSessions,
     /// Operator home directory, sourced from `Config` once at startup. The
     /// cwd->project resolver never prefix-matches a stored `repo_path` equal
     /// to this, so `$HOME` cannot become a catch-all (issue #103). `None`
@@ -207,6 +436,10 @@ async fn handle_hook(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let env = HookEnvelope::from_query_and_body(query, body);
+    // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
+    // subagent sessions) when the operator opts in. Returning 202 (not an error)
+    // means the client treats the event as delivered and never retries/spools
+    // it. Runs before the semaphore so a dropped event consumes no capacity.
     // The auth middleware in front of `/hook` injects the request's
     // [`ActorContext`] (rung 1 root, rung 2 DB user, or anonymous). We
     // capture its `user` field NOW — before the spawn drops the request
@@ -215,10 +448,27 @@ async fn handle_hook(
     let actor_user = actor_ext
         .map(|axum::Extension(ctx)| ctx.user)
         .unwrap_or_default();
+    let actor_key = ActorKey {
+        user: actor_user.clone(),
+        session_id: env.session_id.clone(),
+    };
+    if should_drop_subagent(&state, &env, &actor_key).await {
+        return (StatusCode::ACCEPTED, "subagent capture dropped");
+    }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         warn!("hook ingest saturated; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
     };
+    let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+    if !state
+        .ingest_rate
+        .lock()
+        .await
+        .try_take(&rate_key, std::time::Instant::now())
+    {
+        warn!(source = %log_rate_key(&rate_key), "hook ingest rate limit exceeded for source; dropping event with 429");
+        return (StatusCode::TOO_MANY_REQUESTS, "hook source rate limited");
+    }
     tokio::spawn(async move {
         let _permit = permit;
         process_envelope(state, env, actor_user).await;
@@ -240,13 +490,72 @@ pub struct HookBatchItem {
     pub body: serde_json::Value,
 }
 
-/// Response to `POST /hook/batch`: the length of the contiguous leading prefix
-/// of items that committed (equals the request length on full success).
+/// Response to `POST /hook/batch`: legacy clients read the contiguous leading
+/// prefix in `accepted`; newer clients prefer `accepted_indices` when present to
+/// retain only non-contiguous items skipped by per-source rate limiting.
 #[derive(Debug, Serialize)]
 pub struct HookBatchAck {
-    /// Items committed, oldest-first. The client deletes exactly this many
-    /// spool entries and re-sends the rest next pass.
+    /// Contiguous leading prefix committed, oldest-first. Kept for old spool
+    /// drains and as a safe lower bound when `accepted_indices` is absent.
     pub accepted: usize,
+    /// Non-contiguous item indexes committed by a server new enough to keep
+    /// scanning past per-source rate-limited items. Omitted when it is exactly
+    /// the legacy accepted prefix so older clients keep working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_indices: Option<Vec<usize>>,
+    /// Item index that failed processing after earlier rate-limited skips. New
+    /// spool drains charge this item, not the first unaccepted one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_index: Option<usize>,
+}
+
+impl HookBatchAck {
+    fn prefix(accepted: usize) -> Self {
+        Self {
+            accepted,
+            accepted_indices: None,
+            failed_index: None,
+        }
+    }
+
+    fn indexed(indices: Vec<usize>) -> Self {
+        Self::indexed_with_empty(indices, false, None)
+    }
+
+    fn indexed_full_scan(indices: Vec<usize>) -> Self {
+        Self::indexed_with_empty(indices, true, None)
+    }
+
+    fn indexed_failed(indices: Vec<usize>, failed_index: usize) -> Self {
+        Self::indexed_with_empty(indices, true, Some(failed_index))
+    }
+
+    fn indexed_with_empty(
+        indices: Vec<usize>,
+        include_empty_indices: bool,
+        failed_index: Option<usize>,
+    ) -> Self {
+        let legacy_prefix = indices
+            .iter()
+            .copied()
+            .enumerate()
+            .take_while(|(pos, idx)| *pos == *idx)
+            .count();
+        let contiguous = indices
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(pos, idx)| pos == idx);
+        Self {
+            accepted: legacy_prefix,
+            accepted_indices: if contiguous && !(include_empty_indices && indices.is_empty()) {
+                None
+            } else {
+                Some(indices)
+            },
+            failed_index,
+        }
+    }
 }
 
 /// Batch sibling of [`handle_hook`]. Accepts many spooled events in ONE request
@@ -255,12 +564,12 @@ pub struct HookBatchAck {
 /// dominant cost when a backlog drains to a remote, gated server, and the reason
 /// a sequential per-event drain falls behind under parallel load.
 ///
-/// Unlike `handle_hook` (which spawns and answers `202` immediately), the batch
-/// is processed INLINE and FAIL-FAST: items run in order and the first error
-/// stops the batch, returning `accepted = <committed prefix>`. Inline + fail-fast
-/// keeps every item's side effects (a SessionEnd writes a session page + a
-/// handoff) inside the response window, so a partially-applied batch never
-/// commits beyond what `accepted` reports — the client deletes only that prefix.
+/// Unlike `handle_hook` (which spawns and answers `202` immediately), stored
+/// batch items are processed INLINE so every item's side effects (a SessionEnd
+/// writes a session page + a handoff) stay inside the response window. Real
+/// processing errors still fail-fast. Per-source rate-limit misses are different:
+/// the item is skipped and later unrelated sources continue, with
+/// `accepted_indices` telling new spool drains exactly which entries committed.
 async fn handle_hook_batch(
     State(state): State<Arc<HookState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -272,43 +581,112 @@ async fn handle_hook_batch(
             max = MAX_HOOK_BATCH_ITEMS,
             "hook batch too large; rejecting before processing"
         );
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(HookBatchAck { accepted: 0 }),
-        );
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(HookBatchAck::prefix(0)));
     }
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor_user = actor_ext
         .map(|axum::Extension(ctx)| ctx.user)
         .unwrap_or_default();
-    // Hold capacity proportional to the batch size so batch ingress cannot
-    // exceed the same in-flight event bound as single `/hook` requests. Empty
-    // batches still acquire one permit to respect backpressure consistently.
-    let permits = u32::try_from(items.len().max(1)).unwrap_or(u32::MAX);
-    let Ok(permit) = state
-        .ingest_semaphore
-        .clone()
-        .try_acquire_many_owned(permits)
-    else {
-        warn!("hook batch ingest saturated; rejecting with 429");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(HookBatchAck { accepted: 0 }),
-        );
-    };
-    let _permit = permit;
-    let mut accepted = 0usize;
-    for item in items {
+    let mut accepted_indices = Vec::new();
+    for (idx, item) in items.into_iter().enumerate() {
         let query = parse_hook_query(&item.url);
         let env = HookEnvelope::from_query_and_body(query, item.body);
-        if let Err(e) = process(&state, env, actor_user.clone()).await {
-            warn!(error = %e, accepted, "hook batch item failed; stopping (fail-fast)");
-            break;
+        let actor_key = ActorKey {
+            user: actor_user.clone(),
+            session_id: env.session_id.clone(),
+        };
+        // Accept-but-drop subagent captures (see `handle_hook`): count the item
+        // as committed so the client clears it from its spool, but do not store
+        // it. Keeps the contiguous-prefix ack contract intact.
+        if should_drop_subagent(&state, &env, &actor_key).await {
+            accepted_indices.push(idx);
+            continue;
         }
-        accepted += 1;
+        let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+            warn!(
+                accepted = accepted_indices.len(),
+                "hook batch ingest saturated; rejecting with 429"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(HookBatchAck::indexed(accepted_indices)),
+            );
+        };
+        let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+        if !state
+            .ingest_rate
+            .lock()
+            .await
+            .try_take(&rate_key, std::time::Instant::now())
+        {
+            drop(permit);
+            warn!(accepted = accepted_indices.len(), source = %log_rate_key(&rate_key), "hook batch source rate limited; skipping item and continuing");
+            continue;
+        }
+        let _permit = permit;
+        if let Err(e) = process(&state, env, actor_user.clone()).await {
+            warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
+            return (
+                StatusCode::OK,
+                Json(HookBatchAck::indexed_failed(accepted_indices, idx)),
+            );
+        }
+        accepted_indices.push(idx);
     }
-    (StatusCode::OK, Json(HookBatchAck { accepted }))
+    (
+        StatusCode::OK,
+        Json(HookBatchAck::indexed_full_scan(accepted_indices)),
+    )
+}
+
+/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
+/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
+/// session on `SubagentStart` and on any marker-bearing event; keeps it through
+/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
+/// `stop` / `session_end`) of a session already known to be a subagent. No-op
+/// (returns `false`) unless this event's project opted in via the per-event
+/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &ActorKey) -> bool {
+    if !env.drop_subagent_requested {
+        return false;
+    }
+    let Ok(session_id) = resolve_session_id(env) else {
+        return false;
+    };
+    let Ok((workspace_id, project_id)) = resolve_project_ids_inner(
+        state,
+        env.cwd.as_deref(),
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_strategy,
+        actor,
+        env.recall_default_global_requested,
+    )
+    .await
+    else {
+        return false;
+    };
+    let key = SubagentSessionKey {
+        workspace_id,
+        project_id,
+        session_id,
+    };
+    let marked = matches!(
+        env.event,
+        HookEvent::SubagentStart | HookEvent::SubagentStop
+    ) || body_is_subagent(&env.raw);
+
+    if marked {
+        state.subagent_sessions.lock().await.insert(key);
+        return true;
+    }
+
+    let tracked = state.subagent_sessions.lock().await.contains(&key);
+    if tracked && matches!(env.event, HookEvent::SessionEnd) {
+        state.subagent_sessions.lock().await.remove(&key);
+    }
+    tracked
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
@@ -340,6 +718,19 @@ pub struct HandoffQuery {
     pub project: Option<String>,
     /// Project strategy (mirror of `HookQuery.project_strategy`).
     pub project_strategy: Option<String>,
+    /// Per-repo opt-in for the session-start project brief, forwarded by
+    /// the host-side hook from `.ai-memory.toml`'s
+    /// `[briefing] inject_on_session_start`. A truthy value makes this
+    /// endpoint append a compiled, char-budgeted brief of the project's
+    /// pinned / `_rules/` / `_slots/` pages after any pending handoff, so
+    /// the agent starts with the architecture context instead of
+    /// re-exploring the codebase (#176). Off when absent.
+    pub briefing: Option<String>,
+    /// Char budget for the brief, forwarded from the marker's
+    /// `[briefing] max_chars`. Clamped server-side to
+    /// [`BRIEF_BUDGET_MIN`], [`BRIEF_BUDGET_MAX`]; defaults to
+    /// [`BRIEF_BUDGET_DEFAULT`] when absent or unparsable.
+    pub briefing_budget: Option<String>,
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -382,24 +773,156 @@ async fn fetch_and_accept_handoff(
         user: actor_user,
         session_id: None,
     };
-    let (ws, proj) = resolve_project_ids(
+    let (ws, proj) = resolve_project_ids_inner(
         state,
         query.cwd.as_deref(),
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
         &actor_key,
+        // The /handoff query carries no recall preference; the main capture
+        // path is what publishes default_global for read tools.
+        false,
     )
     .await?;
-    let handoff = state
-        .reader
-        .latest_open_handoff(ws, proj, query.cwd)
-        .await?;
-    let Some(h) = handoff else {
-        return Ok(None);
+    let handoff_md = {
+        let handoff = state
+            .reader
+            .latest_open_handoff(ws, proj, query.cwd)
+            .await?;
+        match handoff {
+            Some(h) => {
+                state.writer.accept_handoff(h.id, agent, None).await?;
+                Some(render_handoff_markdown(&h))
+            }
+            None => None,
+        }
     };
-    state.writer.accept_handoff(h.id, agent, None).await?;
-    Ok(Some(render_handoff_markdown(&h)))
+    // The brief is additive and non-destructive: unlike the handoff (a
+    // single-use slot consumed above), it is recomposed on every opted-in
+    // session start — exactly what a Claude Code `/clear` needs (#176).
+    let brief_md = if crate::payload::query_flag_truthy(query.briefing.as_deref()) {
+        let budget = query
+            .briefing_budget
+            .as_deref()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(BRIEF_BUDGET_DEFAULT)
+            .clamp(BRIEF_BUDGET_MIN, BRIEF_BUDGET_MAX);
+        let (core, recent) = state
+            .reader
+            .session_brief_pages(ws, proj, BRIEF_CORE_PAGES_LIMIT, BRIEF_RECENT_PAGES_LIMIT)
+            .await?;
+        render_session_brief(&core, &recent, budget)
+    } else {
+        None
+    };
+    Ok(match (handoff_md, brief_md) {
+        (Some(h), Some(b)) => Some(format!("{h}\n{b}")),
+        (Some(h), None) => Some(h),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    })
+}
+
+/// Default char budget for the session-start brief (~1k tokens at the
+/// usual ~4 chars/token) — enough for a few rules pages without taxing
+/// every session start.
+const BRIEF_BUDGET_DEFAULT: usize = 4_000;
+/// Floor for the marker-supplied budget: below this the brief can't fit
+/// even one meaningful page plus the headers.
+const BRIEF_BUDGET_MIN: usize = 500;
+/// Ceiling for the marker-supplied budget: the brief is injected into
+/// EVERY opted-in session start, so an unbounded budget would let one
+/// marker line quietly burn five figures of tokens per `/clear`.
+const BRIEF_BUDGET_MAX: usize = 20_000;
+/// How many core (pinned / `_rules/` / `_slots/`) pages the store fetches;
+/// the char budget usually cuts earlier.
+const BRIEF_CORE_PAGES_LIMIT: usize = 24;
+/// How many recently-updated page titles the brief lists as follow-up
+/// pointers.
+const BRIEF_RECENT_PAGES_LIMIT: usize = 10;
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 char.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Render the marker-opted session-start project brief: core pages with
+/// bodies (pinned first) under a char budget, then recently-updated titles
+/// as follow-up pointers. Returns `None` for an empty project so the hook
+/// injects nothing rather than an empty scaffold.
+fn render_session_brief(
+    core: &[ai_memory_store::BriefPageBody],
+    recent: &[ai_memory_store::BriefingPage],
+    budget_chars: usize,
+) -> Option<String> {
+    if core.is_empty() && recent.is_empty() {
+        return None;
+    }
+    let mut buf = String::with_capacity(budget_chars.min(8_192));
+    buf.push_str(
+        "> 🧭 **ai-memory: project brief** (auto-injected — `.ai-memory.toml [briefing]`)\n",
+    );
+
+    let mut omitted: Vec<&str> = Vec::new();
+    for page in core {
+        let pin = if page.pinned { " 📌" } else { "" };
+        let header = format!(
+            "\n## {title}{pin} (`{path}`)\n",
+            title = page.title,
+            path = page.path,
+        );
+        // Reserve room for the footer sections so a single huge page
+        // can't crowd out the recent-pages pointers entirely.
+        let used = buf.len();
+        if used + header.len() >= budget_chars {
+            omitted.push(&page.path);
+            continue;
+        }
+        let remaining = budget_chars - used - header.len();
+        let body = page.body.trim();
+        buf.push_str(&header);
+        if body.len() > remaining {
+            buf.push_str(truncate_at_char_boundary(body, remaining));
+            buf.push_str("\n_[truncated by `[briefing] max_chars`]_\n");
+        } else {
+            buf.push_str(body);
+            buf.push('\n');
+        }
+    }
+    if !omitted.is_empty() {
+        buf.push_str("\n**Core pages omitted by budget** (read via `memory_query` if needed)\n");
+        for path in omitted {
+            buf.push_str(&format!("- `{path}`\n"));
+        }
+    }
+    if !recent.is_empty() {
+        buf.push_str("\n**Recently updated pages** (titles only)\n");
+        for page in recent {
+            buf.push_str(&format!(
+                "- {title} (`{path}`, {kind}, {ts})\n",
+                title = page.title,
+                path = page.path,
+                kind = page.kind,
+                ts = page.updated_at,
+            ));
+        }
+    }
+    buf.push_str(
+        "\n_**To the receiving agent:** this brief is compiled from this \
+         project's pinned / `_rules/` / `_slots/` wiki pages. Treat it as \
+         current architecture and standing-rule context — do NOT re-explore \
+         the codebase to rediscover what is already stated here. Call \
+         `memory_query` for detail beyond this brief._\n",
+    );
+    Some(buf)
 }
 
 fn render_handoff_markdown(h: &Handoff) -> String {
@@ -482,6 +1005,15 @@ fn cache_key_for(
     )
 }
 
+fn normalize_project_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
+}
+
 /// Resolve the `(workspace_id, project_id)` pair for a hook event.
 ///
 /// Precedence:
@@ -495,15 +1027,19 @@ fn cache_key_for(
 /// project_strategy)` so the same `cwd` resolved with and without an
 /// override (e.g. during a hook-script upgrade window) doesn't poison each
 /// other's slot.
-async fn resolve_project_ids(
+#[allow(clippy::too_many_arguments)]
+async fn resolve_project_ids_inner(
     state: &HookState,
     cwd: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
     actor: &ai_memory_core::ActorKey,
+    default_global: bool,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    let cwd_norm = cwd.filter(|s| !s.is_empty()).map(str::to_string);
+    let cwd_norm = cwd
+        .filter(|s| !s.is_empty())
+        .map(normalize_project_path_key);
 
     // Without cwd AND without a project override, there's nothing to
     // resolve — fall through to the server defaults.
@@ -526,7 +1062,9 @@ async fn resolve_project_ids(
             // MCP read tools need as their default. Keyed by the actor so
             // opt-in isolation modes (`per_session`/`per_actor`) keep
             // concurrent callers separated.
-            state.active_project.set_for(actor, ids.0, ids.1);
+            state
+                .active_project
+                .set_for(actor, ids.0, ids.1, default_global);
             return Ok(ids);
         }
     }
@@ -544,9 +1082,12 @@ async fn resolve_project_ids(
         (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
             Some(resolved) => resolved,
             None => {
-                state
-                    .active_project
-                    .set_for(actor, state.workspace_id, state.project_id);
+                state.active_project.set_for(
+                    actor,
+                    state.workspace_id,
+                    state.project_id,
+                    default_global,
+                );
                 return Ok((state.workspace_id, state.project_id));
             }
         },
@@ -557,12 +1098,33 @@ async fn resolve_project_ids(
             // gets refactored. Same effect as `unreachable!`, but
             // visible at compile time instead of inside the panic
             // message.
-            state
-                .active_project
-                .set_for(actor, state.workspace_id, state.project_id);
+            state.active_project.set_for(
+                actor,
+                state.workspace_id,
+                state.project_id,
+                default_global,
+            );
             return Ok((state.workspace_id, state.project_id));
         }
     };
+
+    // The reserved global preferences scope (issue #154) is written only
+    // through explicit MCP `scope: "global"` requests — event capture must
+    // never create it or leak observations into it, whether the name came
+    // from a directory literally called `_global` or a marker-file
+    // override. Fall back to the server-default project, same as a
+    // cwd-less event.
+    if project_name == ai_memory_core::GLOBAL_SCOPE_PROJECT {
+        debug!(
+            cwd = ?cwd_norm,
+            "hook router: refusing to attribute event capture to the reserved \
+             global scope; using the server-default project"
+        );
+        state
+            .active_project
+            .set_for(actor, state.workspace_id, state.project_id, default_global);
+        return Ok((state.workspace_id, state.project_id));
+    }
 
     fn derive_project_from_cwd(
         cwd: &str,
@@ -598,9 +1160,9 @@ async fn resolve_project_ids(
         ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
             let repo_path = root
                 .map(|p| {
-                    repo_root_in_cwd_namespace(path, &p)
-                        .to_string_lossy()
-                        .into_owned()
+                    normalize_project_path_key(
+                        &repo_root_in_cwd_namespace(path, &p).to_string_lossy(),
+                    )
                 })
                 .or_else(|| repo_path_from_cwd(cwd));
             (name, repo_path)
@@ -611,9 +1173,9 @@ async fn resolve_project_ids(
         let path = std::path::Path::new(cwd);
         let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
         cwd_is_repo_root(path, &repo_root).then(|| {
-            repo_root_in_cwd_namespace(path, &repo_root)
-                .to_string_lossy()
-                .into_owned()
+            normalize_project_path_key(
+                &repo_root_in_cwd_namespace(path, &repo_root).to_string_lossy(),
+            )
         })
     }
 
@@ -648,7 +1210,7 @@ async fn resolve_project_ids(
             if let Ok(root) = ai_memory_consolidate::discover_main_repo_root(cwd_path) {
                 let visible_root = repo_root_in_cwd_namespace(cwd_path, &root);
                 if visible_root.file_name().and_then(|name| name.to_str()) == Some(project) {
-                    return Some(visible_root.to_string_lossy().into_owned());
+                    return Some(normalize_project_path_key(&visible_root.to_string_lossy()));
                 }
             }
         }
@@ -714,8 +1276,69 @@ async fn resolve_project_ids(
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
-    state.active_project.set_for(actor, ws, proj);
+    state
+        .active_project
+        .set_for(actor, ws, proj, default_global);
     Ok(ids)
+}
+
+/// Back-compat wrapper used by tests: resolve without the `default_global`
+/// recall preference (equivalent to a repo that never opted into
+/// `[recall] default_global`). Production paths call
+/// [`resolve_project_ids_inner`] directly with the marker's value.
+#[cfg(test)]
+async fn resolve_project_ids(
+    state: &HookState,
+    cwd: Option<&str>,
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
+    project_strategy: ProjectStrategy,
+    actor: &ai_memory_core::ActorKey,
+) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    resolve_project_ids_inner(
+        state,
+        cwd,
+        workspace_override,
+        project_override,
+        project_strategy,
+        actor,
+        false,
+    )
+    .await
+}
+
+/// Whether session-sticky attribution may apply: the event's cwd must sit
+/// inside the session's own cwd subtree, and the session's cwd must be a
+/// meaningful anchor — not missing, not the filesystem root, and not the
+/// user's home directory (broad roots would fold every project beneath
+/// them into one bucket, the #103 catch-all failure mode).
+fn sticky_within_session_tree(
+    session_cwd: Option<&str>,
+    event_cwd: Option<&str>,
+    home_dir: Option<&str>,
+) -> bool {
+    let Some(session_cwd) = session_cwd.filter(|s| !s.trim().is_empty()) else {
+        return false;
+    };
+    let session_norm = normalize_project_path_key(session_cwd);
+    if session_norm == "/" {
+        return false;
+    }
+    if let Some(home) = home_dir
+        && normalize_project_path_key(home) == session_norm
+    {
+        return false;
+    }
+    // A cwd-less event inside a known session still belongs to it — there
+    // is no directory evidence to contradict the session (and per-event
+    // resolution would only shrug it into the server default anyway).
+    let Some(event_cwd) = event_cwd.filter(|s| !s.trim().is_empty()) else {
+        return true;
+    };
+    let event_norm = normalize_project_path_key(event_cwd);
+    // Component-wise containment: "/a/b" contains "/a/b/c" but not
+    // "/a/bc" (Path::starts_with is component-based, not string-based).
+    std::path::Path::new(&event_norm).starts_with(std::path::Path::new(&session_norm))
 }
 
 async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor_user: Option<String>) {
@@ -743,15 +1366,96 @@ async fn process(
         user: actor_user.clone(),
         session_id: env.session_id.clone(),
     };
-    let (mut ws, mut proj) = resolve_project_ids(
-        state,
-        env.cwd.as_deref(),
-        env.workspace_override.as_deref(),
-        env.project_override.as_deref(),
-        env.project_strategy,
-        &actor_key,
-    )
-    .await?;
+    // Session-sticky attribution: for an event whose session already
+    // exists, the session's own scope is the source of truth (the same
+    // rationale as the V19 repair). Per-event cwd derivation only decides
+    // for session-CREATING events. Without this, a mid-session `cd subdir/`
+    // inside a NON-GIT project scattered observations into basename
+    // fragments ("sources", "desktop", …): the v0.12.2 prefix match keys on
+    // `repo_path`, and #103 deliberately never records one for non-git
+    // parents, so the match had nothing to anchor to.
+    //
+    // Stickiness is bounded so it can never become a catch-all:
+    // - Explicit marker-file overrides still win — a `.ai-memory.toml`
+    //   naming a project is a deliberate rescope, not drift.
+    // - The event's cwd must sit INSIDE the session's own cwd subtree;
+    //   `cd`-ing out of the session's tree (into a different project)
+    //   falls back to per-event resolution as before.
+    // - A session rooted at a broad directory — the filesystem root or
+    //   the user's home — never sticks, or a stray session started in
+    //   `$HOME` would fold every project beneath it into one bucket
+    //   (the same catch-all failure #103 healed for repo_path keys).
+    let sticky_scope = if env.project_override.is_none() && env.workspace_override.is_none() {
+        state
+            .reader
+            .find_session_scope(session_id)
+            .await?
+            .filter(|(_, _, session_cwd)| {
+                sticky_within_session_tree(
+                    session_cwd.as_deref(),
+                    env.cwd.as_deref(),
+                    state.home_dir.as_deref(),
+                )
+            })
+    } else {
+        None
+    };
+    let (mut ws, mut proj) = match sticky_scope {
+        Some((session_ws, session_proj, _)) => {
+            // Publish the pointer like resolve_project_ids does on a cache
+            // hit: this session being active is exactly what the MCP read
+            // tools should default to.
+            state.active_project.set_for(
+                &actor_key,
+                session_ws,
+                session_proj,
+                env.recall_default_global_requested,
+            );
+            (session_ws, session_proj)
+        }
+        None => {
+            resolve_project_ids_inner(
+                state,
+                env.cwd.as_deref(),
+                env.workspace_override.as_deref(),
+                env.project_override.as_deref(),
+                env.project_strategy,
+                &actor_key,
+                env.recall_default_global_requested,
+            )
+            .await?
+        }
+    };
+
+    if matches!(env.event, HookEvent::SessionEnd) {
+        match state
+            .reader
+            .session_end_disposition(session_id, ws, proj, env.agent)
+            .await?
+        {
+            ai_memory_store::SessionEndDisposition::Open => {}
+            ai_memory_store::SessionEndDisposition::DropStale => {
+                info!(
+                    session = %session_id,
+                    agent = %env.agent.as_str(),
+                    "ignoring SessionEnd for missing, mismatched, or already-ended session"
+                );
+                return Ok(());
+            }
+            // The agent resumed an ended session under the same id and kept
+            // working (issue #152). Run the full end path again — page
+            // rewrite, ended_at bump, handoff, opt-in LLM consolidation — so
+            // the resumed work reaches the compiled session page instead of
+            // living only in raw observations.
+            ai_memory_store::SessionEndDisposition::ReEndWithNewWork => {
+                info!(
+                    session = %session_id,
+                    agent = %env.agent.as_str(),
+                    "SessionEnd re-ends a resumed session with new work; re-running end path"
+                );
+            }
+        }
+    }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -771,21 +1475,26 @@ async fn process(
         // begin_session trips the project foreign key. Evict the stale
         // slot, re-resolve (which recreates the project), and retry once.
         warn!(error = %e, "begin_session failed; evicting stale project cache and retrying");
-        let cwd_norm = env.cwd.as_deref().filter(|s| !s.is_empty());
+        let cwd_norm = env
+            .cwd
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(normalize_project_path_key);
         let key = cache_key_for(
-            cwd_norm,
+            cwd_norm.as_deref(),
             env.workspace_override.as_deref(),
             env.project_override.as_deref(),
             env.project_strategy,
         );
         state.project_cache.lock().await.remove(&key);
-        let refreshed = resolve_project_ids(
+        let refreshed = resolve_project_ids_inner(
             state,
             env.cwd.as_deref(),
             env.workspace_override.as_deref(),
             env.project_override.as_deref(),
             env.project_strategy,
             &actor_key,
+            env.recall_default_global_requested,
         )
         .await?;
         ws = refreshed.0;
@@ -1086,7 +1795,10 @@ const fn importance_for(event: HookEvent) -> u8 {
         HookEvent::UserPrompt => 8,
         HookEvent::PostToolUse | HookEvent::PreToolUse => 5,
         HookEvent::Stop | HookEvent::PreCompact => 6,
-        HookEvent::Notification | HookEvent::Other => 3,
+        HookEvent::Notification
+        | HookEvent::Other
+        | HookEvent::SubagentStart
+        | HookEvent::SubagentStop => 3,
     }
 }
 
@@ -1128,6 +1840,8 @@ mod tests {
             project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+            ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             home_dir: None,
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
@@ -1135,6 +1849,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn init_repo_with_commit(path: &std::path::Path) -> git2::Repository {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
@@ -1148,6 +1863,71 @@ mod tests {
                 .unwrap();
         }
         repo
+    }
+
+    #[cfg(windows)]
+    fn init_repo_with_commit(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-q", "-b", "main"]).arg(path);
+        assert_command_success(init);
+
+        let mut email = std::process::Command::new("git");
+        email
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.email", "test@example.com"]);
+        assert_command_success(email);
+
+        let mut name = std::process::Command::new("git");
+        name.arg("-C")
+            .arg(path)
+            .args(["config", "user.name", "Test"]);
+        assert_command_success(name);
+
+        let mut commit = std::process::Command::new("git");
+        commit
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "--allow-empty", "-m", "initial"]);
+        assert_command_success(commit);
+    }
+
+    #[cfg(windows)]
+    fn init_bare_repo(path: &std::path::Path) {
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "--bare", "-q"]).arg(path);
+        assert_command_success(init);
+    }
+
+    // Windows 11 + Git Bash support matters for regulated enterprise setups
+    // where Git Bash is the approved shell available from the corporate
+    // repository. Symlink creation can still be denied by Windows policy, so
+    // the Windows path skips only when the OS reports the missing privilege.
+    #[cfg(unix)]
+    fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "skipping symlink repo-path assertion: Windows denied symlink creation privilege"
+                );
+                false
+            }
+            Err(e) => panic!("failed to create test symlink {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_command_success(mut command: std::process::Command) {
+        let status = command.status().unwrap();
+        assert!(status.success(), "command failed: {command:?}");
     }
 
     /// Two hook events with distinct cwds must land in two distinct projects.
@@ -1192,6 +1972,343 @@ mod tests {
         assert_eq!(state.active_project.get(), Some((ws_b, proj_b)));
     }
 
+    // Catch-all guards on stickiness: a session accidentally started at a
+    // broad root (`/`, `$HOME`) must NOT fold everything beneath it into
+    // one project, and `cd`-ing OUT of the session's tree must fall back
+    // to per-event resolution.
+    #[test]
+    fn sticky_never_applies_to_broad_roots_or_out_of_tree_cwds() {
+        // Session rooted at the filesystem root: never sticky.
+        assert!(!sticky_within_session_tree(
+            Some("/"),
+            Some("/mnt/data/Projects/real-project"),
+            Some("/home/user"),
+        ));
+        // Session rooted at $HOME: never sticky.
+        assert!(!sticky_within_session_tree(
+            Some("/home/user"),
+            Some("/home/user/Projects/real-project"),
+            Some("/home/user"),
+        ));
+        // Missing session cwd: no anchor, no stickiness.
+        assert!(!sticky_within_session_tree(
+            None,
+            Some("/a/b/c"),
+            Some("/home/user"),
+        ));
+        // Event cwd OUTSIDE the session tree: falls back to per-event
+        // resolution (a real `cd` into a different project).
+        assert!(!sticky_within_session_tree(
+            Some("/a/b"),
+            Some("/a/other"),
+            Some("/home/user"),
+        ));
+        // Component-wise containment, not string-prefix: /a/bc is NOT
+        // inside /a/b.
+        assert!(!sticky_within_session_tree(
+            Some("/a/b"),
+            Some("/a/bc"),
+            Some("/home/user"),
+        ));
+
+        // The intended case: subdirectory of a normal session cwd sticks.
+        assert!(sticky_within_session_tree(
+            Some("/a/b"),
+            Some("/a/b/c"),
+            Some("/home/user"),
+        ));
+        // Same dir sticks; cwd-less events inside a known session stick.
+        assert!(sticky_within_session_tree(
+            Some("/a/b"),
+            Some("/a/b"),
+            Some("/home/user"),
+        ));
+        assert!(sticky_within_session_tree(
+            Some("/a/b"),
+            None,
+            Some("/home/user"),
+        ));
+    }
+
+    // Session-sticky attribution: a mid-session `cd subdir/` inside a
+    // NON-GIT project must keep observations in the session's project.
+    // This is the exact production failure behind the fragment cleanup:
+    // non-git parents have no repo_path, so the v0.12.2 prefix match
+    // can't anchor subdir cwds, and per-event basename derivation minted
+    // "sources"/"desktop"/… fragment projects daily.
+    #[tokio::test]
+    async fn mid_session_subdir_cwd_sticks_to_the_sessions_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "44444444-4444-4444-4444-444444444444";
+        // Plain directory, deliberately NOT a git repo.
+        let parent = tmp.path().join("tiktok_analysis");
+        let subdir = parent.join("sources");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let fire = |event: &str, cwd: std::path::PathBuf| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        // Session starts at the parent; a later tool event reports the
+        // subdirectory cwd (agent shells keep their working directory).
+        process(&state, fire("session-start", parent.clone()), None)
+            .await
+            .unwrap();
+        process(&state, fire("post-tool-use", subdir.clone()), None)
+            .await
+            .unwrap();
+
+        let parent_proj = state
+            .reader
+            .find_project(state.workspace_id, "tiktok_analysis".to_string())
+            .await
+            .unwrap()
+            .expect("parent project exists");
+        assert_eq!(
+            state
+                .reader
+                .find_project(state.workspace_id, "sources".to_string())
+                .await
+                .unwrap(),
+            None,
+            "the subdir event must not mint a fragment project"
+        );
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations.iter().all(|o| o.project_id == parent_proj),
+            "every observation must carry the session's project"
+        );
+
+        // An explicit marker override mid-session is a deliberate rescope
+        // and must still win over stickiness.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(subdir.to_string_lossy().into_owned()),
+                project: Some("declared-elsewhere".into()),
+                workspace: Some("default".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid,
+                "cwd": subdir.to_string_lossy(),
+                "tool_name": "Bash",
+            }),
+        );
+        process(&state, env, None).await.unwrap();
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "declared-elsewhere".to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "marker-file overrides must still rescope"
+        );
+    }
+
+    // Issue #154: event capture must never create or attribute to the
+    // reserved `_global` preferences scope — not from a directory that
+    // happens to carry the reserved name, and not from a marker-file
+    // project override.
+    #[tokio::test]
+    async fn reserved_global_scope_is_never_auto_attributed() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        // cwd whose basename is the reserved name.
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some("/home/user/_global"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (ws, proj),
+            (state.workspace_id, state.project_id),
+            "cwd named _global must fall back to the server-default project"
+        );
+
+        // Explicit marker-file override naming the reserved scope.
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some("/home/user/some-project"),
+            None,
+            Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (ws, proj),
+            (state.workspace_id, state.project_id),
+            "project override _global must fall back to the server-default project"
+        );
+
+        // Neither call may have materialised the reserved project row.
+        let created = state
+            .reader
+            .find_project(
+                state.workspace_id,
+                ai_memory_core::GLOBAL_SCOPE_PROJECT.to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created, None, "event capture must not create _global");
+    }
+
+    #[test]
+    fn ingest_rate_limiter_disabled_passes_through() {
+        let mut rl = IngestRateLimiter::disabled();
+        let now = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(rl.try_take("s", now), "disabled limiter must always admit");
+        }
+    }
+
+    #[test]
+    fn ingest_rate_limiter_isolates_keys_and_refills() {
+        // burst=2, refill=1/s. Key "a" burns its 2 tokens; the 3rd is denied.
+        // Key "b" is unaffected; after 1s "a" refills exactly one token.
+        let mut rl = IngestRateLimiter::new(1.0, 2.0);
+        let t0 = std::time::Instant::now();
+        assert!(rl.try_take("a", t0));
+        assert!(rl.try_take("a", t0));
+        assert!(!rl.try_take("a", t0), "3rd event for 'a' is over burst");
+        assert!(rl.try_take("b", t0), "a different source keeps flowing");
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(rl.try_take("a", t1), "'a' refilled after 1s");
+        assert!(!rl.try_take("a", t1), "only one token refilled");
+    }
+
+    #[test]
+    fn ingest_rate_limiter_is_bounded() {
+        let mut rl = IngestRateLimiter::new(1.0, 1.0);
+        let now = std::time::Instant::now();
+        for i in 0..(INGEST_RATE_MAX_KEYS + 100) {
+            rl.try_take(&format!("k{i}"), now);
+        }
+        assert!(
+            rl.len() <= INGEST_RATE_MAX_KEYS,
+            "keys must stay bounded, got {}",
+            rl.len()
+        );
+    }
+
+    #[test]
+    fn ingest_rate_limiter_bounds_key_bytes() {
+        let mut rl = IngestRateLimiter::new(1.0, 1.0);
+        let huge = "s".repeat(1024 * 1024);
+        assert!(rl.try_take(&huge, std::time::Instant::now()));
+        assert!(
+            rl.max_stored_key_len() <= INGEST_RATE_MAX_KEY_BYTES,
+            "stored limiter keys must be byte-bounded"
+        );
+    }
+
+    #[test]
+    fn ingest_rate_key_uses_actor_and_missing_session_fallback() {
+        let query = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let one = HookEnvelope::from_query_and_body(query.clone(), serde_json::json!({"cwd":"/a"}));
+        let two = HookEnvelope::from_query_and_body(query.clone(), serde_json::json!({"cwd":"/b"}));
+        assert_ne!(ingest_rate_key(&one, None), ingest_rate_key(&two, None));
+
+        let scoped_a = HookEnvelope::from_query_and_body(
+            HookQuery {
+                workspace: Some("team-a".into()),
+                project_strategy: Some("basename".into()),
+                ..query.clone()
+            },
+            serde_json::json!({"cwd":"/same"}),
+        );
+        let scoped_b = HookEnvelope::from_query_and_body(
+            HookQuery {
+                workspace: Some("team-b".into()),
+                project_strategy: Some("repo-root".into()),
+                ..query.clone()
+            },
+            serde_json::json!({"cwd":"/same"}),
+        );
+        assert_ne!(
+            ingest_rate_key(&scoped_a, None),
+            ingest_rate_key(&scoped_b, None)
+        );
+
+        let with_session =
+            HookEnvelope::from_query_and_body(query, serde_json::json!({"session_id":"same"}));
+        assert_ne!(
+            ingest_rate_key(&with_session, Some("alice")),
+            ingest_rate_key(&with_session, Some("bob")),
+            "different actors sharing a session id get separate limiter buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_rate_limits_a_flooding_source_but_not_others() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        // burst=1, ~no refill within the test window: a source's 2nd event is
+        // over budget while a different source is unaffected.
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::new(0.001, 1.0)));
+        let state = Arc::new(state);
+
+        async fn hit(state: Arc<HookState>, sid: &str) -> StatusCode {
+            handle_hook(
+                State(state),
+                Query(HookQuery {
+                    event: "session-start".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                Json(serde_json::json!({ "session_id": sid })),
+            )
+            .await
+            .into_response()
+            .status()
+        }
+
+        assert_eq!(hit(state.clone(), "flooder").await, StatusCode::ACCEPTED);
+        assert_eq!(
+            hit(state.clone(), "flooder").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "2nd event from the same source is over burst → 429"
+        );
+        assert_eq!(
+            hit(state.clone(), "other").await,
+            StatusCode::ACCEPTED,
+            "a different source must not be rate limited"
+        );
+    }
+
     #[tokio::test]
     async fn handle_hook_returns_429_when_ingest_saturated() {
         let tmp = TempDir::new().unwrap();
@@ -1212,6 +2329,37 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_does_not_debit_source_token_when_globally_saturated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::new(0.001, 1.0)));
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(state);
+
+        let query = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = serde_json::json!({ "session_id": "global-first" });
+        let first = handle_hook(
+            State(state.clone()),
+            Query(query.clone()),
+            None,
+            Json(body.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        state.ingest_semaphore.add_permits(1);
+        let second = handle_hook(State(state), Query(query), None, Json(body))
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -1243,6 +2391,336 @@ mod tests {
         assert_eq!(ack["accepted"], 2, "both events committed, oldest-first");
     }
 
+    /// `pre-tool-use` query+agent for building an env to recompute a SessionId.
+    fn grok_tool_query() -> HookQuery {
+        HookQuery {
+            event: "pre-tool-use".into(),
+            agent: Some("grok".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_drops_subagent_events_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // A grok subagent tool-use event (carries `subagentType`) alongside a
+        // top-level event (no marker), in ONE batch.
+        let sub_body = serde_json::json!({
+            "sessionId": "sub-s1", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let top_body = serde_json::json!({ "sessionId": "top-s1", "toolName": "x" });
+        // The project opted in (`.ai-memory.toml` → `drop_subagent=1`), so every
+        // event carries the flag; only the actual subagent capture is dropped.
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: sub_body.clone(),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: top_body.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Accept-but-drop: BOTH are acked so the client clears its spool…
+        assert_eq!(
+            ack["accepted"], 2,
+            "both acked so the client clears its spool"
+        );
+
+        // …but only the top-level event was persisted; the subagent left nothing.
+        let sub_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            sub_body,
+        ))
+        .unwrap();
+        let top_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            top_body,
+        ))
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "subagent capture must not be persisted"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "top-level capture is persisted as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_keeps_subagent_events_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // No `drop_subagent` flag on the request → the project did not opt in,
+        // so its subagent captures are stored as usual.
+        let sub_body = serde_json::json!({
+            "sessionId": "sub-s2", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let items = vec![HookBatchItem {
+            url: "http://h/hook?event=pre-tool-use&agent=grok".into(),
+            body: sub_body.clone(),
+        }];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sub_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            sub_body,
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "without the per-project opt-in, subagent captures are stored (default behavior)"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_subagent_captures_drops_unmarked_tail_of_tracked_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // (1) marked subagent event seeds session "sub" (and is dropped);
+        // (2) a later UNMARKED event on "sub" is the tail → dropped via tracking;
+        // (3) an UNMARKED event on a never-seeded session "top" → kept.
+        let marked = serde_json::json!({
+            "sessionId": "sub", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let tail = serde_json::json!({ "sessionId": "sub", "toolName": "y" });
+        let top = serde_json::json!({ "sessionId": "top", "toolName": "z" });
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: marked,
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: tail.clone(),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: top.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3, "all acked: 2 dropped + 1 processed");
+
+        let sub_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(grok_tool_query(), tail))
+                .unwrap();
+        let top_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(grok_tool_query(), top)).unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the unmarked tail of a tracked subagent session is dropped"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an unmarked event on a non-subagent session is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_start_event_seeds_the_session_so_its_tail_drops() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // SubagentStart seeds session "ss" BEFORE its first content event, so even
+        // the leading unmarked user_prompt_submit is dropped.
+        let start = serde_json::json!({ "sessionId": "ss" });
+        let lead = serde_json::json!({ "sessionId": "ss", "prompt": "go" });
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=subagent-start&agent=grok&drop_subagent=1".into(),
+                body: start,
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=grok&drop_subagent=1".into(),
+                body: lead.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("grok".into()),
+                ..Default::default()
+            },
+            lead,
+        ))
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "SubagentStart seeds the session so the leading unmarked event drops too"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_subagent_tracking_is_scoped_by_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let actor = ai_memory_core::ActorKey::default();
+
+        let marked_project_a = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-a".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionId": "shared-session", "subagentType": "general-purpose"
+            }),
+        );
+        assert!(should_drop_subagent(&state, &marked_project_a, &actor).await);
+
+        let unmarked_project_b = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-b".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
+        );
+        assert!(
+            !should_drop_subagent(&state, &unmarked_project_b, &actor).await,
+            "a subagent session tracked in project-a must not drop same-id events in project-b"
+        );
+
+        let unmarked_project_a = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-a".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &unmarked_project_a, &actor).await,
+            "the originally tracked project's unmarked tail still drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_keeps_session_tracked_until_session_end_tail_drops() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let actor = ai_memory_core::ActorKey::default();
+
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("grok".into()),
+            project: Some("tail-project".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+
+        let start = HookEnvelope::from_query_and_body(
+            query("subagent-start"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(should_drop_subagent(&state, &start, &actor).await);
+
+        let subagent_stop = HookEnvelope::from_query_and_body(
+            query("subagent-stop"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(should_drop_subagent(&state, &subagent_stop, &actor).await);
+
+        let unmarked_stop_tail = HookEnvelope::from_query_and_body(
+            query("stop"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &unmarked_stop_tail, &actor).await,
+            "SubagentStop must not clear tracking before the unmarked stop tail"
+        );
+
+        let session_end_tail = HookEnvelope::from_query_and_body(
+            query("session-end"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &session_end_tail, &actor).await,
+            "SessionEnd tail is dropped and then clears tracking"
+        );
+
+        let after_session_end = HookEnvelope::from_query_and_body(
+            query("pre-tool-use"),
+            serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
+        );
+        assert!(
+            !should_drop_subagent(&state, &after_session_end, &actor).await,
+            "SessionEnd clears tracking for that scoped session"
+        );
+    }
+
     #[tokio::test]
     async fn handle_hook_batch_returns_429_when_saturated() {
         let tmp = TempDir::new().unwrap();
@@ -1260,6 +2738,136 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_skips_rate_limited_first_item_and_accepts_later_source() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let mut limiter = IngestRateLimiter::new(0.001, 1.0);
+        assert!(limiter.try_take("u:\ns:flooder", std::time::Instant::now()));
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(limiter));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "flooder" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "other" }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 0);
+        assert_eq!(ack["accepted_indices"], serde_json::json!([1]));
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_reports_failed_index_after_rate_limited_skip() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let mut limiter = IngestRateLimiter::new(0.001, 1.0);
+        assert!(limiter.try_take("u:\ns:flooder", std::time::Instant::now()));
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(limiter));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "flooder" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                    body: serde_json::json!({ "prompt": "missing session fails" }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 0);
+        assert_eq!(ack["accepted_indices"], serde_json::json!([]));
+        assert_eq!(ack["failed_index"], 1);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_drops_subagent_events_before_capacity_check() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: serde_json::json!({
+                    "sessionId": "saturated-subagent", "subagentType": "general-purpose"
+                }),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 1,
+            "droppable subagent batch items should clear the spool even when ingest capacity is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_saturated_after_prefix_reports_accepted_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                    body: serde_json::json!({
+                        "sessionId": "saturated-prefix", "subagentType": "general-purpose"
+                    }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=grok".into(),
+                    body: serde_json::json!({
+                        "sessionId": "saturated-prefix", "prompt": "retry later"
+                    }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1, "429 still reports the committed prefix");
     }
 
     #[tokio::test]
@@ -1286,7 +2894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_hook_batch_acquires_capacity_per_item() {
+    async fn handle_hook_batch_processes_sequentially_with_one_permit() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1305,7 +2913,15 @@ mod tests {
             .await
             .into_response();
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 2,
+            "batch processing is sequential, so one permit is enough for processed items"
+        );
     }
 
     #[test]
@@ -1525,12 +3141,12 @@ mod tests {
             .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
             .await
             .unwrap();
-        // Three poison rows that would each match too broadly without
-        // the safety filters.
+        // Poison rows that would match too broadly without the safety filters.
+        // New trailing-slash repo paths are normalized at the store write
+        // boundary; legacy raw trailing separators are covered in store tests.
         for (name, repo) in [
             ("empty-repo", String::new()),
             ("root-repo", String::from("/")),
-            ("trailing-repo", String::from("/repo/foo/")),
         ] {
             state
                 .writer
@@ -1539,7 +3155,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Resolve a cwd that the three poison rows would each match
+        // Resolve a cwd that the poison rows would each match
         // pre-fix. Expect: a NEW project created by basename.
         let (resolved_ws, resolved) = resolve_project_ids(
             &state,
@@ -2068,6 +3684,22 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    #[test]
+    fn project_cache_store_can_evict_by_workspace_id() {
+        let mut cache = ProjectCacheStore::new(4);
+        let doomed_ws = WorkspaceId::new();
+        let kept_ws = WorkspaceId::new();
+        let key_a = ("/a".into(), String::new(), String::new(), "basename".into());
+        let key_b = ("/b".into(), String::new(), String::new(), "basename".into());
+
+        cache.insert(key_a.clone(), (doomed_ws, ProjectId::new()));
+        cache.insert(key_b.clone(), (kept_ws, ProjectId::new()));
+        cache.retain(|_, (ws, _)| *ws != doomed_ws);
+
+        assert!(!cache.contains_key(&key_a));
+        assert!(cache.contains_key(&key_b));
+    }
+
     /// If the cached project is deleted out from under the router (e.g.
     /// `purge-project` on a live server), the next event must self-heal:
     /// evict the stale slot, recreate the project, and ingest — instead of
@@ -2104,7 +3736,7 @@ mod tests {
         //    points at it (exactly the purge-on-live-server scenario).
         state
             .writer
-            .purge_project(ws, proj, "default/heal-project")
+            .purge_project(ws, proj, "default/heal-project", None)
             .await
             .unwrap();
         assert!(
@@ -2287,7 +3919,7 @@ mod tests {
 
         state
             .writer
-            .purge_project(ws, proj, "default/repo-root-project")
+            .purge_project(ws, proj, "default/repo-root-project", None)
             .await
             .unwrap();
 
@@ -2393,6 +4025,366 @@ mod tests {
                 .any(|p| p.path.as_str().starts_with("sessions/")),
             "SessionEnd must write a heuristic sessions/<id>.md page regardless of the flag; got {:?}",
             pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_does_not_end_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "22222222-2222-2222-2222-222222222222";
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": sid }),
+        );
+        process(&state, env, None).await.unwrap();
+
+        let completed = state
+            .reader
+            .latest_completed_session_for_project(state.workspace_id, state.project_id)
+            .await
+            .unwrap();
+        assert!(
+            completed.is_none(),
+            "Stop must not be treated as SessionEnd"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_closes_only_matching_scoped_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let target = state
+            .writer
+            .get_or_create_project(state.workspace_id, "target", None)
+            .await
+            .unwrap();
+        let other = state
+            .writer
+            .get_or_create_project(state.workspace_id, "other", None)
+            .await
+            .unwrap();
+        let target_sid = SessionId::new();
+        let other_project_sid = SessionId::new();
+        let other_agent_sid = SessionId::new();
+        for (id, project_id, agent) in [
+            (target_sid, target, AgentKind::Codex),
+            (other_project_sid, other, AgentKind::Codex),
+            (other_agent_sid, target, AgentKind::ClaudeCode),
+        ] {
+            state
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: state.workspace_id,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                })
+                .await
+                .unwrap();
+        }
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-end".into(),
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/target".into()),
+                workspace: Some("default".into()),
+                project: Some("target".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": target_sid.to_string(), "cwd": "/tmp/target" }),
+        );
+        process(&state, env, None).await.unwrap();
+
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, target)
+                .await
+                .unwrap(),
+            Some(target_sid)
+        );
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(state.workspace_id, other, AgentKind::Codex, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "other project Codex session must remain open"
+        );
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    target,
+                    AgentKind::ClaudeCode,
+                    None
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "other agent session in same project must remain open"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_session_end_does_not_create_summary_or_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let target = state
+            .writer
+            .get_or_create_project(state.workspace_id, "target", None)
+            .await
+            .unwrap();
+        let other = state
+            .writer
+            .get_or_create_project(state.workspace_id, "other", None)
+            .await
+            .unwrap();
+        let wrong_project_sid = SessionId::new();
+        let wrong_agent_sid = SessionId::new();
+        for (id, project_id, agent) in [
+            (wrong_project_sid, other, AgentKind::Codex),
+            (wrong_agent_sid, target, AgentKind::ClaudeCode),
+        ] {
+            state
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: state.workspace_id,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                })
+                .await
+                .unwrap();
+        }
+
+        for sid in [wrong_project_sid, wrong_agent_sid] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "session-end".into(),
+                    agent: Some("codex".into()),
+                    cwd: Some("/tmp/target".into()),
+                    workspace: Some("default".into()),
+                    project: Some("target".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid.to_string(), "cwd": "/tmp/target" }),
+            );
+            process(&state, env, None).await.unwrap();
+        }
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, target, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .all(|p| !p.path.as_str().starts_with("sessions/")),
+            "mismatched SessionEnd must not write target summary pages: {:?}",
+            pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, target, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "mismatched SessionEnd must not create a target handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_ended_session_end_does_not_create_summary_or_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let target = state
+            .writer
+            .get_or_create_project(state.workspace_id, "target", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        state
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: state.workspace_id,
+                project_id: target,
+                agent_kind: AgentKind::Codex,
+                cwd: Some(std::path::PathBuf::from("/tmp/target")),
+            })
+            .await
+            .unwrap();
+        state.writer.end_session(sid, None).await.unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-end".into(),
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/target".into()),
+                workspace: Some("default".into()),
+                project: Some("target".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": sid.to_string(), "cwd": "/tmp/target" }),
+        );
+        process(&state, env, None).await.unwrap();
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, target, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .all(|p| !p.path.as_str().starts_with("sessions/")),
+            "already-ended synthetic SessionEnd must not write summary pages"
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, target, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "already-ended synthetic SessionEnd must not create a handoff"
+        );
+    }
+
+    // Issue #152: an agent that resumes an ended session under the same id
+    // and keeps working must get its page re-compiled by the second
+    // SessionEnd instead of that end being dropped as "already-ended".
+    #[tokio::test]
+    async fn resumed_session_second_end_reruns_end_path() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "33333333-3333-3333-3333-333333333333";
+        let session_id: SessionId = sid.parse().unwrap();
+        let fire = |event: &str, tool: Option<&str>| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            if let Some(tool) = tool {
+                body["tool_name"] = serde_json::Value::String(tool.into());
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        // First life: one tool call, then a real end.
+        process(&state, fire("post-tool-use", Some("Bash")), None)
+            .await
+            .unwrap();
+        process(&state, fire("session-end", None), None)
+            .await
+            .unwrap();
+        let disposition = state
+            .reader
+            .session_end_disposition(
+                session_id,
+                state.workspace_id,
+                state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::DropStale,
+            "a freshly-ended session with no newer work must drop duplicate ends"
+        );
+        let page_after_first_end = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path.as_str().starts_with("sessions/"))
+            .expect("first SessionEnd writes the session page");
+
+        // Second life: the agent resumed the same id and did more work.
+        process(&state, fire("post-tool-use", Some("Edit")), None)
+            .await
+            .unwrap();
+        let disposition = state
+            .reader
+            .session_end_disposition(
+                session_id,
+                state.workspace_id,
+                state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::ReEndWithNewWork,
+            "observations after ended_at must mark the session re-endable"
+        );
+
+        process(&state, fire("session-end", None), None)
+            .await
+            .unwrap();
+
+        let page_after_second_end = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path.as_str().starts_with("sessions/"))
+            .expect("second SessionEnd keeps the session page");
+        // The rewrite supersedes the page, so the latest version carries a
+        // new page id.
+        assert_ne!(
+            page_after_first_end.id, page_after_second_end.id,
+            "the re-end must rewrite the session page with the resumed work"
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, state.project_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the re-end must refresh the auto-handoff"
+        );
+        // ended_at advanced past the resumed work: the next duplicate end is
+        // dropped again (pins the de1cef2 dedupe behaviour post-re-end).
+        let disposition = state
+            .reader
+            .session_end_disposition(
+                session_id,
+                state.workspace_id,
+                state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::DropStale,
+            "after the re-end, ended_at must cover the resumed work again"
         );
     }
 
@@ -2585,6 +4577,8 @@ mod tests {
                 workspace: Some("acme".into()),
                 project: None,
                 project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
             },
             None,
         )
@@ -2594,6 +4588,184 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    fn brief_page(
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+        path: &str,
+        body: &str,
+        pinned: bool,
+    ) -> ai_memory_core::NewPage {
+        ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new(path).unwrap(),
+            title: path.trim_end_matches(".md").to_string(),
+            body: body.into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned,
+            links: Vec::new(),
+            author_id: None,
+        }
+    }
+
+    /// `briefing=true` on the `/handoff` query returns the compiled project
+    /// brief even with NO pending handoff — the `/clear` case of #176 — and
+    /// a truthy value combined with a pending handoff returns both, handoff
+    /// first. A non-truthy value leaves the endpoint's contract unchanged.
+    #[tokio::test]
+    async fn handoff_query_briefing_flag_appends_project_brief() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/briefed-repo";
+
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                ws,
+                proj,
+                "_rules/style.md",
+                "always use the single writer actor",
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let query = |briefing: Option<&str>| HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.into()),
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: briefing.map(str::to_owned),
+            briefing_budget: None,
+        };
+
+        // Non-truthy opt-in: no handoff pending, nothing to inject.
+        let rendered = fetch_and_accept_handoff(&state, query(Some("false")), None)
+            .await
+            .unwrap();
+        assert!(
+            rendered.is_none(),
+            "non-truthy briefing flag must not inject anything"
+        );
+
+        // Truthy opt-in, no pending handoff: brief alone (the /clear case).
+        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+            .await
+            .unwrap()
+            .expect("brief must be injected without a pending handoff");
+        assert!(
+            rendered.contains("project brief") && rendered.contains("single writer actor"),
+            "brief must carry the rules page body: {rendered}"
+        );
+        assert!(
+            rendered.contains("do NOT re-explore"),
+            "brief must end with the agent-facing reading instructions"
+        );
+
+        // Truthy opt-in with a pending handoff: handoff first, brief after.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                summary: "resume the auth refactor".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+            .await
+            .unwrap()
+            .expect("handoff + brief must both be injected");
+        let handoff_pos = rendered.find("resume the auth refactor").unwrap();
+        let brief_pos = rendered.find("project brief").unwrap();
+        assert!(
+            handoff_pos < brief_pos,
+            "pending handoff must precede the brief"
+        );
+    }
+
+    /// The brief renderer respects the char budget: an over-budget body is
+    /// truncated with a visible note, fully crowded-out core pages are
+    /// listed as omitted, and an empty project renders nothing at all.
+    #[test]
+    fn render_session_brief_enforces_budget() {
+        let core = vec![
+            ai_memory_store::BriefPageBody {
+                path: "_rules/a.md".into(),
+                title: "a".into(),
+                body: "x".repeat(2_000),
+                pinned: true,
+                updated_at: "2026-07-12T00:00:00Z".into(),
+            },
+            ai_memory_store::BriefPageBody {
+                path: "_rules/b.md".into(),
+                title: "b".into(),
+                body: "never truncated into view".into(),
+                pinned: false,
+                updated_at: "2026-07-12T00:00:00Z".into(),
+            },
+        ];
+        let recent = vec![ai_memory_store::BriefingPage {
+            path: "concepts/q.md".into(),
+            title: "queue".into(),
+            kind: "fact".into(),
+            updated_at: "2026-07-12T00:00:00Z".into(),
+        }];
+
+        let out = render_session_brief(&core, &recent, BRIEF_BUDGET_MIN).unwrap();
+        assert!(
+            out.contains("[truncated by `[briefing] max_chars`]"),
+            "over-budget body must be visibly truncated: {out}"
+        );
+        assert!(
+            out.contains("Core pages omitted by budget") && out.contains("`_rules/b.md`"),
+            "crowded-out core pages must be listed by path: {out}"
+        );
+        assert!(
+            !out.contains("never truncated into view"),
+            "omitted page bodies must not leak: {out}"
+        );
+        assert!(
+            out.contains("Recently updated pages") && out.contains("concepts/q.md"),
+            "recent pointers survive the budget cut: {out}"
+        );
+
+        // Multi-byte safety: a body of 4-byte chars must cut on a boundary.
+        let emoji_core = vec![ai_memory_store::BriefPageBody {
+            path: "_rules/e.md".into(),
+            title: "e".into(),
+            body: "🦀".repeat(1_000),
+            pinned: false,
+            updated_at: "2026-07-12T00:00:00Z".into(),
+        }];
+        let out = render_session_brief(&emoji_core, &[], BRIEF_BUDGET_MIN).unwrap();
+        assert!(out.is_char_boundary(out.len()), "must remain valid UTF-8");
+
+        assert!(
+            render_session_brief(&[], &[], BRIEF_BUDGET_DEFAULT).is_none(),
+            "empty project must inject nothing"
         );
     }
 
@@ -2638,6 +4810,8 @@ mod tests {
                 workspace: None,
                 project: None,
                 project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
             },
             None,
         )
@@ -2952,7 +5126,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn repo_root_override_stores_repo_path_in_cwd_namespace() {
         let tmp = TempDir::new().unwrap();
@@ -2965,7 +5139,9 @@ mod tests {
         std::fs::create_dir_all(real_repo.join("sibling")).unwrap();
 
         let alias_root = tmp.path().join("alias");
-        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        if !create_test_symlink_dir(&real_root, &alias_root) {
+            return;
+        }
         let alias_app = alias_root.join("repo/app");
         let alias_sibling = alias_root.join("repo/sibling");
 
@@ -3047,19 +5223,41 @@ mod tests {
 
         // Create a real git repo inside the temp dir.
         let main_dir = tmp.path().join("my-project");
-        let repo = init_repo_with_commit(&main_dir);
 
         // Create a worktree in a sibling directory.
         let wt_dir = tmp.path().join("my-project-feature-branch");
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        // Create a branch for the worktree to check out.
-        let branch = repo.branch("feature-branch", &head, false).unwrap();
-        repo.worktree(
-            "feature-branch",
-            &wt_dir,
-            Some(git2::WorktreeAddOptions::new().reference(Some(&branch.into_reference()))),
-        )
-        .unwrap();
+        #[cfg(windows)]
+        {
+            init_repo_with_commit(&main_dir);
+            let mut branch = std::process::Command::new("git");
+            branch
+                .arg("-C")
+                .arg(&main_dir)
+                .args(["branch", "feature-branch"]);
+            assert_command_success(branch);
+
+            let mut worktree = std::process::Command::new("git");
+            worktree
+                .arg("-C")
+                .arg(&main_dir)
+                .args(["worktree", "add", "-q"])
+                .arg(&wt_dir)
+                .arg("feature-branch");
+            assert_command_success(worktree);
+        }
+        #[cfg(not(windows))]
+        {
+            let repo = init_repo_with_commit(&main_dir);
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            // Create a branch for the worktree to check out.
+            let branch = repo.branch("feature-branch", &head, false).unwrap();
+            repo.worktree(
+                "feature-branch",
+                &wt_dir,
+                Some(git2::WorktreeAddOptions::new().reference(Some(&branch.into_reference()))),
+            )
+            .unwrap();
+        }
 
         let main_cwd = main_dir.to_str().unwrap();
         let wt_cwd = wt_dir.to_str().unwrap();
@@ -3158,6 +5356,9 @@ mod tests {
         let state = make_state(&tmp).await;
 
         let bare_dir = tmp.path().join("my-bare-project.git");
+        #[cfg(windows)]
+        init_bare_repo(&bare_dir);
+        #[cfg(not(windows))]
         git2::Repository::init_bare(&bare_dir).unwrap();
         let cwd = bare_dir.to_str().unwrap();
 
@@ -3178,6 +5379,9 @@ mod tests {
         // The project name should come from basename, not from the grandparent.
         // To verify: resolve with a different bare repo name and confirm different project.
         let bare_dir2 = tmp.path().join("other-bare.git");
+        #[cfg(windows)]
+        init_bare_repo(&bare_dir2);
+        #[cfg(not(windows))]
         git2::Repository::init_bare(&bare_dir2).unwrap();
         let (_, proj2) = resolve_project_ids(
             &state,

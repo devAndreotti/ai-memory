@@ -46,8 +46,10 @@ from hook paths.
 1. Agent CLI emits a lifecycle hook (SessionStart, UserPromptSubmit,
    PostToolUse, …). Shell-script hooks `curl` event JSON to `POST /hook`
    with a short timeout. Native `ai-memory hook --event ...` commands spool
-   events locally and drain them at session boundaries; high-latency
-   operators can raise the drain/handoff caps with minute-based env vars.
+   events locally, do a short bounded cleanup at session start, and hand
+   session-end delivery to a detached lock-aware `hook-drain` helper;
+   high-latency operators can raise the drain/handoff/background caps with
+   minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP
    429 instead of queueing unbounded work.
 2. Server's hook router sanitises the payload (the only path from
@@ -57,9 +59,8 @@ from hook paths.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. Auto-commits the wiki. Clients
-   without a true session-end hook (currently OpenCode and Antigravity
-   CLI) should call `memory_handoff_begin` before quitting when a
-   handoff is needed.
+   without a true session-end hook (currently Antigravity CLI) should call
+   `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
@@ -79,13 +80,18 @@ from hook paths.
    rejected candidates/rejection-buffer entries rather than wiki writes.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
-   the same RRF. If compiled wiki pages miss entirely, bounded raw
-   observation FTS returns fallback `raw_hits`. Page hits bump
-   `access_count` + `last_accessed_at` - the M8 reinforcement term.
+   the same RRF. If compiled wiki pages miss entirely in default,
+   explicit project, or explicit `scopes` mode, bounded raw observation
+   FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
+   pages across projects only. Page hits bump `access_count` +
+   `last_accessed_at` - the M8 reinforcement term.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
    access get purged. Semantic / pinned / freshly-touched pages survive.
+   Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
+   enumerate every existing workspace/project scope before doing per-project
+   work, matching the auto-improvement scheduler's store-wide scope model.
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
@@ -218,7 +224,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. Defaults to the current project; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
@@ -229,7 +235,7 @@ invariants below.
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
-| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
+| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. `scope: "global"` writes into the reserved `_global` preferences scope instead of the current project. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |

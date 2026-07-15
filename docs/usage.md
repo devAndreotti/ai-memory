@@ -78,10 +78,11 @@ The agent calls `memory_install_self_routing` and receives the slim
 `markered_block`, marker strings, rules-file hints, managed skill payloads,
 skill target hints, and overwrite guidance. It then uses its normal file-edit
 tool to preserve unrelated user content, replace or append the
-`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block, and write each
-managed skill below the selected skill root. Skill files are ai-memory-managed
-only when they contain the managed marker, so unmanaged same-name skills should
-not be overwritten unless the human explicitly forces replacement.
+`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block only when the
+marker delimiters appear alone on their own lines, and write each managed skill
+below the selected skill root. Skill files are ai-memory-managed only when they
+contain the managed marker, so unmanaged same-name skills should not be
+overwritten unless the human explicitly forces replacement.
 
 From a terminal:
 
@@ -94,6 +95,8 @@ ai-memory install-instructions --no-skills
 
 `install-instructions` installs or updates managed skills by default. Use
 `--no-skills` only when you intentionally want a snippet-only refresh.
+The CLI replaces only the markered ai-memory block, preserves unrelated content,
+and writes a timestamped backup before changing an existing instruction file.
 `install-instructions --print` previews the instruction snippet only; use
 `install-skills --print` to preview skill payloads. Skill flags mirror
 `install-skills` with an `--skills-` prefix:
@@ -285,3 +288,31 @@ rule looks durable enough to copy into `CLAUDE.md` or `AGENTS.md`.
 ai-memory never edits the rules file on its own. The lint suggestion is
 the whole workflow: copy the rule if it should apply every turn, ignore
 it if it was temporary context.
+
+## Architecture Decision Records (ADRs)
+
+Two facts frame how ADRs and ai-memory interact:
+
+1. **ai-memory never touches files in your repository.** Its wiki lives
+   in the server's data dir; the background jobs (consolidation,
+   curation, retention decay, auto-improvement) read and write wiki
+   pages only. A `docs/adr/` directory in the repo — maintained by hand
+   or by a dedicated ADR tool/MCP server (e.g.
+   [joshrotenberg/adrs](https://github.com/joshrotenberg/adrs)) — is
+   categorically outside ai-memory's write surface. Run both side by
+   side without ceremony: the ADR tool owns the canonical log, ai-memory
+   owns cross-session recall.
+
+2. **Wiki pages marked `pinned: true` are immutable to automation.**
+   Retention decay and curation skip them, and the auto-improvement
+   apply path hard-refuses to rewrite them (the proposal is recorded as
+   a conflict with the reason). Unpinning is the explicit opt-out.
+
+For decisions recorded *in* the wiki, the managed durable-pages Agent
+Skill teaches agents the recipe: `decisions/<slug>.md`, ADR structure
+(Status / Context / Decision / Consequences, including rejected
+alternatives), `pinned: true`, and supersede-by-new-page instead of
+editing history. Ask an agent to "record this as an architectural
+decision" and the skill does the rest; the structured shape also
+retrieves noticeably better through `memory_query` than free-form
+prose.

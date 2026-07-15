@@ -191,15 +191,41 @@ pub enum AgentKind {
     OpenClaw,
     /// Google Antigravity CLI (`agy`).
     AntigravityCli,
-    /// Oh My Pi (`omp`) / Pi-compatible coding agent.
+    /// Oh My Pi (`omp`) coding agent.
     Omp,
+    /// Pi coding agent.
+    #[serde(rename = "pi")]
+    Pi,
     /// xAI Grok Build CLI (`grok`).
     Grok,
+    /// Zero coding agent (Gitlawb/zero).
+    Zero,
     /// Anything else (manual capture, future agents).
     Other,
 }
 
 impl AgentKind {
+    /// Every variant, for tests that must cover the full agent surface —
+    /// e.g. the store-level check that the persisted `sessions.agent_kind`
+    /// CHECK constraint accepts every kind (the Zero integration shipped
+    /// with the enum variant but without the V26 migration and only a
+    /// live test caught it). Extend together with the enum.
+    pub const ALL: [Self; 13] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Cursor,
+        Self::GeminiCli,
+        Self::ClaudeDesktop,
+        Self::OpenClaw,
+        Self::AntigravityCli,
+        Self::Omp,
+        Self::Pi,
+        Self::Grok,
+        Self::Zero,
+        Self::Other,
+    ];
+
     /// Kebab-case wire string matching the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -213,7 +239,9 @@ impl AgentKind {
             Self::OpenClaw => "openclaw",
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
+            Self::Pi => "pi",
             Self::Grok => "grok",
+            Self::Zero => "zero",
             Self::Other => "other",
         }
     }
@@ -232,8 +260,10 @@ impl AgentKind {
             "claude-desktop" | "claude_desktop" => Self::ClaudeDesktop,
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
-            "omp" | "pi" | "oh-my-pi" => Self::Omp,
+            "pi" => Self::Pi,
+            "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
+            "zero" => Self::Zero,
             _ => Self::Other,
         }
     }
@@ -243,7 +273,9 @@ impl AgentKind {
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
     /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), so
+    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Zero's agent loop discards the sessionStart dispatch result entirely
+    /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
     /// **destructive** (the server marks the handoff accepted) and the result
     /// would be discarded — silently losing the handoff. For such agents the
@@ -253,7 +285,7 @@ impl AgentKind {
     /// should fail safe.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Other)
+        !matches!(self, Self::Grok | Self::Zero | Self::Other)
     }
 }
 
@@ -297,6 +329,7 @@ mod tests {
         // Grok cannot inject the session-start handoff (ignores hook stdout);
         // every other agent can.
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
         assert!(!AgentKind::Other.session_start_injects_handoff());
@@ -346,6 +379,17 @@ mod tests {
 
         let omp = serde_json::to_string(&AgentKind::Omp).unwrap();
         assert_eq!(omp, "\"omp\"");
+        assert_eq!(AgentKind::from_wire("omp"), AgentKind::Omp);
+        assert_eq!(AgentKind::from_wire("oh-my-pi"), AgentKind::Omp);
+
+        let pi = serde_json::to_string(&AgentKind::Pi).unwrap();
+        assert_eq!(pi, "\"pi\"");
+        assert_eq!(AgentKind::Pi.as_str(), "pi");
+        assert_eq!(AgentKind::from_wire("pi"), AgentKind::Pi);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>(&pi).unwrap(),
+            AgentKind::Pi
+        );
 
         let openclaw = serde_json::to_string(&AgentKind::OpenClaw).unwrap();
         assert_eq!(openclaw, "\"openclaw\"");

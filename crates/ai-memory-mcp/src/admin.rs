@@ -18,6 +18,8 @@
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
+//! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
 //! - `POST /admin/move-project`   — move a project into another workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
@@ -30,8 +32,10 @@
 
 use std::sync::Arc;
 
+use std::future::Future;
 use std::io::Seek;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
@@ -49,7 +53,7 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
     DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
     ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope,
+    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -67,6 +71,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 const EMBEDDING_WRITE_BATCH: usize = 100;
+const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -125,13 +130,32 @@ pub struct AdminState {
     /// hook router is attached (admin-only tests).
     pub active_project: ActiveProject,
     /// Optional hook to PROACTIVELY evict the hook router's per-cwd
-    /// `(workspace_id, project_id)` cache for a project that just moved
-    /// workspaces. Called with the moved `project_id` after a successful move
-    /// so the next hook event re-resolves cleanly instead of tripping the
-    /// pairing trigger on a stale cached pair first. Fire-and-forget
-    /// (best-effort); the trigger + router re-resolve are the correctness net.
-    /// `None` when no hook router is attached (stdio / admin-only tests).
-    pub on_project_moved: Option<std::sync::Arc<dyn Fn(ProjectId) + Send + Sync>>,
+    /// `(workspace_id, project_id)` cache after admin scope mutations. Admin
+    /// handlers await this after successful moves/purges/deletes/renames so
+    /// the next hook event re-resolves cleanly instead of racing through a
+    /// stale cached pair. `None` when no hook router is attached (stdio /
+    /// admin-only tests).
+    pub scope_invalidator: Option<ScopeInvalidator>,
+}
+
+/// Async hook-router project-cache invalidator installed by the serve command.
+pub type ScopeInvalidator = Arc<
+    dyn Fn(ScopeInvalidation) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync,
+>;
+
+/// Hook-router project-cache invalidation target for admin scope mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeInvalidation {
+    /// Evict cache entries whose resolved project id matches.
+    Project(ProjectId),
+    /// Evict cache entries whose resolved workspace id matches.
+    Workspace(WorkspaceId),
+}
+
+async fn invalidate_scope_cache(state: &AdminState, target: ScopeInvalidation) {
+    if let Some(evict) = &state.scope_invalidator {
+        evict(target).await;
+    }
 }
 
 /// JSON request body for `POST /admin/bootstrap`.
@@ -515,6 +539,8 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/delete-workspace", post(handle_delete_workspace))
+        .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
@@ -1022,6 +1048,16 @@ async fn lookup_ws_proj_no_create(
     lookup_existing_scope(&state.reader, workspace, project)
         .await
         .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
+}
+
+/// Look up a workspace by name **without** auto-creating it.
+async fn lookup_ws_no_create(
+    state: &AdminState,
+    workspace: &str,
+) -> Result<WorkspaceId, (StatusCode, Json<serde_json::Value>)> {
+    lookup_existing_workspace(&state.reader, workspace)
+        .await
         .map_err(scope_err)
 }
 
@@ -2839,8 +2875,10 @@ pub struct PurgeProjectReport {
 async fn handle_purge_project(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<PurgeProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     if !req.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -2890,7 +2928,11 @@ async fn handle_purge_project(
         Err(e) => return e,
     };
 
-    let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
+    let summary = match state
+        .writer
+        .purge_project(ws_id, proj_id, &label, author_id)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return internal_err(e.to_string()),
     };
@@ -2928,6 +2970,9 @@ async fn handle_purge_project(
     }
     state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
 
+    state.active_project.clear_project(proj_id);
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
+
     let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-project {label}"));
 
     let report = PurgeProjectReport {
@@ -2952,6 +2997,223 @@ async fn handle_purge_project(
 // ---------------------------------------------------------------------
 // rename-project
 // ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rename-workspace`.
+#[derive(Deserialize)]
+struct RenameWorkspaceRequest {
+    /// Current workspace name (must exist).
+    from: String,
+    /// New workspace name. Must be non-empty, no slashes, and not already used.
+    to: String,
+}
+
+/// Wire-format summary returned by `POST /admin/rename-workspace`.
+#[derive(Debug, Serialize)]
+pub struct RenameWorkspaceResult {
+    /// Previous workspace name.
+    pub from: String,
+    /// New workspace name.
+    pub to: String,
+    /// Post-rename mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Number of scope manifests refreshed after the SQLite rename.
+    pub manifests_refreshed: usize,
+    /// Non-fatal manifest refresh failure after the SQLite rename committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+}
+
+/// `POST /admin/rename-workspace` — rename a workspace (column-only; the
+/// on-disk dir is UUID-keyed, so nothing moves). 404 unknown, 422 taken/invalid.
+async fn handle_rename_workspace(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RenameWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match lookup_ws_no_create(&state, &req.from).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if let Err(e) = state.writer.rename_workspace(ws_id, req.to.clone()).await {
+        let status = match &e {
+            StoreError::WorkspaceNameTaken(_) | StoreError::InvalidWorkspaceName(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (status, Json(serde_json::json!({ "error": e.to_string() })));
+    }
+    let (manifests_refreshed, manifest_warning) = match state.wiki.backfill_scope_manifests().await
+    {
+        Ok(n) => (n, None),
+        Err(e) => {
+            warn!(error = %e, "rename-workspace: scope-manifest backfill failed after rename");
+            (0, Some(e.to_string()))
+        }
+    };
+    invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!("rename-workspace {} -> {}", req.from, req.to),
+    );
+    let result = RenameWorkspaceResult {
+        from: req.from.clone(),
+        to: req.to.clone(),
+        checkpoint,
+        manifests_refreshed,
+        manifest_warning,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
+/// JSON request body for `POST /admin/delete-workspace`.
+#[derive(Deserialize)]
+struct DeleteWorkspaceRequest {
+    /// Workspace name to delete (must exist).
+    workspace: String,
+    /// Delete even when the workspace still holds projects. Without it, a
+    /// non-empty workspace is refused so a typo can't wipe live data.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/delete-workspace`.
+#[derive(Debug, Serialize)]
+pub struct DeleteWorkspaceResult {
+    /// Workspace name that was deleted.
+    pub workspace: String,
+    /// Projects removed via the `workspace_id` cascade.
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+    /// Paths removed from disk (the workspace's UUID-namespaced directory).
+    pub files_deleted: Vec<String>,
+    /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
+    pub files_failed: Vec<String>,
+    /// Pre-delete checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-delete mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
+/// project/page under it. Guarded: refuses a non-empty workspace unless
+/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+async fn handle_delete_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<DeleteWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match lookup_ws_no_create(&state, &req.workspace).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    if !req.force {
+        match state
+            .reader
+            .list_projects_with_stats_for_workspace(req.workspace.clone())
+            .await
+        {
+            Ok(projects) if !projects.is_empty() => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": StoreError::WorkspaceNotEmpty(projects.len() as u64).to_string()
+                    })),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return internal_err(e.to_string()),
+        }
+    }
+
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let purge_ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: String::new(),
+        op: AdmissionOp::PurgeWorkspace,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_workspace(ws_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint = match checkpoint_or_500(
+        &state.wiki,
+        format!("pre-delete-workspace {}", req.workspace),
+    ) {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    let summary = match state.writer.delete_workspace(ws_id, req.force).await {
+        Ok(s) => s,
+        Err(e) => {
+            let status = match &e {
+                StoreError::WorkspaceNotEmpty(_) => StatusCode::CONFLICT,
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+
+    let ws_root_str = state
+        .wiki
+        .root()
+        .join(ws_id.to_string())
+        .display()
+        .to_string();
+    let mut files_deleted = Vec::new();
+    let mut files_failed = Vec::new();
+    match state.wiki.remove_workspace_dir(ws_id).await {
+        Ok(()) => files_deleted.push(ws_root_str.clone()),
+        Err(e) => {
+            warn!(error = %e, workspace = %req.workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
+            files_failed.push(ws_root_str);
+        }
+    }
+
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
+
+    state.active_project.clear_workspace(ws_id);
+    invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+
+    let result = DeleteWorkspaceResult {
+        workspace: req.workspace.clone(),
+        projects_deleted: summary.projects_deleted,
+        pages_deleted: summary.pages_deleted,
+        files_deleted,
+        files_failed,
+        pre_checkpoint,
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {}", req.workspace)),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
 
 /// JSON request body for `POST /admin/rename-project`.
 #[derive(Deserialize)]
@@ -2983,8 +3245,10 @@ pub struct RenameProjectSummary {
 
 async fn handle_rename_project(
     State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<RenameProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
     let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
         Ok(ids) => ids,
@@ -2999,7 +3263,7 @@ async fn handle_rename_project(
     // instead of the previous false-200.
     if let Err(e) = state
         .writer
-        .rename_project(ws_id, proj_id, req.to.clone())
+        .rename_project(ws_id, proj_id, req.to.clone(), author_id)
         .await
     {
         let status = match &e {
@@ -3255,13 +3519,11 @@ async fn true_move_project(
     // unchanged, only its workspace moved. If a hook had published this project
     // as active, republish it under the destination workspace so the next event
     // resolves cleanly (rather than tripping the pairing trigger first).
-    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
-        state.active_project.set(dst_ws, src_proj);
-    }
+    state
+        .active_project
+        .retarget_project_workspace(src_proj, dst_ws);
     // Proactively drop any stale per-cwd cache entry for the moved project.
-    if let Some(evict) = &state.on_project_moved {
-        evict(src_proj);
-    }
+    invalidate_scope_cache(state, ScopeInvalidation::Project(src_proj)).await;
 
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "true-move: scope-manifest backfill failed after move");
@@ -3416,7 +3678,7 @@ async fn handle_move_project(
     // the now-stale workspace id (the (workspace_id, project_id) trigger would
     // make it fail, but the operator should consciously opt in). `force: true`
     // proceeds — safe because the move republishes the active pointer below.
-    if !req.force && state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+    if !req.force && state.active_project.contains_project(src_proj) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -3761,10 +4023,16 @@ async fn copy_purge_merge(
                 // Preserve the stored title verbatim (PageSummary.title is
                 // the DB-derived title), rather than re-deriving it.
                 title: Some(p.title.clone()),
-                // None → the write_page admission chain resolves the
-                // workspace/project NAMES from the destination IDs, so the
-                // git-mirror lands the copy under the destination path.
-                admission_ctx: None,
+                // Skip the named contributors enrich webhook on move copies:
+                // the frontmatter (including the contributors list) is copied
+                // verbatim, so re-enriching each copy adds nothing but blocking
+                // per-page latency to a bulk move. write_page still resolves
+                // the destination NAMES and runs the other hooks (git-mirror),
+                // so the copy lands under the destination path.
+                admission_ctx: Some(AdmissionContext {
+                    skip_webhooks: vec![CONTRIBUTORS_WEBHOOK_NAME.to_string()],
+                    ..AdmissionContext::default()
+                }),
                 author_id: None,
                 actor: actor.clone(),
             })
@@ -3855,7 +4123,14 @@ async fn copy_purge_merge(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+    // The source purge is an internal step of move-project (a distinct op that
+    // records its own move report); it is not attributed as a standalone
+    // `purge_project` here, so the audit author is left NULL.
+    let summary = match state
+        .writer
+        .purge_project(src_ws, src_proj, &label, None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return internal_err(e.to_string()),
     };
@@ -3890,14 +4165,10 @@ async fn copy_purge_merge(
     // The source project_id was just purged; if it was the published active
     // project, the pointer now dangles — clear it so the next hook re-resolves
     // to the (new) project rather than the deleted id.
-    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
-        state.active_project.clear();
-    }
+    state.active_project.clear_project(src_proj);
     // Proactively drop any stale per-cwd cache entry for the purged source
     // project (its project_id no longer exists).
-    if let Some(evict) = &state.on_project_moved {
-        evict(src_proj);
-    }
+    invalidate_scope_cache(state, ScopeInvalidation::Project(src_proj)).await;
 
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "copy-purge move: scope-manifest backfill failed after move");
@@ -4572,7 +4843,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
 
         let resp = router
@@ -4615,7 +4886,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
         (tmp, router)
     }
@@ -4647,7 +4918,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         }
     }
 
@@ -5696,7 +5967,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -5804,7 +6075,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -5905,7 +6176,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6012,7 +6283,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
 
         post_write_page_with_actor(
@@ -6069,6 +6340,276 @@ mod tests {
         assert_eq!(json["source_purged"], true);
     }
 
+    #[tokio::test]
+    async fn move_project_guard_and_true_move_retarget_keyed_active_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "live", "notes/source.md", "source body").await;
+        let src_ws = store
+            .reader
+            .find_workspace("src".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let src_proj = store
+            .reader
+            .find_project(src_ws, "live".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, src_ws, src_proj, false);
+        active.set(WorkspaceId::new(), ProjectId::new());
+
+        let move_body = serde_json::json!({
+            "from_workspace": "src",
+            "project": "live",
+            "to_workspace": "dst",
+            "confirm": true,
+        });
+        let guarded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&move_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guarded.status(), StatusCode::CONFLICT);
+
+        let forced_body = serde_json::json!({
+            "from_workspace": "src",
+            "project": "live",
+            "to_workspace": "dst",
+            "confirm": true,
+            "force": true,
+        });
+        let moved = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&forced_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.status(), StatusCode::OK);
+        let dst_ws = store
+            .reader
+            .find_workspace("dst".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.get_for(&actor), Some((dst_ws, src_proj)));
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_clears_single_and_keyed_active_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        let router = admin_router(state);
+
+        post_write_page(&router, "doomed-ws", "p", "notes/x.md", "bye").await;
+        let ws = store
+            .reader
+            .find_workspace("doomed-ws".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let proj = store
+            .reader
+            .find_project(ws, "p".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, ws, proj, false);
+        active.set(ws, proj);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "doomed-ws",
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(active.get().is_none());
+        assert!(active.get_for(&actor).is_none());
+        assert!(!active.contains_workspace(ws));
+    }
+
+    fn recording_scope_invalidator(
+        seen: Arc<std::sync::Mutex<Vec<ScopeInvalidation>>>,
+    ) -> ScopeInvalidator {
+        Arc::new(move |target| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                // Prove admin handlers await the invalidator before returning;
+                // constructing and dropping this future would not record.
+                tokio::task::yield_now().await;
+                seen.lock().unwrap().push(target);
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_awaits_workspace_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.scope_invalidator = Some(recording_scope_invalidator(seen.clone()));
+        let router = admin_router(state);
+
+        post_write_page(&router, "doomed-ws", "p", "notes/x.md", "bye").await;
+        let ws = store
+            .reader
+            .find_workspace("doomed-ws".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "doomed-ws",
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![ScopeInvalidation::Workspace(ws)]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_purge_move_clears_keyed_active_entries_and_awaits_project_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        state.scope_invalidator = Some(recording_scope_invalidator(seen.clone()));
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "merged", "notes/source.md", "source body").await;
+        post_write_page(
+            &router,
+            "dst",
+            "merged",
+            "notes/existing.md",
+            "existing body",
+        )
+        .await;
+        let src_ws = store
+            .reader
+            .find_workspace("src".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let src_proj = store
+            .reader
+            .find_project(src_ws, "merged".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, src_ws, src_proj, false);
+        active.set(src_ws, src_proj);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from_workspace": "src",
+                            "project": "merged",
+                            "to_workspace": "dst",
+                            "confirm": true,
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(active.get().is_none());
+        assert!(active.get_for(&actor).is_none());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![ScopeInvalidation::Project(src_proj)]
+        );
+    }
+
     // ── user-management endpoints (P1.4) ──────────────────────────
 
     /// Test router that has a token pepper configured (so user-management
@@ -6098,7 +6639,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -6266,6 +6807,16 @@ mod tests {
             ),
             (
                 "POST",
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "default", "force": true}),
+            ),
+            (
+                "POST",
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "default", "to": "renamed"}),
+            ),
+            (
+                "POST",
                 "/admin/write-page",
                 serde_json::json!({
                     "workspace": "default",
@@ -6365,6 +6916,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multiuser_workspace_admin_routes_reach_handler_for_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for (uri, payload) in [
+            (
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "missing", "force": true}),
+            ),
+            (
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "missing", "to": "renamed"}),
+            ),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", "Bearer root-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} rejected root auth"
+            );
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} rejected root auth"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6608,7 +7198,7 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
         });
         // Inject a Root level so we're past the require_root gate;
         // the 503 must come from require_pepper.

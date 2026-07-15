@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::markdown;
 use crate::state::WebState;
 
 /// Cache TTL for page-list, workspace, search, and summary endpoints.
@@ -48,6 +49,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route(
             "/workspaces/{workspace}/projects/{project}/briefing",
             axum::routing::get(briefing_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/audit",
+            axum::routing::get(audit_handler),
         )
         .route(
             "/workspaces/{workspace}/overview",
@@ -422,6 +427,63 @@ async fn briefing_handler(
     ))
 }
 
+/// Upper bound on pages checked for on-disk presence per overview
+/// request. Each row costs one `fs::metadata` call; the newest pages
+/// are checked first, so fresh drift is caught even when capped.
+const MISSING_ON_DISK_STAT_CAP: usize = 2000;
+
+/// Indexed latest pages whose markdown file no longer exists in the
+/// wiki tree. Runs the stat batch on the blocking pool — page counts
+/// are bounded by [`MISSING_ON_DISK_STAT_CAP`], but stats against a
+/// cold or network-mounted volume must not stall the async runtime.
+async fn missing_on_disk_pages(
+    state: &Arc<WebState>,
+    workspace_id: ai_memory_core::WorkspaceId,
+    project_id: Option<ai_memory_core::ProjectId>,
+    limit: usize,
+) -> Result<Vec<HealthPage>, Response> {
+    let refs = state
+        .reader
+        .latest_pages_with_project_ids(workspace_id, project_id, MISSING_ON_DISK_STAT_CAP)
+        .await
+        .map_err(internal_error)?;
+    let wiki = state.wiki.clone();
+    tokio::task::spawn_blocking(move || {
+        refs.into_iter()
+            .filter(|r| {
+                !wiki
+                    .project_root(workspace_id, r.project_id)
+                    .join(&r.page.path)
+                    .is_file()
+            })
+            .map(|r| r.page)
+            .take(limit)
+            .collect()
+    })
+    .await
+    .map_err(|e| internal_error(format!("missing-on-disk stat task: {e}")))
+}
+
+/// Recent `audit_log` entries for a project — who did what, and when.
+/// Covers page writes plus operational actions (purge, rename); read-only,
+/// same cache/auth posture as the other `/api/v1` list endpoints.
+async fn audit_handler(
+    State(state): State<Arc<WebState>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let entries = state
+        .reader
+        .recent_audit_log_for_project(workspace_id, project_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(entries).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
 async fn overview_handler(
     State(state): State<Arc<WebState>>,
     Path(workspace): Path<String>,
@@ -475,6 +537,8 @@ async fn overview_handler(
         .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
+    let missing =
+        missing_on_disk_pages(&state, workspace_id, None, query.limit.clamp(1, 100)).await?;
     let health = ApiHealth {
         stale,
         duplicates,
@@ -484,6 +548,8 @@ async fn overview_handler(
         stale_pages: detail.stale,
         duplicate_pages: detail.duplicates,
         orphan_pages: detail.orphans,
+        broken_link_pages: detail.broken_links,
+        missing_on_disk_pages: missing,
     };
 
     Ok(with_cache(
@@ -535,6 +601,7 @@ async fn project_overview_handler(
         .health_detail_for_project(workspace_id, project_id, limit)
         .await
         .map_err(internal_error)?;
+    let missing = missing_on_disk_pages(&state, workspace_id, Some(project_id), limit).await?;
     let health = ApiHealth {
         stale,
         duplicates,
@@ -544,6 +611,8 @@ async fn project_overview_handler(
         stale_pages: detail.stale,
         duplicate_pages: detail.duplicates,
         orphan_pages: detail.orphans,
+        broken_link_pages: detail.broken_links,
+        missing_on_disk_pages: missing,
     };
 
     Ok(with_cache(
@@ -587,7 +656,15 @@ async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSear
                 path: meta.path,
                 project: meta.project_name,
                 rank: hit.rank,
-                snippet: hit.snippet,
+                // HTML-escape the raw FTS snippet, preserving only the
+                // fixed `<mark>` highlight tags. The SQLite `snippet()`
+                // function splices `<mark>` into the *unescaped* page body,
+                // so without this any HTML in a page body reaches a JSON
+                // consumer verbatim — and the React cockpit renders the
+                // snippet via `dangerouslySetInnerHTML`, which would then
+                // execute it (stored/DOM XSS). The server-rendered search
+                // route already escapes here; the JSON path must match.
+                snippet: markdown::escape_snippet(&hit.snippet),
                 title: hit.title,
                 workspace: meta.workspace_name,
             });
@@ -800,6 +877,14 @@ struct ApiHealth {
     stale_pages: Vec<HealthPage>,
     duplicate_pages: Vec<HealthPage>,
     orphan_pages: Vec<HealthPage>,
+    /// Latest pages with ≥1 unresolved outgoing link. Informational —
+    /// an unresolved link can be an intentional forward reference. No
+    /// authoritative counter; the list itself is the signal (capped).
+    broken_link_pages: Vec<HealthPage>,
+    /// Indexed latest pages whose markdown file is gone from the wiki
+    /// tree (watcher only reacts to create/modify, so deletions and
+    /// unmounted volumes persist as drift). Capped like the others.
+    missing_on_disk_pages: Vec<HealthPage>,
 }
 
 #[derive(Debug, Serialize)]

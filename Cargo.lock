@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -48,6 +48,7 @@ dependencies = [
  "dirs",
  "figment",
  "flate2",
+ "fs2",
  "getrandom 0.3.4",
  "jiff",
  "reqwest",
@@ -71,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -94,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "jiff",
  "regex",
@@ -109,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -128,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -151,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -174,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -202,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -220,12 +221,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "ai-memory-web"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-store",
@@ -248,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "1.4.0"
+version = "1.12.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -334,9 +336,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "askama"
@@ -695,9 +697,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -946,6 +948,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

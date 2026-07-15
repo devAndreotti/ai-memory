@@ -1,4 +1,4 @@
-//! Integration tests for installing ai-memory instructions.
+//! Integration tests for ai-memory routing instructions.
 
 use std::fs;
 use std::path::Path;
@@ -16,6 +16,7 @@ fn run_ai_memory(project: &Path, home: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(project)
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
         .output()
         .unwrap()
@@ -111,6 +112,48 @@ fn no_skills_writes_only_instruction_snippet() {
 }
 
 #[test]
+fn install_instructions_updates_only_markered_block_and_backs_up_original() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = project.path().join("CLAUDE.md");
+    let original = format!(
+        "# Project\n\nKeep this intro.\n\n{MARKER_START}\nold ai-memory block\n{MARKER_END}\n\nKeep this tail.\n"
+    );
+    fs::write(&target, &original).unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output);
+
+    let updated = fs::read_to_string(&target).unwrap();
+    assert!(updated.contains("Keep this intro."));
+    assert!(updated.contains("Keep this tail."));
+    assert!(updated.contains(MARKER_START));
+    assert!(updated.contains("Use the installed ai-memory Agent Skills"));
+    assert!(!updated.contains("old ai-memory block"));
+
+    let backups: Vec<_> = fs::read_dir(project.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("CLAUDE.md.bak-"))
+        })
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "install-instructions must back up updates"
+    );
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+}
+
+#[test]
 fn print_shows_only_snippet_without_mutating() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -199,6 +242,8 @@ fn inferred_instruction_targets_select_matching_skill_agents() {
 fn explicit_skill_scope_and_agent_override_instruction_target_inference() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    let global_skills = home.path().join("global-skills");
+    let global_skills_arg = global_skills.to_string_lossy().to_string();
 
     let output = run_ai_memory(
         project.path(),
@@ -211,15 +256,13 @@ fn explicit_skill_scope_and_agent_override_instruction_target_inference() {
             "global",
             "--skills-agent",
             "claude-code",
+            "--skills-target-dir",
+            &global_skills_arg,
         ],
     );
     assert_success(output);
 
-    assert!(
-        home.path()
-            .join(".claude/skills/ai-memory-retrieval/SKILL.md")
-            .exists()
-    );
+    assert!(global_skills.join("ai-memory-retrieval/SKILL.md").exists());
     assert!(!home.path().join(".agents/skills").exists());
     assert!(!project.path().join(".claude/skills").exists());
     assert!(!project.path().join(".agents/skills").exists());

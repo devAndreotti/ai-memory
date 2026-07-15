@@ -22,7 +22,9 @@ use crate::auto_improve::{
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
 };
 use crate::error::{StoreError, StoreResult};
-use crate::ops::{self, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
+use crate::ops::{
+    self, DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary,
+};
 use crate::users::{self, TOKEN_HASH_LEN};
 
 /// Commands accepted by the writer thread.
@@ -76,6 +78,10 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         summary_page_id: Option<PageId>,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SweepHollowProjects {
+        min_age_days: u32,
+        reply: oneshot::Sender<StoreResult<Vec<String>>>,
     },
     InsertObservation {
         obs: NewObservation,
@@ -148,7 +154,23 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         /// Human-readable `workspace/project` label forwarded into the summary.
         label: String,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
+    },
+    /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
+    /// sessions/…). Refused when non-empty unless `force`.
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        force: bool,
+        reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
+    },
+    /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
+    RenameWorkspace {
+        workspace_id: WorkspaceId,
+        new_name: String,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Re-stamp a project's `workspace_id` across every domain table in one
     /// transaction, keeping the same `project_id` (a lossless cross-workspace
@@ -167,6 +189,9 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         new_name: String,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Record a successfully-applied wiki-structure migration.
@@ -394,6 +419,22 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete hollow project rows (no data of any kind) older than
+    /// `min_age_days`; returns the deleted names. See
+    /// [`ops::sweep_hollow_projects`].
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub async fn sweep_hollow_projects(&self, min_age_days: u32) -> StoreResult<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SweepHollowProjects {
+            min_age_days,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Append an observation row.
     ///
     /// # Errors
@@ -592,12 +633,56 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         label: impl Into<String>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
             workspace_id,
             project_id,
             label: label.into(),
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete a workspace and, via the `workspace_id` cascade, every project /
+    /// page / session under it. Refuses a non-empty workspace unless `force`.
+    ///
+    /// # Errors
+    /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and
+    /// `force` is false; [`StoreError::NotFound`] when the workspace is absent;
+    /// [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn delete_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> StoreResult<DeleteWorkspaceSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteWorkspace {
+            workspace_id,
+            force,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Rename a workspace (column-only; the on-disk dir is UUID-keyed).
+    ///
+    /// # Errors
+    /// [`StoreError::WorkspaceNameTaken`] / [`StoreError::InvalidWorkspaceName`]
+    /// / [`StoreError::NotFound`] / [`StoreError::WriterClosed`].
+    pub async fn rename_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        new_name: impl Into<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenameWorkspace {
+            workspace_id,
+            new_name: new_name.into(),
             reply: tx,
         })
         .await?;
@@ -646,12 +731,14 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         new_name: impl Into<String>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::RenameProject {
             workspace_id,
             project_id,
             new_name: new_name.into(),
+            author_id,
             reply: tx,
         })
         .await?;
@@ -1033,6 +1120,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
             }
+            WriteCmd::SweepHollowProjects {
+                min_age_days,
+                reply,
+            } => {
+                let result = ops::sweep_hollow_projects(&mut conn, min_age_days);
+                send_or_warn(reply, result, "sweep_hollow_projects");
+            }
             WriteCmd::InsertObservation { obs, reply } => {
                 let result = ops::insert_observation(&mut conn, &obs);
                 send_or_warn(reply, result, "insert_observation");
@@ -1130,10 +1224,28 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 project_id,
                 label,
+                author_id,
                 reply,
             } => {
-                let result = ops::purge_project(&mut conn, &workspace_id, &project_id, &label);
+                let result =
+                    ops::purge_project(&mut conn, &workspace_id, &project_id, &label, author_id);
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::DeleteWorkspace {
+                workspace_id,
+                force,
+                reply,
+            } => {
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                send_or_warn(reply, result, "delete_workspace");
+            }
+            WriteCmd::RenameWorkspace {
+                workspace_id,
+                new_name,
+                reply,
+            } => {
+                let result = ops::rename_workspace(&mut conn, &workspace_id, &new_name);
+                send_or_warn(reply, result, "rename_workspace");
             }
             WriteCmd::MoveProjectWorkspace {
                 project_id,
@@ -1153,9 +1265,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 project_id,
                 new_name,
+                author_id,
                 reply,
             } => {
-                let result = ops::rename_project(&mut conn, &workspace_id, &project_id, &new_name);
+                let result = ops::rename_project(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &new_name,
+                    author_id,
+                );
                 send_or_warn(reply, result, "rename_project");
             }
             WriteCmd::InsertWikiMigration {

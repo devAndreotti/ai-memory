@@ -1905,6 +1905,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn write_eval_script(body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap().keep();
@@ -1913,7 +1914,45 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
-        path.display().to_string()
+        // Execute through the shell instead of exec'ing the freshly-written
+        // temp file directly. Some Linux filesystems can briefly report
+        // ETXTBSY for direct exec under parallel tests even after write(2)
+        // returns and the file handle has been dropped.
+        format!("sh {}", path.display())
+    }
+
+    #[cfg(windows)]
+    fn write_eval_script(body: &str) -> String {
+        let dir = tempfile::TempDir::new().unwrap().keep();
+        let path = dir.join("eval.cmd");
+        let body = match body {
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n" => {
+                "more >NUL\r\necho {\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}\r\n"
+                    .into()
+            }
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n" => {
+                "more >NUL\r\necho {\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}\r\n"
+                    .into()
+            }
+            "#!/bin/sh\ncat >/dev/null\nexit 7\n" => "more >NUL\r\nexit /B 7\r\n".into(),
+            "#!/bin/sh\nexit 7\n" => "exit /B 7\r\n".into(),
+            "#!/bin/sh\ncat >/dev/null\nprintf 'not-json'\n" => {
+                "more >NUL\r\necho not-json\r\n".into()
+            }
+            "#!/bin/sh\ncat >/dev/null\nsleep 3\n" => {
+                "more >NUL\r\nping -n 4 127.0.0.1 >NUL\r\n".into()
+            }
+            "#!/bin/sh\nsleep 5\n" => "ping -n 6 127.0.0.1 >NUL\r\n".into(),
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
+                let chunk = "x".repeat(100);
+                format!(
+                    "set \"chunk={chunk}\"\r\nfor /L %%i in (1,1,700) do <NUL set /p _=%chunk%\r\n"
+                )
+            }
+            other => panic!("unmapped eval script fixture for Windows: {other:?}"),
+        };
+        std::fs::write(&path, format!("@echo off\r\n{body}")).unwrap();
+        format!("cmd.exe /C {}", path.display())
     }
 
     #[tokio::test]
@@ -2064,8 +2103,19 @@ mod tests {
         .await;
 
         assert!(proposals.is_empty());
-        assert_eq!(rejected[0].reason, "eval_gate_error");
-        assert!(rejected[0].evidence.contains("eval stdout exceeded"));
+        // This test has flaked rarely on loaded machines with a different
+        // eval_gate_error; print the actual reason/evidence so the next
+        // occurrence identifies the real failure mode instead of hiding it.
+        assert_eq!(
+            rejected[0].reason, "eval_gate_error",
+            "evidence: {}",
+            rejected[0].evidence
+        );
+        assert!(
+            rejected[0].evidence.contains("eval stdout exceeded"),
+            "evidence: {}",
+            rejected[0].evidence
+        );
     }
 
     #[test]

@@ -3,42 +3,78 @@
 {% block title %}Projects — ai-memory{% endblock %}
 
 {% block content %}
-<div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Projects</h1>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki.</p>
+<div class="mb-8 flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
+  <div>
+    <p class="mb-2 text-xs font-semibold uppercase text-sky-700 dark:text-sky-400">Read-only memory browser</p>
+    <h1 class="text-3xl font-bold text-slate-950 dark:text-slate-50">Projects</h1>
+    <p class="mt-2 max-w-2xl text-sm leading-6 text-slate-600 dark:text-slate-400">
+      Inspect workspaces, audit generated pages, and jump into recent memory without leaving the browser.
+    </p>
+  </div>
+  <div class="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:w-[34rem]">
+    <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div class="text-xs font-medium text-slate-500 dark:text-slate-400">Projects</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-950 dark:text-slate-50">{{ project_count_label }}</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div class="text-xs font-medium text-slate-500 dark:text-slate-400">Pages</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-950 dark:text-slate-50">{{ page_count_label }}</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div class="text-xs font-medium text-slate-500 dark:text-slate-400">Active</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-950 dark:text-slate-50">{{ active_project_count_label }}</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div class="text-xs font-medium text-slate-500 dark:text-slate-400">Latest</div>
+      <div class="mt-2 truncate text-sm font-semibold text-slate-950 dark:text-slate-50">
+        {% if last_updated_relative != "" %}{{ last_updated_relative }}{% else %}No activity{% endif %}
+      </div>
+    </div>
+  </div>
 </div>
 
-<div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 text-sm text-amber-900 dark:text-amber-200">
-  <p class="font-medium mb-1">This is LLM-optimised memory, not hand-curated documentation.</p>
-  <p class="text-amber-800 dark:text-amber-300/90 leading-relaxed">
-    Pages are compiled from session observations by an LLM and revised as you work — they're shaped
-    for an agent's retrieval needs, not for human readability. The primary interface is the MCP
-    tools (<code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_query</code>,
+<details class="mb-6 rounded-lg border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 shadow-sm dark:border-amber-900/60 dark:bg-amber-950/20 dark:text-amber-100">
+  <summary class="cursor-pointer font-medium">LLM-optimised memory, not hand-curated documentation</summary>
+  <p class="mt-3 text-amber-900 dark:text-amber-200/90 leading-relaxed">
+    Pages are compiled from session observations by an LLM and revised as you work. They're shaped
+    for agent retrieval first. MCP tools like
+    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_query</code>,
     <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_recent</code>,
-    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_explore</code>,
-    …) your coding agent calls automatically. This browser is for spelunking — auditing what
-    landed, browsing your own history, sharing a page with a teammate — not for serving as project
-    documentation.
+    and <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_explore</code>
+    remain the primary interface; this browser is for auditing, browsing history, and sharing pages.
   </p>
-</div>
+</details>
 
 {% if projects.is_empty() %}
-<div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-12 text-center">
-  <p class="text-slate-500 dark:text-slate-400 text-sm">
-    No projects yet — wire up a hook and start a session.
+<div class="rounded-lg border border-dashed border-slate-300 bg-white p-12 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900">
+  <p class="text-sm font-medium text-slate-700 dark:text-slate-200">No projects yet</p>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">
+    Wire up a hook and start a session; projects appear here after memory writes land.
   </p>
 </div>
 {% else %}
 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
   {% for card in projects %}
-  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
-    <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
-    <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
-    <div class="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+  <a href="{{ card.href }}" class="group block rounded-lg border border-slate-200 bg-white p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md dark:border-slate-800 dark:bg-slate-900 dark:hover:border-sky-700">
+    <div class="flex items-start justify-between gap-4">
+      <div class="min-w-0">
+        <div class="text-xs font-medium text-slate-500 dark:text-slate-400">{{ card.workspace }}</div>
+        <div class="mt-2 truncate text-lg font-semibold text-slate-950 dark:text-slate-50">{{ card.project }}</div>
+      </div>
+      <div class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200">
+        {{ card.page_count }}
+      </div>
+    </div>
+    <div class="mt-5 flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400">
       <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>
       {% if card.last_updated_relative != "" %}
       <span>{{ card.last_updated_relative }}</span>
+      {% else %}
+      <span>No activity</span>
       {% endif %}
+    </div>
+    <div class="mt-4 h-1 rounded-full bg-slate-100 dark:bg-slate-800">
+      <div class="h-1 w-10 rounded-full bg-sky-500 transition-all group-hover:w-20"></div>
     </div>
   </a>
   {% endfor %}

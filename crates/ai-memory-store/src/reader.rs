@@ -58,6 +58,31 @@ pub struct AutoImproveCandidateSession {
     pub ended_at: i64,
 }
 
+/// Open session selected for manual finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSession {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+}
+
+/// How a `SessionEnd` event should treat its target session — see
+/// [`ReaderPool::session_end_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndDisposition {
+    /// The session is open in the resolved scope/agent: run the normal end
+    /// path.
+    Open,
+    /// Missing, cross-scope, cross-agent, or already ended with no
+    /// observations after `ended_at`: a duplicate or stale end — drop it.
+    DropStale,
+    /// Already ended, but observations arrived after `ended_at`: the agent
+    /// resumed the session under the same id — run the full end path again
+    /// so the resumed work reaches the compiled page (issue #152).
+    ReEndWithNewWork,
+}
+
 /// The latest version of a page's stored content, used as a DB-backed
 /// fallback when the on-disk markdown read fails (index/disk skew). The
 /// markdown file is the source of truth, but the store keeps a faithful copy
@@ -348,6 +373,25 @@ pub struct BriefingPage {
     pub updated_at: String,
 }
 
+/// One core page of the session-start project brief — body included,
+/// because the brief is injected as agent context and the whole point is
+/// sparing the agent a re-exploration round-trip. Returned by
+/// [`ReaderPool::session_brief_pages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefPageBody {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title (first H1 / frontmatter title).
+    pub title: String,
+    /// Full markdown body of the latest version. The hooks-side renderer
+    /// applies the char budget; the store returns it whole.
+    pub body: String,
+    /// Whether the page is pinned (decay-immune, operator-curated).
+    pub pinned: bool,
+    /// ISO-8601 timestamp of the last update.
+    pub updated_at: String,
+}
+
 /// One row per (workspace, project) with aggregate stats.
 /// Returned by [`ReaderPool::list_projects_with_stats`].
 #[derive(Debug, Clone, Serialize)]
@@ -570,6 +614,43 @@ pub struct HealthDetail {
     pub duplicates: Vec<HealthPage>,
     /// Latest pages with no incoming or outgoing links.
     pub orphans: Vec<HealthPage>,
+    /// Latest pages with at least one unresolved outgoing link
+    /// (`to_page_id IS NULL`). One row per page regardless of how many
+    /// of its links are unresolved. Unlike the three lists above there is
+    /// no separate authoritative counter — an unresolved link can also be
+    /// an intentional forward reference, so this is informational.
+    pub broken_links: Vec<HealthPage>,
+}
+
+/// A latest page plus the project id needed to resolve its on-disk
+/// location (`Wiki::project_root(ws, project_id).join(path)`). Returned
+/// by [`ReaderPool::latest_pages_with_project_ids`] for disk-drift checks.
+#[derive(Debug, Clone)]
+pub struct PageDiskRef {
+    /// Owning project id (the caller already knows the workspace id).
+    pub project_id: ProjectId,
+    /// Identity + kind, ready to surface as a health drill-down row.
+    pub page: HealthPage,
+}
+
+/// One entry in the append-only `audit_log` (page writes, purges,
+/// renames, and other attributable operations). Returned by
+/// [`ReaderPool::recent_audit_log_for_project`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditLogEntry {
+    /// Microseconds since epoch.
+    pub at: i64,
+    /// Operation kind (e.g. `create_page`, `purge_project`, `rename_project`).
+    pub op: String,
+    /// Relative wiki path of the affected page, when the entry is
+    /// page-scoped and that page is still the latest version.
+    pub page_path: Option<String>,
+    /// Username of the attributed actor, if known.
+    pub author_username: Option<String>,
+    /// Display name of the attributed actor, if known.
+    pub author_name: Option<String>,
+    /// Free-form JSON detail captured at write time.
+    pub detail: String,
 }
 
 /// Cheap, cloneable read-only connection pool handle.
@@ -1009,6 +1090,146 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Return open sessions matching one scoped project and agent.
+    ///
+    /// Results are newest-first so callers can default to finalizing only the
+    /// latest open session while offering an explicit all-sessions mode.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_sessions_for_scope_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<OpenSession>> {
+        let agent = agent_kind.as_str().to_string();
+        self.with_conn(move |conn| {
+            let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
+            let sql = format!(
+                "SELECT id, cwd FROM sessions \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND agent_kind = ?3 AND ended_at IS NULL \
+                 ORDER BY started_at DESC, id DESC{limit_clause}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let cwd: Option<String> = row.get(1)?;
+                    Ok((id_bytes, cwd))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, cwd) = row?;
+                out.push(OpenSession {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    cwd,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// The `(workspace_id, project_id, cwd)` a session was created under,
+    /// or `None` when no such session exists. The hook router uses this for
+    /// session-sticky attribution: mid-session events inherit the session's
+    /// scope instead of re-deriving a project from the event's cwd, so a
+    /// `cd subdir/` inside a non-git project (whose parent has no
+    /// `repo_path` for the prefix match to key on) can no longer scatter
+    /// observations into basename-fragment projects. The session's own cwd
+    /// is returned so the router can bound stickiness to the session's
+    /// directory subtree.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_session_scope(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId, Option<String>)>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT workspace_id, project_id, cwd FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match row {
+                Some((ws, proj, cwd)) => Ok(Some((
+                    WorkspaceId::from_slice(&ws)?,
+                    ProjectId::from_slice(&proj)?,
+                    cwd,
+                ))),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// How a `SessionEnd` should treat its target session (issue #152).
+    ///
+    /// The old boolean ("is the session open?") conflated two very different
+    /// ended states: a *duplicate/stale* end (nothing happened since
+    /// `ended_at` — drop it, the reason the guard exists) and a *re-end* of a
+    /// resumed session (the agent reused the id and kept working after the
+    /// first end — the end path must run again or the resumed work never
+    /// reaches the compiled session page).
+    pub async fn session_end_disposition(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+    ) -> StoreResult<SessionEndDisposition> {
+        let agent = agent_kind.as_str().to_string();
+        self.with_conn(move |conn| {
+            let ended_at: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT ended_at FROM sessions \
+                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                       AND agent_kind = ?4",
+                    params![
+                        session_id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(ended_at) = ended_at else {
+                // Missing, cross-scope, or cross-agent: never end it.
+                return Ok(SessionEndDisposition::DropStale);
+            };
+            let Some(ended_at) = ended_at else {
+                return Ok(SessionEndDisposition::Open);
+            };
+            let newer: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations \
+                 WHERE session_id = ?1 AND created_at > ?2",
+                params![session_id.as_bytes(), ended_at],
+                |row| row.get(0),
+            )?;
+            if newer > 0 {
+                Ok(SessionEndDisposition::ReEndWithNewWork)
+            } else {
+                Ok(SessionEndDisposition::DropStale)
+            }
         })
         .await
     }
@@ -1933,6 +2154,101 @@ impl ReaderPool {
         .await
     }
 
+    /// Fetch the pages that make up a session-start project brief: the
+    /// "core" pages WITH bodies (pinned, plus everything under `_rules/`
+    /// and `_slots/` — the operator-curated, highest-signal memory), and
+    /// the most-recently-updated page titles WITHOUT bodies (pointers the
+    /// agent can follow up on via `memory_query`).
+    ///
+    /// Core pages are ordered pinned-first then by path, so a char-budget
+    /// cut in the renderer drops the least-curated content last. Both
+    /// limits are clamped defensively; the renderer applies the actual
+    /// byte budget.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_brief_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        core_pages_limit: usize,
+        recent_pages_limit: usize,
+    ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
+        let core_limit = core_pages_limit.clamp(1, 100) as i64;
+        let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        self.with_conn(move |conn| {
+            let mut core_stmt = conn.prepare_cached(
+                "SELECT path, title, body, pinned, updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
+                 ORDER BY pinned DESC, path ASC \
+                 LIMIT ?3",
+            )?;
+            let core: Vec<BriefPageBody> = core_stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), core_limit],
+                    |row| {
+                        let updated_us: i64 = row.get(4)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)? != 0,
+                            updated_us,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(path, title, body, pinned, updated_us)| {
+                    jiff::Timestamp::from_microsecond(updated_us)
+                        .map(|ts| BriefPageBody {
+                            path,
+                            title,
+                            body,
+                            pinned,
+                            updated_at: ts.to_string(),
+                        })
+                        .map_err(|e| {
+                            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(
+                                format!("bad updated_at: {e}"),
+                            ))
+                        })
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+
+            let mut recent_stmt = conn.prepare_cached(
+                "SELECT path, title, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?3",
+            )?;
+            let recent: Vec<BriefingPage> = recent_stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit],
+                    briefing_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok((core, recent))
+        })
+        .await
+    }
+
     /// Return the latest open handoff for the workspace, aggregating
     /// across all of its projects (no project filter).
     ///
@@ -2389,11 +2705,144 @@ impl ReaderPool {
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
+            // Params: ws, [proj], limit. One row per source page via EXISTS —
+            // a page with three unresolved links must not appear three times.
+            let broken_sql = format!(
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                   AND EXISTS ( \
+                       SELECT 1 FROM links l \
+                       WHERE l.from_page_id = pg.id AND l.to_page_id IS NULL \
+                   ) \
+                 ORDER BY pg.updated_at DESC LIMIT ?"
+            );
+            let mut broken_stmt = conn.prepare(&broken_sql)?;
+            let broken_links = broken_stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    health_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
             Ok(HealthDetail {
                 stale,
                 duplicates,
                 orphans,
+                broken_links,
             })
+        })
+        .await
+    }
+
+    /// Latest pages in a workspace (optionally one project), each carrying
+    /// its project id so the caller can resolve the page's on-disk path.
+    /// Capped at `limit` rows — disk-drift checks stat one file per row,
+    /// so the cap bounds filesystem work, not just payload size.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_pages_with_project_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageDiskRef>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
+            let clause = if proj.is_some() {
+                " AND pg.project_id = ?"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT w.name, p.name, pg.path, pg.title, \
+                        COALESCE( \
+                            json_extract(pg.frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ), \
+                        pg.project_id \
+                 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                 ORDER BY pg.updated_at DESC LIMIT ?"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(Value::Blob(workspace_id.as_bytes().to_vec()))
+                            .chain(proj)
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    |row| {
+                        let page = health_page_from_row(row)?;
+                        let bytes: Vec<u8> = row.get(5)?;
+                        Ok((page, bytes))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(page, bytes)| {
+                    let project_id = ProjectId::from_slice(&bytes)?;
+                    Ok(PageDiskRef { project_id, page })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Recent `audit_log` entries for a project, newest first.
+    ///
+    /// Covers every attributable write path (page create/update, purge,
+    /// rename, ...) — `op` distinguishes them. `page_path` resolves only
+    /// when the entry is page-scoped and that page is still the latest
+    /// version; a purge/rename entry (or a superseded page) legitimately
+    /// carries `page_path = None`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_audit_log_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<AuditLogEntry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT al.at, al.op, pg.path, au.username, au.name, al.detail \
+                 FROM audit_log al \
+                 LEFT JOIN pages pg ON pg.id = al.page_id AND pg.is_latest = 1 \
+                 LEFT JOIN users au ON au.id = al.author_id \
+                 WHERE al.workspace_id = ?1 AND al.project_id = ?2 \
+                 ORDER BY al.at DESC LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
+                    |row| {
+                        Ok(AuditLogEntry {
+                            at: row.get(0)?,
+                            op: row.get(1)?,
+                            page_path: row.get(2)?,
+                            author_username: row.get(3)?,
+                            author_name: row.get(4)?,
+                            detail: row.get(5)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
         .await
     }
@@ -3465,15 +3914,13 @@ impl ReaderPool {
     ///
     /// - `workspace_id = ?1` — never matches a project in another
     ///   workspace.
-    /// - `repo_path IS NOT NULL AND length(repo_path) > 1 AND repo_path
-    ///   NOT LIKE '%/'` — rejects stored values that would match too
-    ///   broadly (`NULL`, `''`, `/`) or fail the `<repo_path>/%`
-    ///   boundary (trailing slash).
-    /// - Stored `repo_path` wildcards (`%`, `_`) are escaped in the
-    ///   generated `LIKE` pattern, so they stay literal path bytes
-    ///   instead of matching unintended siblings.
-    /// - `?3 IS NULL OR repo_path <> ?3` — never matches a stored
-    ///   `repo_path` equal to the operator's home directory (`home`).
+    /// - `repo_path IS NOT NULL` plus Rust-side normalization rejects stored
+    ///   values that would match too broadly (`NULL`, `''`, `/`) or fail the
+    ///   `<repo_path>/%` boundary (trailing slash/backslash).
+    /// - Stored `repo_path` wildcards (`%`, `_`) are compared as literal path
+    ///   bytes in Rust, not as SQL `LIKE` wildcards.
+    /// - A normalized stored `repo_path` equal to the operator's home
+    ///   directory (`home`) is never matched.
     ///   Such a row would be a prefix catch-all for every project
     ///   beneath `$HOME`; the caller passes the server's own `$HOME`
     ///   (filesystem root `/` is already excluded by the
@@ -3495,38 +3942,49 @@ impl ReaderPool {
         cwd: String,
         home: Option<&str>,
     ) -> StoreResult<Option<(ProjectId, String)>> {
-        let home = home.map(str::to_owned);
-        let cwd_norm = cwd.trim_end_matches('/').to_string();
+        let home = home.map(|h| normalize_cwd(h).into_owned());
+        let cwd_norm = normalize_cwd(&cwd).into_owned();
         if !is_safe_cwd_for_prefix_match(&cwd_norm) {
             return Ok(None);
         }
         self.with_conn(move |conn| {
-            // Two-condition LIKE: exact match OR descendant (prefix +
-            // `/`). The boundary `/` on the descendant arm stops
-            // `/foo/bar` from matching `/foo/ba`. The LIKE arm escapes
-            // stored wildcard characters so real paths containing `%` or
-            // `_` stay literal instead of turning into broad matches.
-            let row_opt = conn
-                .query_row(
-                    "SELECT id, name FROM projects \
-                     WHERE workspace_id = ?1 \
-                       AND repo_path IS NOT NULL \
-                       AND length(repo_path) > 1 \
-                       AND repo_path NOT LIKE '%/' \
-                       AND (?3 IS NULL OR repo_path <> ?3) \
-                       AND (?2 = repo_path OR ?2 LIKE replace(replace(replace(repo_path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\') \
-                     ORDER BY length(repo_path) DESC \
-                     LIMIT 1",
-                    params![workspace_id.as_bytes(), cwd_norm, home],
-                    |row| {
-                        let bytes: Vec<u8> = row.get(0)?;
-                        let name: String = row.get(1)?;
-                        Ok((bytes, name))
-                    },
-                )
-                .optional()?;
-            row_opt
-                .map(|(bytes, name)| {
+            // Compare in Rust instead of SQL LIKE so stored `%`/`_` bytes stay
+            // literal and legacy Windows rows with backslashes keep matching a
+            // slash-normalized hook cwd. New writes normalize `repo_path`, but
+            // this compatibility read path protects existing databases.
+            let mut stmt = conn.prepare(
+                "SELECT id, name, repo_path FROM projects \
+                 WHERE workspace_id = ?1 AND repo_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![workspace_id.as_bytes()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut matches = Vec::new();
+            for row in rows {
+                let (bytes, name, repo_path) = row?;
+                if has_trailing_path_separator(&repo_path) {
+                    continue;
+                }
+                let repo_norm = normalize_cwd(&repo_path).into_owned();
+                if repo_norm.len() <= 1
+                    || !is_safe_cwd_for_prefix_match(&repo_norm)
+                    || home.as_deref() == Some(repo_norm.as_str())
+                {
+                    continue;
+                }
+                if cwd_within(&repo_norm, &cwd_norm) {
+                    matches.push((bytes, name, repo_norm.len()));
+                }
+            }
+            matches.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+            matches
+                .into_iter()
+                .next()
+                .map(|(bytes, name, _)| {
                     ProjectId::from_slice(&bytes)
                         .map(|id| (id, name))
                         .map_err(StoreError::from)
@@ -3560,7 +4018,7 @@ impl ReaderPool {
         home: Option<&str>,
     ) -> StoreResult<ContaminationReport> {
         let scoped = scope.is_some();
-        let home = home.map(str::to_owned);
+        let home = home.map(|h| normalize_cwd(h).into_owned());
         let scope_params: Vec<Value> = match &scope {
             Some((ws, proj)) => vec![
                 Value::Blob(ws.as_bytes().to_vec()),
@@ -3686,7 +4144,14 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
-                            if home.as_deref() == Some(repo_path.as_str()) {
+                            if has_trailing_path_separator(&repo_path) {
+                                continue;
+                            }
+                            let repo_path = normalize_cwd(&repo_path).into_owned();
+                            if repo_path.len() <= 1
+                                || !is_safe_cwd_for_prefix_match(&repo_path)
+                                || home.as_deref() == Some(repo_path.as_str())
+                            {
                                 continue;
                             }
                             prefixes.push((
@@ -3707,7 +4172,14 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
-                            if home.as_deref() == Some(repo_path.as_str()) {
+                            if has_trailing_path_separator(&repo_path) {
+                                continue;
+                            }
+                            let repo_path = normalize_cwd(&repo_path).into_owned();
+                            if repo_path.len() <= 1
+                                || !is_safe_cwd_for_prefix_match(&repo_path)
+                                || home.as_deref() == Some(repo_path.as_str())
+                            {
                                 continue;
                             }
                             prefixes.push((
@@ -3727,13 +4199,12 @@ impl ReaderPool {
         // CHECK A: resolve each session's cwd against preloaded valid prefixes
         // and flag a bucket mismatch.
         for (id, ws, landed_proj, landed_ws_name, landed_proj_name, cwd) in candidates {
-            let cwd_norm = cwd.trim_end_matches('/').to_string();
+            let cwd_norm = normalize_cwd(&cwd).into_owned();
             if !is_safe_cwd_for_prefix_match(&cwd_norm) {
                 continue;
             }
             let resolved = prefixes.iter().find(|(prefix_ws, _, _, repo_path)| {
-                *prefix_ws == ws
-                    && (cwd_norm == *repo_path || cwd_norm.starts_with(&format!("{repo_path}/")))
+                *prefix_ws == ws && cwd_within(repo_path, &cwd_norm)
             });
             if let Some((_, resolved_proj, resolved_name, _)) = resolved
                 && *resolved_proj != landed_proj
@@ -4738,6 +5209,10 @@ fn is_safe_cwd_for_prefix_match(cwd: &str) -> bool {
     true
 }
 
+fn has_trailing_path_separator(path: &str) -> bool {
+    path.len() > 1 && path.ends_with(['/', '\\'])
+}
+
 fn checkout(inner: &Inner) -> StoreResult<Connection> {
     if let Some(conn) = inner.pool.lock().pop() {
         return Ok(conn);
@@ -5117,5 +5592,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(widened, None, "wildcards in repo_path must stay literal");
+    }
+
+    #[tokio::test]
+    async fn prefix_match_handles_legacy_windows_backslash_repo_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = ProjectId::new();
+        let conn =
+            rusqlite::Connection::open(tmp.path().join("db").join(crate::DB_FILENAME)).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                project_id.as_bytes(),
+                ws.as_bytes(),
+                "app",
+                r"C:\Users\tester\app",
+                jiff::Timestamp::now().as_microsecond()
+            ],
+        )
+        .unwrap();
+
+        let matched = store
+            .reader
+            .find_project_by_cwd_prefix(
+                ws,
+                String::from("C:/Users/tester/app/crates/core"),
+                Some(r"C:\Users\tester"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched.map(|(id, _)| id), Some(project_id));
+    }
+
+    #[tokio::test]
+    async fn prefix_match_ignores_legacy_trailing_separator_repo_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = ProjectId::new();
+        let conn =
+            rusqlite::Connection::open(tmp.path().join("db").join(crate::DB_FILENAME)).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                project_id.as_bytes(),
+                ws.as_bytes(),
+                "legacy-trailing",
+                "/repo/foo/",
+                jiff::Timestamp::now().as_microsecond()
+            ],
+        )
+        .unwrap();
+
+        let matched = store
+            .reader
+            .find_project_by_cwd_prefix(ws, String::from("/repo/foo/bar"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(matched, None, "legacy trailing separator must not match");
     }
 }

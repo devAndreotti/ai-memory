@@ -20,6 +20,16 @@ pub(crate) async fn handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let project_count = summaries.len();
+    let total_pages = summaries.iter().map(|s| s.page_count).sum::<u64>();
+    let active_projects = summaries.iter().filter(|s| s.page_count > 0).count();
+    let last_updated_relative = summaries
+        .iter()
+        .filter_map(|s| s.last_updated.as_deref())
+        .next()
+        .map(humanize)
+        .unwrap_or_default();
+
     let projects = summaries
         .into_iter()
         .map(|s| {
@@ -35,8 +45,14 @@ pub(crate) async fn handler(
         })
         .collect();
 
-    let html = ProjectsView { projects }
-        .render()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let html = ProjectsView {
+        projects,
+        project_count_label: project_count.to_string(),
+        page_count_label: total_pages.to_string(),
+        active_project_count_label: active_projects.to_string(),
+        last_updated_relative,
+    }
+    .render()
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
 }

@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::commands::path_util::home_dir;
+
 /// First top-level `cwd` string in the payload (parity with
 /// `ai_memory_extract_cwd`: take the top-level value, ignore nested
 /// `cwd` fields in tool payloads).
@@ -50,11 +52,22 @@ pub fn url_encode(s: &str) -> String {
 /// server cannot see this checkout.
 pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
-    let (mut workspace, mut project, mut strategy) = (None, None, None);
+    let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
+        (None, None, None, None, None);
+    let (mut briefing, mut briefing_budget) = (None, None);
     if let Some(marker) = find_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
         strategy = parse_toml_key(&marker, "project_strategy");
+        drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
+        // `[recall] default_global = true` (or top-level; quoted or bare) —
+        // a meta-repo opts every default-scoped read into a global search.
+        default_global = parse_toml_flag(&marker, "default_global");
+        // `[briefing] inject_on_session_start = true` + optional
+        // `max_chars = N` — opt this repo into the compiled project brief
+        // appended to the session-start handoff fetch (#176).
+        briefing = parse_toml_flag(&marker, "inject_on_session_start");
+        briefing_budget = parse_toml_flag(&marker, "max_chars");
     }
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
@@ -71,7 +84,57 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
     if let Some(val) = strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
     }
+    // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
+    // the `drop_subagent` flag so the server scopes the drop to this project.
+    // The server interprets truthiness (`1`/`true`/…).
+    if let Some(val) = drop_subagent.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&drop_subagent={}", url_encode(&val)));
+    }
+    // Per-repo `default_global` opt-in: forward the marker's value so the
+    // server can publish it on the ActiveProject and make default-scoped read
+    // tools search globally. Truthiness is decided server-side.
+    if let Some(val) = default_global.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&default_global={}", url_encode(&val)));
+    }
+    // Per-repo session-start brief opt-in: forwarded on every request for
+    // simplicity (the capture path ignores it); only the `/handoff` GET at
+    // session start acts on it. Truthiness and the char-budget clamp are
+    // decided server-side.
+    if let Some(val) = briefing.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing={}", url_encode(&val)));
+    }
+    if let Some(val) = briefing_budget.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing_budget={}", url_encode(&val)));
+    }
     qs
+}
+
+/// Parse a root-level `key = <value>` line, accepting a quoted string
+/// (`key = "true"`) OR a bare token (`key = true` / `key = 1`), so a
+/// `[recall] default_global = true` marker works whether or not the operator
+/// quotes the value. Line-based like [`parse_toml_key`], so section headers
+/// are ignored; strips an optional trailing `# comment`.
+fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(after_key) = trimmed.strip_prefix(key) else {
+            continue;
+        };
+        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let val = rest
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn repo_root_project(cwd: &str) -> Option<String> {
@@ -87,7 +150,7 @@ fn repo_root_project(cwd: &str) -> Option<String> {
 /// user's declaration on shared machines (parity with
 /// `ai_memory_find_marker`).
 fn find_marker(cwd: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir();
+    let home = home_dir();
     let mut dir = Path::new(cwd);
     loop {
         let candidate = dir.join(".ai-memory.toml");
@@ -189,16 +252,28 @@ pub async fn post_hook(
 /// Outcome of one `POST /hook/batch` request — many spooled events delivered in
 /// a single round-trip, so a draining client amortizes TLS + network RTT + the
 /// edge auth hop over the whole batch instead of paying it per event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOutcome {
     /// Server committed the leading `usize` items (contiguous prefix, oldest
     /// first). Equals the request length on full success; a smaller value means
     /// the server stopped on that item (fail-fast) — the caller deletes the
     /// prefix and charges the next item a retry.
     Accepted(usize),
-    /// `429` — ingest saturated; nothing was processed. Keep the whole batch and
-    /// retry it later WITHOUT bumping attempts (saturation isn't a failure).
-    Saturated,
+    /// Server committed these item indexes, which may be non-contiguous when it
+    /// skipped per-source rate-limited events and continued with later sources.
+    /// If `failed_index` is present, that item failed processing and should be
+    /// charged instead of assuming the first unaccepted item failed.
+    AcceptedIndices {
+        indices: Vec<usize>,
+        failed_index: Option<usize>,
+    },
+    /// `429` — ingest saturated after committing this many leading items. The
+    /// caller deletes that prefix and retries the rest later WITHOUT bumping
+    /// attempts (saturation isn't a failure).
+    Saturated(usize),
+    /// `429` with a non-contiguous committed set. New servers can include this
+    /// when a global saturation happens after earlier skipped items.
+    SaturatedIndices(Vec<usize>),
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
     Unsupported,
@@ -234,16 +309,35 @@ pub async fn post_batch(
             if status.is_success() {
                 match resp.json::<serde_json::Value>().await {
                     Ok(v) => {
-                        let accepted = v
-                            .get("accepted")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0) as usize;
-                        BatchOutcome::Accepted(accepted)
+                        if let Some(indices) = accepted_indices(&v) {
+                            BatchOutcome::AcceptedIndices {
+                                indices,
+                                failed_index: failed_index(&v),
+                            }
+                        } else {
+                            let accepted = v
+                                .get("accepted")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0) as usize;
+                            BatchOutcome::Accepted(accepted)
+                        }
                     }
                     Err(_) => BatchOutcome::Failed,
                 }
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                BatchOutcome::Saturated
+                let body = resp.json::<serde_json::Value>().await.ok();
+                if let Some(indices) = body.as_ref().and_then(accepted_indices) {
+                    BatchOutcome::SaturatedIndices(indices)
+                } else {
+                    let accepted = body
+                        .and_then(|v| {
+                            v.get("accepted")
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|n| n as usize)
+                        })
+                        .unwrap_or(0);
+                    BatchOutcome::Saturated(accepted)
+                }
             } else if status == reqwest::StatusCode::NOT_FOUND
                 || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
             {
@@ -254,6 +348,19 @@ pub async fn post_batch(
         }
         Err(_) => BatchOutcome::Failed,
     }
+}
+
+fn failed_index(v: &serde_json::Value) -> Option<usize> {
+    v.get("failed_index")?.as_u64().map(|n| n as usize)
+}
+
+fn accepted_indices(v: &serde_json::Value) -> Option<Vec<usize>> {
+    let arr = v.get("accepted_indices")?.as_array()?;
+    let mut indices = Vec::with_capacity(arr.len());
+    for item in arr {
+        indices.push(item.as_u64()? as usize);
+    }
+    Some(indices)
 }
 
 /// GET the handoff text with a caller-chosen budget. Returns None on any error
@@ -427,8 +534,8 @@ project = "infra" # this is fine
     }
 
     /// `marker_query_suffix` appends `&workspace=…&project=…` (and
-    /// `&project_strategy=…`) when the marker declares them. Each value is
-    /// URL-encoded, so a workspace with a space round-trips as `%20`.
+    /// `&project_strategy=…`, `&drop_subagent=…`) when the marker declares them.
+    /// Each value is URL-encoded, so a workspace with a space round-trips as `%20`.
     #[test]
     fn marker_query_suffix_appends_marker_fields() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -439,6 +546,7 @@ project = "infra" # this is fine
 workspace = "acme corp"
 project = "infra"
 project_strategy = "repo-root"
+drop_subagent_captures = "true"
 "#,
         )
         .unwrap();
@@ -449,6 +557,75 @@ project_strategy = "repo-root"
         assert!(qs.contains("&workspace=acme%20corp"), "{qs}");
         assert!(qs.contains("&project=infra"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+        assert!(qs.contains("&drop_subagent=true"), "{qs}");
+    }
+
+    /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so
+    /// the server keeps that project's subagent captures (opt-in only).
+    #[test]
+    fn marker_query_suffix_omits_drop_subagent_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("drop_subagent"), "{qs}");
+    }
+
+    /// A `[recall] default_global` marker (bare `true`, under a section)
+    /// forwards the flag so the server can broaden default-scoped reads.
+    #[test]
+    fn marker_query_suffix_appends_default_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\n[recall]\ndefault_global = true\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(qs.contains("&default_global=true"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_omits_default_global_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("default_global"), "{qs}");
+    }
+
+    /// A `[briefing]` section (bare or quoted values) forwards the opt-in
+    /// and the char budget so the session-start `/handoff` GET can compose
+    /// the project brief (#176).
+    #[test]
+    fn marker_query_suffix_appends_briefing_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\n[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(qs.contains("&briefing=true"), "{qs}");
+        assert!(qs.contains("&briefing_budget=6000"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_omits_briefing_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("briefing"), "{qs}");
     }
 
     #[test]

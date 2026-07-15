@@ -33,7 +33,8 @@ handoff lookups.
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
-and `project_strategy` query params to the server when a marker is present;
+`project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
+`briefing_budget` query params to the server when a marker declares them;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently.
 
@@ -53,6 +54,45 @@ project = "pe-portais"
 # linked worktrees and subdirectories share one project. Ignored when
 # `project` is present.
 project_strategy = "repo-root"
+
+# Optional. Opt this project into drop_subagent_captures: set it to "true"
+# and the server accepts but does NOT store this project's subagent-session
+# captures. A multi-agent harness fans one goal out to many subagent
+# sessions whose per-event captures can flood a small instance; scoping the
+# opt-in here keeps the drop from affecting other projects on the same
+# server. Off by default (absent / "false").
+drop_subagent_captures = "true"
+
+# Optional. Broaden this repo's DEFAULT memory recall to every project:
+# an unscoped `memory_query` from sessions in this tree behaves as
+# `global=true` (each hit annotated with its workspace + project).
+# Meant for meta-repos that constantly need sibling-project context.
+# Explicit args always win — passing `workspace`/`project`/`scopes`/
+# `global` overrides this for that call. Off by default. Note: while
+# active, unscoped queries return cross-project `global_hits` instead
+# of project `hits` + `global_scope_hits` (the `_global` preference
+# pages still appear, annotated, among the global results).
+[recall]
+default_global = "true"
+
+# Optional. Inject a compiled project brief at session start (and after a
+# context clear — Claude Code re-fires SessionStart on /clear): the
+# session-start handoff fetch also returns this project's pinned /
+# `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
+# page titles, so the agent starts with the architecture context instead
+# of re-exploring the codebase. Appended AFTER any pending handoff, and
+# unlike the handoff it is not consumed — it is recomposed every opted-in
+# session start. Only agents whose session-start hook injects stdout as
+# context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
+# brief costs tokens on EVERY session start, so opt in per repo.
+[briefing]
+inject_on_session_start = "true"
+
+# Optional. Char budget for the brief (~4 chars per token). Bodies over
+# budget are truncated with a visible note; crowded-out core pages are
+# listed by path so the agent can `memory_query` them. Clamped
+# server-side to [500, 20000]; defaults to 4000.
+max_chars = 4000
 ```
 
 **Naming rules** for `workspace` and `project`, validated server-side:
@@ -66,6 +106,18 @@ defensively but the server's regex is the source of truth.
 
 `project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
 values are ignored and behave like the default `basename(cwd)` strategy.
+
+`default_global` and `inject_on_session_start` accept a truthy value
+(`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
+parsed leniently); anything else behaves as absent. `max_chars` is a
+plain integer.
+
+`drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
+`"yes"` / `"on"`); any other value, or its absence, leaves this project's
+subagent captures stored as usual. Top-level (non-subagent) sessions are
+always stored regardless. This is per-project on purpose: there is no
+server-global switch, so opting one noisy project in never sheds subagent
+captures for the others on a shared instance.
 
 ## Four canonical examples
 

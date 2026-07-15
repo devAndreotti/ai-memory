@@ -67,9 +67,12 @@ pub enum Command {
     /// from stdin), avoiding a shell spawn. Used by the WindowsNative
     /// hook config; mirrors hooks/<agent>/<event>.sh.
     Hook(HookArgs),
+    /// Hidden hook spool drainer used by native session-end hooks.
+    #[command(hide = true, name = "hook-drain")]
+    HookDrain(HookDrainArgs),
     /// Print MCP server registration snippets for any supported client
     /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
-    /// CLI, OpenClaw, pi). See docs/mcp-install.md for the full guide.
+    /// CLI, OpenClaw, OMP, Pi). See docs/mcp-install.md for the full guide.
     InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
@@ -89,6 +92,8 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
+    /// Manually finalize the latest open Codex session for this project.
+    FinalizeSession(FinalizeSessionArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
     /// Compute + store embeddings for every latest page (M9).
@@ -293,7 +298,7 @@ pub struct AuthLoginArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// OIDC issuer URL for `oidc-device` login, e.g. a Keycloak realm
-    /// (`https://keycloak.example.com/realms/serpro`). Endpoints are
+    /// (`https://keycloak.example.com/realms/ai-memory`). Endpoints are
     /// discovered from `<issuer>/.well-known/openid-configuration`.
     #[arg(long)]
     pub issuer: Option<String>,
@@ -791,10 +796,13 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
-    /// Oh My Pi (`omp`) / Pi coding agent fork — TypeScript extension
+    /// Real Pi coding agent. Recognized separately from OMP, but hook
+    /// install intentionally fails closed until the Pi bridge lands.
+    Pi,
+    /// Oh My Pi (`omp`) — TypeScript extension
     /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
     /// file directly; restart `omp` for it to load.
-    #[value(alias = "pi", alias = "oh-my-pi")]
+    #[value(alias = "oh-my-pi")]
     Omp,
     /// OpenClaw personal AI gateway — native plugin package with
     /// session/tool/compaction hooks.
@@ -810,6 +818,72 @@ pub enum AgentChoice {
     /// capture works but handoff injection does not — recover the prior
     /// session's handoff via the MCP `memory_handoff_accept` tool.
     Grok,
+    /// Zero coding agent (Gitlawb/zero) — JSON-config lifecycle hooks in
+    /// `$XDG_CONFIG_HOME/zero/hooks.json` (exec-form `command` + `args`,
+    /// so ai-memory's native `hook` command runs with no shell). NOTE:
+    /// Zero discards `sessionStart` hook stdout, so capture works but
+    /// handoff injection does not — recover the prior session's handoff
+    /// via the MCP `memory_handoff_accept` tool.
+    Zero,
+}
+
+impl AgentChoice {
+    /// The core [`AgentKind`] this CLI choice selects — the single mapping
+    /// point between the clap surface and the domain enum. Wire strings,
+    /// hook-bundle directory names, and session attribution all derive from
+    /// the returned kind's `as_str()`; adding an agent means extending this
+    /// match once instead of hunting per-command copies.
+    #[must_use]
+    pub const fn kind(self) -> ai_memory_core::AgentKind {
+        use ai_memory_core::AgentKind;
+        match self {
+            Self::ClaudeCode => AgentKind::ClaudeCode,
+            Self::Codex => AgentKind::Codex,
+            Self::Cursor => AgentKind::Cursor,
+            Self::GeminiCli => AgentKind::GeminiCli,
+            Self::OpenCode => AgentKind::OpenCode,
+            Self::Pi => AgentKind::Pi,
+            Self::Omp => AgentKind::Omp,
+            Self::Openclaw => AgentKind::OpenClaw,
+            Self::AntigravityCli => AgentKind::AntigravityCli,
+            Self::Grok => AgentKind::Grok,
+            Self::Zero => AgentKind::Zero,
+        }
+    }
+
+    /// `hooks/<subdir>` bundle name for agents that install script hooks.
+    /// `None` for agents wired through a generated integration (plugin /
+    /// extension / exec-form native commands) instead of a script
+    /// directory. The subdir equals the kind's wire string for every
+    /// script agent.
+    #[must_use]
+    pub const fn script_hook_subdir(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero => None,
+            _ => Some(self.kind().as_str()),
+        }
+    }
+}
+
+/// Arguments for `finalize-session`.
+#[derive(Debug, Args)]
+pub struct FinalizeSessionArgs {
+    /// Agent kind to finalize. Defaults to Codex because Codex has no reliable
+    /// true SessionEnd hook.
+    #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
+    pub agent: AgentChoice,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Finalize every matching open session instead of just the latest one.
+    #[arg(long)]
+    pub all: bool,
+    /// Emit a JSON summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// MCP client to render configuration for. Includes both the
@@ -837,12 +911,17 @@ pub enum McpClient {
     GeminiCli,
     /// OpenClaw personal AI gateway — `~/.openclaw/config.json`.
     Openclaw,
-    /// Oh My Pi (`omp`) / Pi-compatible coding agent — `~/.omp/agent/mcp.json`.
-    #[value(alias = "omp", alias = "oh-my-pi")]
+    /// Real Pi coding agent. Pi core has no native MCP config yet.
     Pi,
+    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
+    #[value(alias = "oh-my-pi")]
+    Omp,
     /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
+    /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
+    /// `mcp.servers` map with native HTTP transport + bearer headers.
+    Zero,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -883,6 +962,8 @@ pub enum LlmProviderChoice {
     OpenaiOauth,
     /// GitHub Copilot Chat backend.
     Copilot,
+    /// OpenCode Zen/Go cloud API.
+    Opencode,
 }
 
 /// Arguments for `embed`.
@@ -1146,6 +1227,10 @@ pub struct HookArgs {
     pub project_strategy: Option<ProjectStrategyArg>,
 }
 
+/// Arguments for hidden `hook-drain`.
+#[derive(Debug, Args)]
+pub struct HookDrainArgs {}
+
 /// Arguments for `install-hooks`.
 #[derive(Debug, Args)]
 pub struct InstallHooksArgs {
@@ -1360,8 +1445,8 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn pi_mcp_client_aliases_parse_to_same_variant() {
-        for alias in ["pi", "omp", "oh-my-pi"] {
+    fn pi_and_omp_mcp_clients_parse_to_distinct_variants() {
+        for (alias, expected_pi) in [("pi", true), ("omp", false), ("oh-my-pi", false)] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-mcp",
@@ -1376,8 +1461,9 @@ mod tests {
                 panic!("expected install-mcp command for alias {alias}");
             };
             assert!(
-                matches!(args.client, McpClient::Pi),
-                "alias {alias} must resolve to the Pi/OMP MCP client"
+                matches!(args.client, McpClient::Pi) == expected_pi,
+                "alias {alias} resolved to unexpected MCP client: {:?}",
+                args.client
             );
         }
     }
@@ -1572,8 +1658,8 @@ mod tests {
     }
 
     #[test]
-    fn pi_hook_agent_aliases_parse_to_same_variant() {
-        for alias in ["omp", "pi", "oh-my-pi"] {
+    fn pi_and_omp_hook_agents_parse_to_distinct_variants() {
+        for (alias, expected_pi) in [("pi", true), ("omp", false), ("oh-my-pi", false)] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-hooks",
@@ -1588,8 +1674,9 @@ mod tests {
                 panic!("expected install-hooks command for alias {alias}");
             };
             assert!(
-                matches!(args.agent, AgentChoice::Omp),
-                "alias {alias} must resolve to the OMP hook agent"
+                matches!(args.agent, AgentChoice::Pi) == expected_pi,
+                "alias {alias} resolved to unexpected hook agent: {:?}",
+                args.agent
             );
         }
     }

@@ -105,6 +105,40 @@ pub fn get_or_create_workspace(
     Ok(id)
 }
 
+/// Names of other workspaces that already contain a project called `name`
+/// (excluding `workspace_id`), ordered by workspace name. Homonymous
+/// projects across workspaces are legal — rows are id-namespaced — but on
+/// *creation* a non-empty result is almost always an accidental misroute,
+/// so the caller can surface a warning. Runs inside the caller's `tx`.
+fn project_name_in_other_workspaces(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+) -> StoreResult<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT w.name FROM projects p \
+         JOIN workspaces w ON w.id = p.workspace_id \
+         WHERE p.name = ?1 AND p.workspace_id != ?2 \
+         ORDER BY w.name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![name, workspace_id.as_bytes()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn warn_project_name_in_other_workspaces(name: &str, also_in: &[String]) {
+    if !also_in.is_empty() {
+        tracing::warn!(
+            project = name,
+            also_in = ?also_in,
+            "creating a project whose name already exists in other workspace(s) — legal (id-namespaced) but often an accidental misroute"
+        );
+    }
+}
+
 /// Resolve a project by `(workspace_id, name)`, creating it if missing.
 /// Atomic.
 pub fn get_or_create_project(
@@ -113,7 +147,10 @@ pub fn get_or_create_project(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
+    let mut also_in = Vec::new();
+    let mut created = false;
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
@@ -124,6 +161,7 @@ pub fn get_or_create_project(
     let id = if let Some(bytes) = existing {
         ai_memory_core::ProjectId::from_slice(&bytes)?
     } else {
+        also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
         let id = ai_memory_core::ProjectId::new();
         tx.execute(
             "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
@@ -132,17 +170,77 @@ pub fn get_or_create_project(
                 id.as_bytes(),
                 workspace_id.as_bytes(),
                 name,
-                repo_path,
+                repo_path.as_deref(),
                 Timestamp::now().as_microsecond()
             ],
         )?;
+        created = true;
         id
     };
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
         crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
     }
+    if created {
+        warn_project_name_in_other_workspaces(name, &also_in);
+    }
     Ok(id)
+}
+
+/// Delete "hollow" project rows: zero pages (any version), zero sessions,
+/// zero observations, zero handoffs, zero auto-improve runs/proposals/
+/// rejections, and older than `min_age_days`. (The per-project
+/// scheduler-state row is bookkeeping created for every project and does
+/// not count as data.) These
+/// are pure bookkeeping noise left behind by probes, renames, and failed
+/// first events — nothing exists to lose, which is what makes this safe to
+/// run on a schedule (the operator-driven `purge-project` covers everything
+/// that actually holds data). Reserved projects (`scratch`, the cwd-less
+/// fallback; `_global`, the preferences scope) are exempt even when empty.
+/// Returns the deleted names for logging.
+///
+/// # Errors
+/// Propagates SQLite failures.
+pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreResult<Vec<String>> {
+    let cutoff =
+        Timestamp::now().as_microsecond() - i64::from(min_age_days) * 24 * 60 * 60 * 1_000_000;
+    let tx = conn.transaction()?;
+    let names: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT name FROM projects
+             WHERE name NOT IN ('scratch', ?1)
+               AND created_at < ?2
+               AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
+        )?;
+        let rows = stmt.query_map(
+            params![ai_memory_core::GLOBAL_SCOPE_PROJECT, cutoff],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if !names.is_empty() {
+        tx.execute(
+            "DELETE FROM projects
+             WHERE name NOT IN ('scratch', ?1)
+               AND created_at < ?2
+               AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
+            params![ai_memory_core::GLOBAL_SCOPE_PROJECT, cutoff],
+        )?;
+    }
+    tx.commit()?;
+    Ok(names)
 }
 
 /// NULL out `repo_path` values that act as longest-prefix-match catch-alls
@@ -165,6 +263,7 @@ pub fn get_or_create_project(
 /// temporarily unmounted drive, and destroying it would wipe a valid prefix
 /// key. This safety rule is mandatory.
 pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> StoreResult<u64> {
+    let home = home.map(normalize_repo_path_key);
     let candidates: Vec<(Vec<u8>, String)> = {
         let mut stmt =
             conn.prepare("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")?;
@@ -175,7 +274,7 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
     };
     let to_null: Vec<Vec<u8>> = candidates
         .into_iter()
-        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home))
+        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home.as_deref()))
         .map(|(id, _)| id)
         .collect();
     let tx = conn.transaction()?;
@@ -192,7 +291,8 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
 /// Decide whether a non-NULL `repo_path` is a prefix-match catch-all that
 /// should be NULLed. See [`heal_catch_all_repo_paths`] for the full rule.
 fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
-    if repo_path == "/" || home == Some(repo_path) {
+    let repo_path_key = normalize_repo_path_key(repo_path);
+    if repo_path_key == "/" || home == Some(repo_path_key.as_str()) {
         return true; // broad sentinels, healed even if they look like git roots
     }
     let p = std::path::Path::new(repo_path);
@@ -202,6 +302,15 @@ fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
     // a `.git` file); a `.git` stat error preserves the row, same as the
     // path-existence check above.
     matches!(p.try_exists(), Ok(true)) && matches!(p.join(".git").try_exists(), Ok(false))
+}
+
+fn normalize_repo_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
 }
 
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
@@ -259,19 +368,26 @@ pub fn ensure_project_with_id(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<()> {
-    conn.execute(
+    let repo_path = repo_path.map(normalize_repo_path_key);
+    let tx = conn.transaction()?;
+    let inserted = tx.execute(
         "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
             name,
-            repo_path,
+            repo_path.as_deref(),
             Timestamp::now().as_microsecond()
         ],
     )?;
+    let also_in = if inserted > 0 {
+        project_name_in_other_workspaces(&tx, &workspace_id, name)?
+    } else {
+        Vec::new()
+    };
     type ProjectRow = (Vec<u8>, String, Option<String>);
-    let existing: Option<ProjectRow> = conn
+    let existing: Option<ProjectRow> = tx
         .query_row(
             "SELECT workspace_id, name, repo_path FROM projects WHERE id = ?1",
             params![id.as_bytes()],
@@ -282,7 +398,7 @@ pub fn ensure_project_with_id(
         Some((existing_ws, existing_name, existing_repo_path))
             if existing_ws.as_slice() == workspace_id.as_bytes()
                 && existing_name == name
-                && existing_repo_path.as_deref() == repo_path =>
+                && existing_repo_path.as_deref() == repo_path.as_deref() =>
         {
             Ok(())
         }
@@ -296,6 +412,10 @@ pub fn ensure_project_with_id(
             "project id {id} was not inserted"
         ))),
     }?;
+    tx.commit()?;
+    if inserted > 0 {
+        warn_project_name_in_other_workspaces(name, &also_in);
+    }
     Ok(())
 }
 
@@ -1080,6 +1200,7 @@ pub fn rename_project(
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     new_name: &str,
+    author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() {
@@ -1093,7 +1214,11 @@ pub fn rename_project(
         ));
     }
 
-    let rows = conn.execute(
+    // Wrap the UPDATE + audit row in one transaction so the trail can never
+    // diverge from the rename it records (on any error the tx drops without
+    // commit, rolling both back).
+    let tx = conn.transaction()?;
+    let rows = tx.execute(
         "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
         params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
     );
@@ -1110,7 +1235,19 @@ pub fn rename_project(
             "project id {project_id} no longer exists in workspace {workspace_id} \
              (race with concurrent purge or delete)",
         ))),
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            audit(
+                &tx,
+                "rename_project",
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+                Timestamp::now().as_microsecond(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        }
         Err(rusqlite::Error::SqliteFailure(err, _))
             if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                 || err.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -1163,6 +1300,7 @@ pub fn purge_project(
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     workspace_project_label: &str,
+    author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -1213,6 +1351,19 @@ pub fn purge_project(
         rusqlite::params![&pid[..], workspace_id.as_bytes()],
     )?;
 
+    // Attributed audit trail for the destructive purge. `page_id` is None
+    // (the whole project is gone); the operator identity comes from the
+    // authenticated request (NULL when single-user / unauthenticated).
+    audit(
+        &tx,
+        "purge_project",
+        Some(workspace_id.as_bytes()),
+        Some(project_id.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+    )?;
+
     tx.commit()?;
     Ok(PurgeSummary {
         label: workspace_project_label.to_string(),
@@ -1223,6 +1374,101 @@ pub fn purge_project(
         handoffs_deleted,
         embeddings_deleted,
     })
+}
+
+/// Summary returned by [`delete_workspace`].
+#[derive(Debug, Default, Clone)]
+pub struct DeleteWorkspaceSummary {
+    /// Projects removed (0 when the workspace was already empty).
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+}
+
+/// Delete a workspace row. Refuses a workspace that still holds projects
+/// unless `force` is set (the guard exists so a stray typo can't wipe a live
+/// workspace). The `workspace_id` FKs are `ON DELETE CASCADE`, so a single
+/// `DELETE FROM workspaces` also removes its projects / pages / sessions /
+/// observations / handoffs. The caller removes the on-disk workspace dir
+/// afterwards.
+///
+/// # Errors
+/// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
+/// is false; [`StoreError::NotFound`] when the workspace does not exist.
+pub fn delete_workspace(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    force: bool,
+) -> StoreResult<DeleteWorkspaceSummary> {
+    let tx = conn.transaction()?;
+    let wid = workspace_id.as_bytes();
+    let count = |sql: &str| -> StoreResult<u64> {
+        let n: Option<i64> = tx
+            .query_row(sql, rusqlite::params![&wid[..]], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+
+    let projects_deleted = count("SELECT COUNT(*) FROM projects WHERE workspace_id = ?1")?;
+    if projects_deleted > 0 && !force {
+        return Err(StoreError::WorkspaceNotEmpty(projects_deleted));
+    }
+    let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1")?;
+
+    let removed = tx.execute(
+        "DELETE FROM workspaces WHERE id = ?1",
+        rusqlite::params![&wid[..]],
+    )?;
+    if removed == 0 {
+        return Err(StoreError::NotFound("workspace".into()));
+    }
+    tx.commit()?;
+    Ok(DeleteWorkspaceSummary {
+        projects_deleted,
+        pages_deleted,
+    })
+}
+
+/// Rename a workspace: a `workspaces.name` UPDATE only — the on-disk dir is
+/// keyed by UUID, so nothing moves. Mirrors [`rename_project`].
+///
+/// # Errors
+/// [`StoreError::InvalidWorkspaceName`] on an empty / `/`-containing name;
+/// [`StoreError::WorkspaceNameTaken`] on a `UNIQUE(name)` collision;
+/// [`StoreError::NotFound`] when the workspace vanished (race with delete).
+pub fn rename_workspace(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    new_name: &str,
+) -> StoreResult<()> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::InvalidWorkspaceName(
+            "workspace name must not be empty or all whitespace".into(),
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(StoreError::InvalidWorkspaceName(
+            "workspace name must not contain '/'".into(),
+        ));
+    }
+    let rows = conn.execute(
+        "UPDATE workspaces SET name = ?1 WHERE id = ?2",
+        params![trimmed, workspace_id.as_bytes()],
+    );
+    match rows {
+        Ok(0) => Err(StoreError::NotFound(format!(
+            "workspace id {workspace_id} no longer exists (race with delete)"
+        ))),
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(StoreError::WorkspaceNameTaken(trimmed.to_string()))
+        }
+        Err(e) => Err(StoreError::Sqlite(e)),
+    }
 }
 
 /// Summary returned by [`move_project_workspace`] and exposed via
@@ -1416,11 +1662,264 @@ mod tests {
         LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier, WorkspaceId,
     };
     use rusqlite::Connection;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_warnings(run: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
 
     /// Open a fresh DB with migrations applied + a default workspace
     /// and "scratch" project pre-created. Tuple-return keeps the
     /// tempdir alive for the duration of the test.
+    // Issue #156 regression, class-wide: every AgentKind must survive
+    // begin_session — i.e. the persisted sessions.agent_kind CHECK
+    // constraint must enumerate every variant. Zero shipped with the enum
+    // variant but without the CHECK migration (V26) and only a live test
+    // caught the constraint failure; this pins the whole class so the next
+    // agent addition fails here, before any deploy.
+    #[test]
+    fn begin_session_accepts_every_agent_kind() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for kind in ai_memory_core::AgentKind::ALL {
+            let session = NewSession {
+                id: ai_memory_core::SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: kind,
+                cwd: None,
+            };
+            begin_session(&mut conn, &session).unwrap_or_else(|e| {
+                panic!(
+                    "sessions.agent_kind CHECK rejects '{}' — add it to the \
+                     constraint with a new migration: {e}",
+                    kind.as_str()
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn get_or_create_project_flags_homonym_across_workspaces() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        let a_shared = get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+
+        // "shared" already lives in `alpha`, so from `beta`'s side it is a
+        // cross-workspace homonym; the owning workspace and unique names
+        // flag nothing.
+        {
+            let tx = conn.transaction().unwrap();
+            assert_eq!(
+                project_name_in_other_workspaces(&tx, &ws_b, "shared").unwrap(),
+                vec!["alpha".to_string()]
+            );
+            assert!(
+                project_name_in_other_workspaces(&tx, &ws_a, "shared")
+                    .unwrap()
+                    .is_empty(),
+                "the owning workspace must be excluded"
+            );
+            assert!(
+                project_name_in_other_workspaces(&tx, &ws_b, "unique-name")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        // Creation is NOT blocked — the homonym is id-namespaced.
+        let b_shared = get_or_create_project(&mut conn, &ws_b, "shared", None).unwrap();
+        assert_ne!(
+            a_shared, b_shared,
+            "homonymous projects must get distinct ids"
+        );
+    }
+
+    #[test]
+    fn get_or_create_project_warns_when_creating_homonym_across_workspaces() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+
+        let logs = capture_warnings(|| {
+            get_or_create_project(&mut conn, &ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            logs.contains("already exists in other workspace")
+                && logs.contains("shared")
+                && logs.contains("alpha"),
+            "homonym creation warning should name the project and other workspace: {logs}"
+        );
+
+        let logs = capture_warnings(|| {
+            get_or_create_project(&mut conn, &ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "idempotent lookup must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn ensure_project_with_id_warns_when_creating_homonym_across_workspaces() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+        let id = ProjectId::new();
+
+        let logs = capture_warnings(|| {
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            logs.contains("already exists in other workspace")
+                && logs.contains("shared")
+                && logs.contains("alpha"),
+            "manifest project creation warning should name the project and other workspace: {logs}"
+        );
+
+        let logs = capture_warnings(|| {
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "idempotent manifest import must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn ensure_project_with_id_does_not_warn_when_validation_fails() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+        let id = ProjectId::new();
+        ensure_project_with_id(&mut conn, id, ws_b, "other", None).unwrap();
+
+        let logs = capture_warnings(|| {
+            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None)
+                .expect_err("same id with different name must fail validation");
+            assert!(
+                matches!(err, StoreError::Duplicate(_)),
+                "unexpected error: {err}"
+            );
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "failed validation must not emit a creation warning: {logs}"
+        );
+    }
+
+    #[test]
+    fn delete_workspace_refuses_non_empty_then_cascades_with_force() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+
+        // Non-empty (holds the "scratch" project + a page) → refused w/o force.
+        let err = delete_workspace(&mut conn, &ws, false).unwrap_err();
+        assert!(
+            matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
+            "expected WorkspaceNotEmpty, got {err:?}"
+        );
+        let ws_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+                rusqlite::params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ws_still, 1, "refused delete must not touch the row");
+
+        // Force cascades: project + page gone, workspace row gone.
+        let summary = delete_workspace(&mut conn, &ws, true).unwrap();
+        assert!(
+            summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
+            "{summary:?}"
+        );
+        let proj_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE workspace_id = ?1",
+                rusqlite::params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proj_left, 0, "projects must cascade on workspace delete");
+
+        // Deleting again → NotFound.
+        assert!(matches!(
+            delete_workspace(&mut conn, &ws, true).unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn delete_workspace_empty_succeeds_without_force() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
+        let summary = delete_workspace(&mut conn, &empty, false).unwrap();
+        assert_eq!(summary.projects_deleted, 0);
+        assert_eq!(summary.pages_deleted, 0);
+    }
+
+    #[test]
+    fn rename_workspace_updates_name_and_rejects_collision() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        get_or_create_workspace(&mut conn, "taken").unwrap();
+
+        rename_workspace(&mut conn, &ws, "renamed").unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM workspaces WHERE id = ?1",
+                rusqlite::params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "renamed", "name column updated in place");
+
+        assert!(matches!(
+            rename_workspace(&mut conn, &ws, "taken").unwrap_err(),
+            StoreError::WorkspaceNameTaken(_)
+        ));
+        assert!(matches!(
+            rename_workspace(&mut conn, &ws, "   ").unwrap_err(),
+            StoreError::InvalidWorkspaceName(_)
+        ));
+    }
+
     fn fresh_db() -> (
         TempDir,
         Connection,
@@ -1908,6 +2407,7 @@ mod tests {
             AgentKind::OpenClaw,
             AgentKind::AntigravityCli,
             AgentKind::Omp,
+            AgentKind::Pi,
             AgentKind::Grok,
             AgentKind::Other,
         ] {
@@ -2512,6 +3012,165 @@ mod tests {
         assert_eq!(parent_rows, 1);
     }
 
+    // Hollow-project sweep: deletes only rows with zero data of any kind
+    // and past the age cutoff; reserved names survive even when hollow.
+    #[test]
+    fn sweep_hollow_projects_deletes_only_old_dataless_rows() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+        let (_tmp, mut conn, ws, _scratch) = fresh_db();
+
+        // Hollow + old: delete. (Backdate created_at 8 days.)
+        let hollow = get_or_create_project(&mut conn, &ws, "zt", None).unwrap();
+        // Hollow + fresh: keep (inside the grace window).
+        let fresh = get_or_create_project(&mut conn, &ws, "new-probe", None).unwrap();
+        // Old but has a session: keep (not hollow).
+        let with_data = get_or_create_project(&mut conn, &ws, "one-off", None).unwrap();
+        // Reserved + hollow + old: keep.
+        let global =
+            get_or_create_project(&mut conn, &ws, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
+                .unwrap();
+
+        let eight_days_us: i64 = 8 * 24 * 60 * 60 * 1_000_000;
+        for id in [&hollow, &with_data, &global] {
+            conn.execute(
+                "UPDATE projects SET created_at = created_at - ?1 WHERE id = ?2",
+                params![eight_days_us, &id.as_bytes()[..]],
+            )
+            .unwrap();
+        }
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: with_data,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let deleted = sweep_hollow_projects(&mut conn, 7).unwrap();
+        assert_eq!(deleted, vec!["zt".to_string()]);
+
+        let exists = |id: &ai_memory_core::ProjectId| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(exists(&hollow), 0, "old hollow row deleted");
+        assert_eq!(exists(&fresh), 1, "fresh hollow row kept (grace window)");
+        assert_eq!(exists(&with_data), 1, "data-bearing row kept");
+        assert_eq!(exists(&global), 1, "reserved _global kept even when hollow");
+
+        // Idempotent: a second pass deletes nothing.
+        assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+    }
+
+    /// V27 re-runs the V19 repair for the fragments that accumulated
+    /// after V19: non-git parents have no repo_path, so the v0.12.2
+    /// prefix guard couldn't anchor subdirectory cwds and per-event
+    /// basename derivation kept minting fragment projects. Idempotent:
+    /// a second pass repairs nothing.
+    #[test]
+    fn v27_reattributes_nongit_fragments_and_preserves_reserved_projects() {
+        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run_to(&mut conn, 26).unwrap();
+
+        // Non-git parent (repo_path NULL — the production shape) plus a
+        // basename fragment holding misattributed observations, and the
+        // reserved projects that must survive even when empty.
+        let ws = get_or_create_workspace(&mut conn, "default").unwrap();
+        let parent = get_or_create_project(&mut conn, &ws, "tiktok_analysis", None).unwrap();
+        let fragment = get_or_create_project(&mut conn, &ws, "sources", None).unwrap();
+        let scratch = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        let global = get_or_create_project(&mut conn, &ws, "_global", None).unwrap();
+
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: parent,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/home/user/tiktok_analysis".into()),
+            },
+        )
+        .unwrap();
+        for i in 0..4 {
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: fragment,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: format!("call {i}"),
+                    body: "body".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+
+        crate::migrations::run_to(&mut conn, 27).unwrap();
+
+        let count = |sql: &str, id: &ai_memory_core::ProjectId| -> i64 {
+            conn.query_row(sql, params![&id.as_bytes()[..]], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                &parent
+            ),
+            4,
+            "observations re-attributed to the non-git parent"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM projects WHERE id = ?1", &fragment),
+            0,
+            "emptied fragment row deleted"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM projects WHERE id = ?1", &scratch),
+            1,
+            "scratch is reserved and survives empty"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM projects WHERE id = ?1", &global),
+            1,
+            "_global is reserved and survives empty"
+        );
+
+        // Idempotency: replay V27's statements directly (refinery won't
+        // re-run an applied version); zero rows change.
+        let sql = include_str!("../migrations/V27__repair_nongit_fragment_attribution.sql");
+        conn.execute_batch(sql).unwrap();
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                &parent
+            ),
+            4
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM projects WHERE id = ?1", &scratch),
+            1
+        );
+    }
+
     #[test]
     fn v20_adds_grok_and_preserves_sessions_invariants_on_upgraded_db() {
         use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
@@ -2633,6 +3292,123 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fk_violations, 0, "V20 must leave foreign keys clean");
+    }
+
+    #[test]
+    fn v25_adds_pi_and_preserves_sessions_invariants_on_upgraded_db() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let ws;
+        let proj;
+        let existing_sid = SessionId::new();
+
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::migrations::run_to(&mut conn, 24).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            ws = get_or_create_workspace(&mut conn, "default").unwrap();
+            proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 25).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Pi,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_count, 2, "V25 must preserve existing sessions");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_sessions_recent', 'idx_sessions_project', 'idx_sessions_started_at', 'idx_sessions_scope_ended')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 4, "V25 must recreate sessions indexes");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'sessions_ws_proj_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            trigger_count, 1,
+            "V25 must recreate the V18 pairing trigger"
+        );
+
+        let scheduler_trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'auto_improve_scheduler_claims_session_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler_trigger_count, 1,
+            "V25 must recreate the V22 scheduler/session pairing trigger"
+        );
+
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj =
+            get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
+        let err = begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: other_proj,
+                agent_kind: AgentKind::Pi,
+                cwd: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sessions.workspace_id does not match"),
+            "pairing trigger must reject split-brain sessions after V25: {err}"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
     }
 
     /// V19 is idempotent: re-running on a repaired DB is a no-op.
@@ -2861,13 +3637,13 @@ mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         // Simulate the post-purge state: project row gone.
         // `purge_project` drives the cascading deletes we want here.
-        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch")
+        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None)
             .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
         // pre-fix code returned `Ok(())` because `UPDATE` affected
         // zero rows. The fix returns `NotFound` so admin handlers
         // can respond 404 honestly.
-        let err = rename_project(&mut conn, &ws, &proj, "renamed")
+        let err = rename_project(&mut conn, &ws, &proj, "renamed", None)
             .expect_err("rename of purged project must error");
         match err {
             StoreError::NotFound(_) => {}
@@ -2881,8 +3657,83 @@ mod tests {
     #[test]
     fn rename_project_of_live_project_succeeds() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
-        rename_project(&mut conn, &ws, &proj, "renamed-live")
+        rename_project(&mut conn, &ws, &proj, "renamed-live", None)
             .expect("rename of live project must succeed");
+    }
+
+    fn seed_user(conn: &Connection, username: &str) -> ai_memory_core::UserId {
+        crate::users::insert_user(
+            conn,
+            &ai_memory_core::NewUser {
+                username: username.to_string(),
+                name: None,
+                email: None,
+            },
+            &[7u8; crate::users::TOKEN_HASH_LEN],
+        )
+        .expect("seed user")
+    }
+
+    fn audit_row_for(conn: &Connection, op: &str) -> (i64, Option<Vec<u8>>) {
+        conn.query_row(
+            "SELECT COUNT(*), MAX(author_id) FROM audit_log WHERE op = ?1",
+            [op],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Attribution guard: a `purge_project` leaves exactly one `audit_log`
+    /// row tagged with the op + the authenticated operator — the
+    /// point-in-time answer to "who wiped this project?" (V16's motivating
+    /// case). Without the audit call the count would be 0.
+    #[test]
+    fn audit_log_records_purge_project_with_author() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let author = seed_user(&conn, "alice");
+
+        purge_project(&mut conn, &ws, &proj, "default/scratch", Some(author))
+            .expect("purge should succeed");
+
+        let (count, op_author) = audit_row_for(&conn, "purge_project");
+        assert_eq!(count, 1, "exactly one purge_project audit row");
+        assert_eq!(
+            op_author.as_deref(),
+            Some(&author.as_bytes()[..]),
+            "audit row must carry the purging operator"
+        );
+    }
+
+    /// A `rename_project` writes an attributed audit row, committed
+    /// atomically with the rename.
+    #[test]
+    fn audit_log_records_rename_project_with_author() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let author = seed_user(&conn, "bob");
+
+        rename_project(&mut conn, &ws, &proj, "renamed", Some(author))
+            .expect("rename should succeed");
+
+        let (count, op_author) = audit_row_for(&conn, "rename_project");
+        assert_eq!(count, 1, "exactly one rename_project audit row");
+        assert_eq!(op_author.as_deref(), Some(&author.as_bytes()[..]));
+    }
+
+    /// A failed rename (name collision) writes NO audit row — the tx that
+    /// wraps the UPDATE + audit rolls back as a unit.
+    #[test]
+    fn audit_log_omits_rename_project_on_collision() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        let author = seed_user(&conn, "carol");
+        // Second project whose name we'll collide with.
+        let other = get_or_create_project(&mut conn, &ws, "taken", None).unwrap();
+
+        let err = rename_project(&mut conn, &ws, &other, "scratch", Some(author))
+            .expect_err("rename onto an existing name must fail");
+        assert!(matches!(err, StoreError::ProjectNameTaken(_)));
+
+        let (count, _) = audit_row_for(&conn, "rename_project");
+        assert_eq!(count, 0, "a rolled-back rename must leave no audit row");
     }
 
     /// Run the reader's exact FTS5 `MATCH` against the real, populated
@@ -3093,12 +3944,12 @@ mod tests {
         );
         assert_eq!(
             read_repo_path(&conn, &git_proj),
-            Some(git_path),
+            Some(normalize_repo_path_key(&git_path)),
             "real git work-tree root must be preserved"
         );
         assert_eq!(
             read_repo_path(&conn, &gone_proj),
-            Some(gone_path),
+            Some(normalize_repo_path_key(&gone_path)),
             "path absent on this host must be preserved (multi-user/unmounted safety)"
         );
     }

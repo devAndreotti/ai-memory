@@ -13,6 +13,10 @@
 
 FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /work
+ARG CARGO_PROFILE_RELEASE_LTO=false
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*

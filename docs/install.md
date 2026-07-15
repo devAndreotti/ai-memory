@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot)
+  (Codex, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -322,6 +322,20 @@ ai-memory auth login oidc-device \
   --client-id "ai-memory-cli"
 ```
 
+The stored OIDC access token is also used by thin-client HTTP commands
+(`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
+similar) when no static `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is
+configured. Static bearer auth still has precedence. This is for external
+OIDC-aware gateways/bridges; native ai-memory server auth still uses static root
+bearer / DB-user tokens, and `/admin/*` remains root-only unless a gateway
+translates accepted OIDC auth into upstream auth that ai-memory accepts.
+
+OIDC/Keycloak `sid` claims describe the login provider's session, not the
+coding-agent session ai-memory uses for `[auto_scope]` isolation. Gateways may
+propagate the authenticated user/client/agent headers, but
+`X-Memory-Actor-Session-Id` should only contain a real lifecycle-hook session id
+from a session-aware bridge.
+
 Restart the service after changing provider settings:
 
 ```bash
@@ -354,22 +368,38 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
-Native `ai-memory hook --event ...` commands spool events locally and drain them
-at session boundaries. The built-in timings stay short by default, but
-high-latency or large-backlog instances can raise them with whole-minute runtime
-env vars in the agent's environment; no `install-hooks` rerun is needed:
+Native `ai-memory hook --event ...` commands spool events locally. Session start
+does a short bounded cleanup drain before fetching a handoff; cancellation-prone
+boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
+`hook-drain` helper so delivery does not depend on one shutdown hook surviving.
+On Unix, the helper uses a trusted `setsid` launcher when available and falls
+back to a separate process group otherwise; Windows uses detached/breakaway
+process flags. The spool is capped, so a permanently undrained backlog is
+eventually pruned rather than unbounded, but old undelivered events can be lost.
+The built-in timings stay short on agent-facing paths, but high-latency or
+large-backlog instances can raise them with whole-minute runtime env vars in the
+agent's environment; no `install-hooks` rerun is needed:
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|
 | `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | each event POST during a drain |
 | `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | the synchronous `session-start` handoff GET |
-| `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time the `session-start` cleanup drain may spend |
-| `AI_MEMORY_HOOK_END_BUDGET_MINUTES` | 10 seconds | 60 minutes | total time the `session-end` flush may spend |
+| `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
+| `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after a background-drain boundary |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
 zero values fall back to the built-in defaults; values above 60 are clamped. The
 incremental threshold is a positive event count; invalid values fall back to 32.
+
+Server-side hook ingest also has an optional per-source limiter for shared or
+remote installs that need protection from one runaway agent session. Set
+`AI_MEMORY_HOOK_RATE_PER_SEC` on the server to the token refill rate per
+actor/session source; `0` or unset disables the limiter. Set
+`AI_MEMORY_HOOK_RATE_BURST` to override the burst size (defaults to the refill
+rate, minimum one token when enabled). The limiter is bounded in both key count
+and key bytes, and `/hook/batch` drains can skip over-budget sources while still
+accepting later unrelated sources.
 
 ### Native service operations
 
@@ -467,8 +497,11 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
-> it runs hooks through Git Bash, so ai-memory renders `bash -c` commands for
-> the `.sh` scripts.
+> it uses Claude exec form (`command` = real `ai-memory.exe`, `args` = argv
+> tokens for `hook --event ...`) by default. Set
+> `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
+> Git Bash `bash -c` commands for the `.sh` scripts, including for older Claude
+> Code builds that do not support exec form.
 > OpenClaw, OpenCode, and OMP are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
@@ -489,6 +522,16 @@ docker run --rm akitaonrails/ai-memory:latest \
         --hooks-dir ~/.ai-memory/hooks \
         --server-url "http://homelab:49374" \
         --auth-token "$TOKEN"
+```
+
+Codex still does not expose a reliable true session-end hook. Its `Stop` hook is
+captured as a turn/stop observation only; ai-memory does **not** treat it as
+SessionEnd. When you need the final session summary, handoff, and
+auto-improvement eligibility for the current project, run:
+
+```bash
+ai-memory finalize-session
+# add --all to close every matching open Codex session in this workspace/project
 ```
 
 ### OpenCode
@@ -519,7 +562,7 @@ loaded at startup.
 
 ```bash
 docker run --rm akitaonrails/ai-memory:latest \
-    install-mcp --client pi \
+    install-mcp --client omp \
     --server-url "http://homelab:49374/mcp" \
     --auth-token "$TOKEN"
 
@@ -531,9 +574,28 @@ ai-memory install-hooks --agent omp --apply \
 ```
 
 Restart OMP after installing or changing the extension; extensions are
-loaded at startup. The ai-memory CLI accepts `--client pi` /
-`--client omp` for MCP and `--agent omp` / `--agent pi` for hooks;
-all four target the same current Oh My Pi integration surface.
+loaded at startup. The ai-memory CLI accepts `--client omp` (or
+`--client oh-my-pi`) for MCP and `--agent omp` (or `--agent oh-my-pi`)
+for hooks; both target OMP's native `.omp` integration surface.
+
+### Pi
+
+Pi does not read a native `mcp.json`. ai-memory supports Pi through one
+generated TypeScript extension at `~/.pi/agent/extensions/ai-memory.ts`; the
+same file captures lifecycle events and bridges ai-memory's HTTP MCP tools into
+Pi with `pi.registerTool`.
+
+```bash
+ai-memory install-hooks --agent pi --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+# `install-mcp --client pi` prints this guidance instead of writing mcp.json:
+ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
+```
+
+Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
+separate and continues to use `.omp` paths.
 
 ### Bind mounts vs docker cp
 
@@ -560,7 +622,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, Grok Build CLI, VS Code Copilot
+### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, Grok Build CLI, Zero, VS Code Copilot
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -644,15 +706,28 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
-OpenClaw, and OMP do not need script extraction because `install-hooks`
-generates TypeScript plugin/extension files for them instead.
+OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
+`install-hooks` generates TypeScript plugin/extension files for them
+instead. For Pi, the generated extension also provides the MCP bridge.
 
 This path is friction-free when:
 - You have curl + bash but not docker
 - You don't need to run a local ai-memory server (you're a client of
   a homelab/remote ai-memory)
+
+### Hook command paths across a container boundary
+
+`install-hooks --apply` stages the hook scripts into the data dir and
+writes their absolute paths into the agent's config. When the CLI runs
+inside a container but the agent runs on the host, those staged paths
+would be container paths the host can't see. Set
+`AI_MEMORY_HOOKS_HOST_ROOT` to the *host* directory that the staged
+`hooks/` tree is mounted from and the rendered config uses
+`<host-root>/<agent>/…` command paths instead. The bundled docker
+wrappers (`bin/ai-memory`, `bin/ai-memory.ps1`) forward this variable
+automatically; you only set it by hand for custom container setups.
 
 ---
 
@@ -691,6 +766,7 @@ The `serve` subcommand also accepts:
 | `--web-slug /web` | `AI_MEMORY_WEB_SLUG` | Where the web UI mounts within the base-path. Default `/web`; set to `/` to mount the UI at the base-path root. |
 | `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |
 | `--cors-allow-origin <origin>` | `AI_MEMORY_CORS_ALLOW_ORIGINS` (CSV) | Allow listed origins to call `/api/v1`. Layer is scoped only to that route — `/mcp`, `/hook`, `/admin`, and `/web` remain origin-locked. |
+| _(config only)_ | `AI_MEMORY_HOOK_RATE_PER_SEC`, `AI_MEMORY_HOOK_RATE_BURST` | Optional per-actor/session hook ingest token bucket. Unset/`0` rate disables it; burst defaults to the rate (minimum one token when enabled). |
 
 On macOS, see [`docs/macos.md`](macos.md); use the archive matching your
 architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
@@ -698,8 +774,8 @@ architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
-Docker Desktop wrapper, or a source build. Native Claude Code uses direct
-`ai-memory.exe hook` commands by default; other native Windows script-hook
+Docker Desktop wrapper, or a source build. Native Claude Code uses Claude exec
+form with a real `ai-memory.exe` by default; other native Windows script-hook
 agents use PowerShell `.ps1` defaults.
 
 When run from source, `install-hooks` finds the bundled scripts in
@@ -740,6 +816,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-2.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 2.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API — OpenAI-compatible endpoint at `opencode.ai/zen/go/v1`. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Reuses `LLM_API_KEY` or `OPENAI_API_KEY` with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
@@ -942,7 +1019,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
-| `auth login oidc-device` | same developer data dir as native hooks | Store a per-developer OIDC device token for native hook authentication |
+| `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
 | `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
@@ -962,12 +1039,13 @@ default:
 
 1. A slim instruction block in `CLAUDE.md`, `AGENTS.md`, or the file passed with
    `--target`. The block is bounded by `<!-- ai-memory:start -->` and
-   `<!-- ai-memory:end -->`.
+   `<!-- ai-memory:end -->` delimiters that appear alone on their own lines.
 2. Managed ai-memory Agent Skills containing the detailed tool-routing guidance.
 
 Re-running the command is safe. If a project still has the old long ai-memory
-block between those markers, the refresh replaces that block in place with the
-slim snippet and leaves unrelated instructions before and after it alone.
+block between line-anchored markers, the refresh replaces that block in place
+with the slim snippet, leaves unrelated instructions before and after it alone,
+and writes a timestamped `.bak-*` backup before changing an existing file.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 `install-instructions --print` previews only the instruction snippet; run
@@ -1022,9 +1100,11 @@ volume). Outside docker, override with `AI_MEMORY_DATA_DIR=/path`.
 
 Scheduled maintenance is configured in `[maintenance]` in `config.toml`.
 By default, rule-based lint and forget sweep run daily outside hook
-latency. Embedding backfill is supported but defaults to off because it
-can call a paid provider; enable it with
-`embedding_backfill_interval_secs` after configuring an embedder.
+latency across every existing workspace/project. Embedding backfill is
+supported but defaults to off because it can call a paid provider; if you
+enable `embedding_backfill_interval_secs` after configuring an embedder,
+each scheduled tick backfills every existing workspace/project and may
+increase provider usage accordingly.
 
 ---
 
@@ -1116,6 +1196,18 @@ plausible-but-wrong pages (the LLM doesn't know your project, it's
 inferring from git history). The wiki is git-versioned precisely so
 this is recoverable: review what landed, `docker exec ai-memory git
 -C /data/wiki diff HEAD~1`, and revert if it's off.
+
+## Logs and read-only sandboxes
+
+The CLI and server write daily-rolling logs to `<data_dir>/logs/`
+(`~/.local/share/ai-memory/logs/` by default). When that location is not
+writable — sandboxes like [ai-jail](https://github.com/akitaonrails/ai-jail)
+mount `$HOME` read-only or as throwaway tmpfs — ai-memory degrades instead
+of failing: it falls back to the OS temp dir, then to stderr-only logging,
+printing the exact path that failed at each step. Commands keep working
+either way. To keep durable file logs (and durable hook spooling) inside a
+sandbox, map the data dir read-write, e.g. `ai-jail --rw-map
+~/.local/share/ai-memory …`.
 
 ## Operating without auth
 

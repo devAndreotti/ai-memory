@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, ProviderAuth,
-    ProviderChoice, ProviderConfig,
+    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
+    ProviderAuth, ProviderChoice, ProviderConfig,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -66,10 +66,10 @@ pub struct Config {
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
-    /// path) from `$HOME`. Used to keep the cwd->project resolver and the
+    /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
     /// startup heal from treating `$HOME` as a prefix-match catch-all
     /// (issue #103) without env reads scattered through the runtime. Not a
-    /// config.toml / env key: always derived from `$HOME` at load.
+    /// config.toml key: always derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
@@ -133,6 +133,10 @@ pub struct Config {
     /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
+    /// Env-backed alias for hook ingest tokens per second per source.
+    pub hook_rate_per_sec: f64,
+    /// Env-backed alias for hook ingest burst tokens per source.
+    pub hook_rate_burst: f64,
     /// `Host`-header allowlist for the HTTP server. Requests whose
     /// `Host` header doesn't match this list are rejected before they
     /// reach MCP, hook, admin, or web routes (DNS-rebinding defence).
@@ -182,6 +186,7 @@ pub struct Config {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
     data_dir: Option<PathBuf>,
+    home_dir: Option<String>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -196,12 +201,14 @@ pub struct RuntimeEnv {
     copilot_api_url: Option<String>,
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
+    opencode_api_key: Option<SecretString>,
 }
 
 impl RuntimeEnv {
     fn from_process() -> Self {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
+            home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -223,6 +230,7 @@ impl RuntimeEnv {
             copilot_api_url: env_string("COPILOT_API_URL"),
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
+            opencode_api_key: env_secret("OPENCODE_API_KEY"),
         }
     }
 
@@ -363,6 +371,8 @@ impl Default for Config {
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
+            hook_rate_per_sec: 0.0,
+            hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             cors_allow_origins: Vec::new(),
             admission_webhooks: Vec::new(),
@@ -600,13 +610,11 @@ impl Config {
             config.admission_webhooks = parsed;
         }
 
-        // $HOME read once here (config-read-path invariant); threaded to the
-        // resolver guard and startup heal so neither reads the env directly.
-        // Normalized so a trailing slash can't slip a catch-all past the
-        // exact-match guards.
-        config.home_dir = std::env::var("HOME")
-            .ok()
-            .and_then(|home| normalize_home_dir(&home));
+        // Home is captured once in RuntimeEnv (config-read-path invariant);
+        // threaded to the resolver guard and startup heal so neither reads the
+        // env directly. AI_MEMORY_HOME is accepted for tests/wrappers that need
+        // to emulate a host home distinct from the process HOME.
+        config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
@@ -645,10 +653,11 @@ impl Config {
             "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
             "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
             "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
+            "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
                 )));
             }
         };
@@ -668,6 +677,7 @@ impl Config {
                             .into(),
                     ));
                 }
+                ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
             },
         };
         Ok(Some(ProviderConfig {
@@ -764,6 +774,7 @@ impl Config {
             ProviderChoice::OpenAiOAuth => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
+            ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
         }
     }
 
@@ -892,12 +903,14 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Normalize `$HOME` for prefix-match comparisons: strip trailing separators
+/// Normalize home for prefix-match comparisons: accept either slash spelling,
+/// strip trailing separators,
 /// so a stored `repo_path` of `/home/u` still equals a `$HOME` of `/home/u/`
 /// (the cwd side is trimmed the same way in `find_project_by_cwd_prefix`).
 /// All-separator or empty input yields `None` (no usable home).
 fn normalize_home_dir(home: &str) -> Option<String> {
-    let trimmed = home.trim_end_matches('/');
+    let normalized = home.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -975,13 +988,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
         let cfg = Config::load(None, Some(cli_dir)).unwrap();
-        // `home_dir` is derived from `$HOME` at load (the single config-read
-        // path), normalized so a trailing slash can't bypass the catch-all
-        // guards. Reading the env in a test is allowed; this fails if the
-        // load-time assignment is dropped while `$HOME` is set.
+        // `home_dir` is derived from AI_MEMORY_HOME or `$HOME` at load (the
+        // single config-read path), normalized so a trailing slash can't bypass
+        // the catch-all guards. Reading the env in a test is allowed; this
+        // fails if the load-time assignment is dropped while either env var is
+        // set.
         assert_eq!(
             cfg.home_dir,
-            std::env::var("HOME")
+            std::env::var("AI_MEMORY_HOME")
+                .or_else(|_| std::env::var("HOME"))
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
         );
@@ -994,6 +1009,10 @@ mod tests {
         assert_eq!(
             normalize_home_dir("/home/u///"),
             Some("/home/u".to_string())
+        );
+        assert_eq!(
+            normalize_home_dir(r"C:\Users\tester\"),
+            Some("C:/Users/tester".to_string())
         );
         // Degenerate inputs yield no usable home rather than an empty or
         // root-collapsing prefix key.
@@ -1010,6 +1029,8 @@ mod tests {
             r#"
             bind = "0.0.0.0:9999"
             log_level = "debug"
+            hook_rate_per_sec = 7.5
+            hook_rate_burst = 12.0
 
             [maintenance]
             enabled = false
@@ -1060,6 +1081,8 @@ mod tests {
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:9999");
         assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.hook_rate_per_sec, 7.5);
+        assert_eq!(cfg.hook_rate_burst, 12.0);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -1320,6 +1343,36 @@ mod tests {
                 .expose_secret(),
             "tok-oauth-test"
         );
+    }
+
+    #[test]
+    fn opencode_provider_resolves_choice_default_model_and_api_key() {
+        for spelling in ["opencode", "opencode-zen", "opencode_zen"] {
+            let cfg = Config {
+                llm_provider: Some(spelling.into()),
+                runtime_env: RuntimeEnv {
+                    opencode_api_key: Some(SecretString::from("sk-opencode-test")),
+                    ..RuntimeEnv::default()
+                },
+                ..Config::default()
+            };
+
+            let provider = cfg.llm_provider_config().unwrap().unwrap();
+            assert_eq!(provider.provider, ProviderChoice::OpenCode, "{spelling}");
+            assert_eq!(provider.model, "claude-sonnet-4-6", "{spelling}");
+            assert_eq!(
+                provider.auth.requirement(),
+                AuthRequirement::RequiredApiKey {
+                    env_var: "OPENCODE_API_KEY"
+                },
+                "{spelling}"
+            );
+            assert_eq!(
+                provider.auth.require_api_key().unwrap().expose_secret(),
+                "sk-opencode-test",
+                "{spelling}"
+            );
+        }
     }
 
     #[test]

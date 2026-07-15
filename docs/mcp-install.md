@@ -19,14 +19,14 @@
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, OpenCode, and
+Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and
 OMP have automatic capture integrations (shell/PowerShell hooks for
 Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / Grok Build CLI, TypeScript plugin/extension
 files for OpenClaw / OpenCode / OMP) and are covered in the
 [main README](../README.md#quick-start). On native Windows, Claude Code uses
 Git Bash `.sh` hooks rather than the PowerShell default used by other
-script-hook agents. Grok captures lifecycle events, but it ignores
-SessionStart stdout, so ai-memory does not auto-inject handoffs for Grok.
+script-hook agents. Grok and Zero capture lifecycle events, but both ignore
+SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
@@ -54,6 +54,23 @@ Built-in integrations should use `ai-memory install-hooks` rather than
 calling `/hook` directly. For a third-party bridge that has its own
 lifecycle vocabulary, keep the core `event` query param on one of
 ai-memory's canonical events when possible:
+
+### Community-maintained Hermes Agent plugin
+
+ai-memory does not currently ship a first-party Hermes Agent installer,
+but a community-maintained
+[`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
+is available. Treat it as a third-party bridge: verify the plugin's
+documented Hermes and ai-memory version matrix, install/update/uninstall
+behavior, platform coverage, and secret handling before enabling it on a
+live ai-memory server. In particular, bearer tokens and endpoint settings
+should stay in environment or local config references rather than generated
+plugin source files.
+
+The same lifecycle guidance below applies to Hermes or any other external
+bridge: map known events onto ai-memory's canonical hook events where
+possible, and use extension metadata for source-specific events instead of
+expanding ai-memory's stored event enum for one client.
 
 ```bash
 curl -X POST \
@@ -84,7 +101,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / pi|omp / antigravity-cli / vscode-copilot
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / vscode-copilot
 > ```
 
 ---
@@ -393,6 +410,43 @@ The rendered hooks config looks like:
 
 ---
 
+## Zero (Gitlawb/zero)
+
+Zero manages MCP servers in `~/.config/zero/config.json`
+(`$XDG_CONFIG_HOME/zero/config.json` on non-default XDG setups) under an
+`mcp.servers` map, with native HTTP transport + bearer headers:
+
+```bash
+ai-memory install-mcp --client zero --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ai-memory": {
+        "type": "http",
+        "url": "http://homelab:49374/mcp",
+        "headers": { "Authorization": "Bearer <token>" }
+      }
+    }
+  }
+}
+```
+
+Lifecycle capture is separate and script-free: `ai-memory install-hooks
+--agent zero --apply` merges exec-form entries (the native `ai-memory hook`
+command + args, JSON payload on stdin — no shell) into
+`~/.config/zero/hooks.json`, covering `sessionStart`/`sessionEnd`/
+`beforeTool`/`afterTool` plus `specialistStart`/`specialistStop` (mapped to
+ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
+capture and session-end handoff *creation* work, but handoff *injection*
+does not — ask Zero to call `memory_handoff_accept` at the start of a
+resumed session.
+
 ## OpenClaw
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via a native
@@ -436,18 +490,17 @@ OpenClaw distinguishes transports explicitly. Use
 
 ## Oh My Pi / OMP
 
-**Status:** ✅ MCP supported via `install-mcp --client pi` or
-`--client omp`. ✅ Lifecycle capture supported via
-`ai-memory install-hooks --agent omp --apply` or `--agent pi --apply`.
+**Status:** ✅ MCP supported via `install-mcp --client omp` (or
+`--client oh-my-pi`). ✅ Lifecycle capture supported via
+`ai-memory install-hooks --agent omp --apply` (or `--agent oh-my-pi`).
 
 **Config file:**
 - User: `~/.omp/agent/mcp.json`
 - Project: `.omp/mcp.json`
 
 The current Oh My Pi package exposes the `omp` binary and native
-`.omp` config directories. The ai-memory CLI accepts `--client pi` /
-`--client omp` for MCP and `--agent omp` / `--agent pi` for lifecycle
-capture; they are aliases for this same integration surface.
+`.omp` config directories. Use `omp` (or `oh-my-pi`) for this integration;
+real `pi` is recognized separately and uses the generated bridge extension below.
 
 ```json
 {
@@ -465,8 +518,7 @@ capture; they are aliases for this same integration surface.
 
 ```bash
 ai-memory install-hooks --agent omp --apply
-# or:
-ai-memory install-hooks --agent pi --apply
+# or: ai-memory install-hooks --agent oh-my-pi --apply
 ```
 
 This writes `~/.omp/agent/extensions/ai-memory.ts`, which OMP discovers
@@ -478,6 +530,25 @@ installing or changing the file.
   used for context injection.
 - The extension uses OMP lifecycle events for prompt/tool capture and
   `before_agent_start` to inject pending ai-memory handoffs.
+
+## Pi
+
+**Status:** ✅ MCP and lifecycle capture supported via generated bridge
+extension. Pi has no native `mcp.json`; use `install-hooks --agent pi --apply`
+to write `~/.pi/agent/extensions/ai-memory.ts`.
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+The generated extension posts lifecycle events to `/hook`, fetches pending
+handoffs in `before_agent_start`, initializes ai-memory's HTTP `/mcp` endpoint,
+lists tools, and registers each one with `pi.registerTool`. `install-mcp
+--client pi` intentionally prints this bridge guidance instead of writing an
+ignored `~/.pi/agent/mcp.json`.
+
+OMP / Oh My Pi remains separate: use `--client omp` / `--agent omp` (or
+`oh-my-pi`) for `.omp` paths.
 
 ---
 
@@ -536,8 +607,20 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, and OMP. Codex, OpenCode, and Antigravity CLI have no true session-end event in the current integration, so ask them to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
 | **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+
+OpenCode uses its official `session.deleted` plugin event for true session-end
+delivery. Its generated plugin also sends a deduped best-effort close for any
+still-active sessions from `dispose` during normal plugin teardown; abrupt
+process exits can still lose that fallback, so `session.deleted` remains the
+primary close path.
+
+Codex `Stop` is not a session end. The Codex hook install intentionally omits
+`SessionEnd`; `ai-memory finalize-session` finds the latest open Codex session
+for the current workspace/project and posts a synthetic `session-end` event
+through the same server path as real hook clients. Use `--all` only when you
+want to close every matching open Codex session in that scope.
 
 So a typical mixed workflow looks like:
 
