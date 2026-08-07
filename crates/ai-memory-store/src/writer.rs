@@ -215,6 +215,17 @@ pub(crate) enum WriteCmd {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    MarkAuditIssueReviewed {
+        workspace_id: WorkspaceId,
+        issue_key: String,
+        reviewed_by: Option<String>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    UnmarkAuditIssueReviewed {
+        workspace_id: WorkspaceId,
+        issue_key: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     ReviveUserToken {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -898,6 +909,48 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Mark an audit/drift issue reviewed, using the same stable `issue_key`
+    /// string the frontend already computes (e.g. `"stale:proj:notes/a.md"`).
+    /// Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn mark_audit_issue_reviewed(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_key: String,
+        reviewed_by: Option<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MarkAuditIssueReviewed {
+            workspace_id,
+            issue_key,
+            reviewed_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Clear a previously-reviewed mark. Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn unmark_audit_issue_reviewed(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_key: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UnmarkAuditIssueReviewed {
+            workspace_id,
+            issue_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Clear `token_expired_at`, re-activating the user's existing token.
     /// Idempotent. Returns `false` when the user doesn't exist.
     ///
@@ -1304,6 +1357,28 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ExpireUserToken { user_id, reply } => {
                 let result = users::expire_user_token(&conn, user_id);
                 send_or_warn(reply, result, "expire_user_token");
+            }
+            WriteCmd::MarkAuditIssueReviewed {
+                workspace_id,
+                issue_key,
+                reviewed_by,
+                reply,
+            } => {
+                let result = crate::audit_review::mark_reviewed(
+                    &conn,
+                    workspace_id,
+                    &issue_key,
+                    reviewed_by.as_deref(),
+                );
+                send_or_warn(reply, result, "mark_audit_issue_reviewed");
+            }
+            WriteCmd::UnmarkAuditIssueReviewed {
+                workspace_id,
+                issue_key,
+                reply,
+            } => {
+                let result = crate::audit_review::unmark_reviewed(&conn, workspace_id, &issue_key);
+                send_or_warn(reply, result, "unmark_audit_issue_reviewed");
             }
             WriteCmd::ReviveUserToken { user_id, reply } => {
                 let result = users::revive_user_token(&conn, user_id);

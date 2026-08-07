@@ -541,6 +541,17 @@ pub struct CrossProjectEdge {
     pub to_path: String,
 }
 
+/// One resolved same-project page link — a wikilink whose source and
+/// target pages both live in the given project. See
+/// [`ReaderPool::intra_project_edges`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageLinkEdge {
+    /// Source page path.
+    pub from_path: String,
+    /// Target page path.
+    pub to_path: String,
+}
+
 /// An unresolved cross-project link — a declared dependency on another
 /// project's page that does not resolve. Surfaced by `memory_lint`.
 #[derive(Debug, Clone, Serialize)]
@@ -1576,7 +1587,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json \
+                        frontmatter_json, title \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -2847,6 +2858,22 @@ impl ReaderPool {
         .await
     }
 
+    /// Reviewed audit/drift issue keys for a workspace (the same stable
+    /// strings the frontend already computes client-side), for the caller
+    /// to check `reviewed_keys.contains(&issue.id)` per issue.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn reviewed_issue_keys(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StoreResult<std::collections::HashSet<String>> {
+        self.with_conn(move |conn| {
+            crate::audit_review::reviewed_keys_for_workspace(conn, workspace_id)
+        })
+        .await
+    }
+
     /// Look up a page's workspace and project names by page id.
     ///
     /// # Errors
@@ -3117,6 +3144,38 @@ impl ReaderPool {
                 for r in rows {
                     out.push(r?);
                 }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Resolved links between pages within a single project — the
+    /// intra-project sibling of [`Self::cross_project_edges`] (which is
+    /// cross-project only). Powers the "Local" page graph in the UI.
+    /// Titles/kinds aren't included: the UI already has every page's
+    /// summary loaded per project and joins on `path`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn intra_project_edges(&self, project: ProjectId) -> StoreResult<Vec<PageLinkEdge>> {
+        self.with_conn(move |conn| {
+            let sql = "SELECT fp.path, tp.path \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 WHERE fp.project_id = ?1 AND tp.project_id = ?1 \
+                 ORDER BY fp.path";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(params![project.as_bytes()], |row| {
+                Ok(PageLinkEdge {
+                    from_path: row.get(0)?,
+                    to_path: row.get(1)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
             }
             Ok(out)
         })
@@ -4662,6 +4721,10 @@ pub struct DecayCandidate {
     /// Frontmatter JSON; the sweep peeks at it for an explicit
     /// `pinned: true` (which overrides the schema flag).
     pub frontmatter_json: String,
+    /// The page's actual title (the `pages.title` column — always
+    /// populated, unlike the optional frontmatter `title` key most pages
+    /// never set since it's normally derived from the body's H1).
+    pub title: String,
 }
 
 fn row_to_decay_candidate(
@@ -4675,6 +4738,7 @@ fn row_to_decay_candidate(
     let access_count: i64 = row.get(5)?;
     let last_accessed_at_us: Option<i64> = row.get(6)?;
     let frontmatter_json: String = row.get(7)?;
+    let title: String = row.get(8)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -4684,6 +4748,7 @@ fn row_to_decay_candidate(
         access_count,
         last_accessed_at_us,
         frontmatter_json,
+        title,
     ))
 }
 
@@ -4697,6 +4762,7 @@ fn materialise_decay_candidate(
     access_count: i64,
     last_accessed_at_us: Option<i64>,
     frontmatter_json: String,
+    title: String,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
@@ -4709,6 +4775,7 @@ fn materialise_decay_candidate(
         access_count: u32::try_from(access_count.max(0)).unwrap_or(u32::MAX),
         last_accessed_at_us,
         frontmatter_json,
+        title,
     })
 }
 

@@ -1,5 +1,6 @@
 import { BookOpenText, Check, Clock3, Copy, FileX, Files, FolderOpen, Ghost, LucideIcon, ShieldAlert, Unlink } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getReviewedIssueIds, markIssueReviewed, unmarkIssueReviewed } from "../lib/api-contract";
 import type { DriftIssueType, MemoryDriftIssue } from "../types";
 
 interface DriftAuditProps {
@@ -21,8 +22,23 @@ const TYPE_ORDER: DriftIssueType[] = ["missing-page", "empty-project", "orphan",
 
 export function DriftAudit({ issues, onOpenProject, onOpenPage }: DriftAuditProps) {
   const [typeFilter, setTypeFilter] = useState<DriftIssueType | "all">("all");
+  // Persisted server-side (see decisions/read-only-frontend-api.md for the
+  // narrow write exception this required) — survives a reload or a
+  // different browser, unlike the local-only state this replaced.
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    getReviewedIssueIds()
+      .then((ids) => {
+        if (!cancelled) setReviewed(ids);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const counts = TYPE_ORDER.reduce<Record<string, number>>((acc, type) => {
     acc[type] = issues.filter((issue) => issue.type === type).length;
@@ -33,11 +49,23 @@ export function DriftAudit({ issues, onOpenProject, onOpenPage }: DriftAuditProp
   const openIssues = issues.filter((issue) => !reviewed.has(issue.id)).length;
 
   const toggleReviewed = (id: string) => {
+    const wasReviewed = reviewed.has(id);
+    // Optimistic update — flip immediately, roll back if the request fails
+    // so the UI never claims a state the server didn't actually persist.
     setReviewed((current) => {
       const next = new Set(current);
-      if (next.has(id)) next.delete(id);
+      if (wasReviewed) next.delete(id);
       else next.add(id);
       return next;
+    });
+    const request = wasReviewed ? unmarkIssueReviewed(id) : markIssueReviewed(id);
+    request.catch(() => {
+      setReviewed((current) => {
+        const next = new Set(current);
+        if (wasReviewed) next.add(id);
+        else next.delete(id);
+        return next;
+      });
     });
   };
 
