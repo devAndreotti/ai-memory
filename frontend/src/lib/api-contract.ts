@@ -5,6 +5,7 @@ import type {
   MemoryDriftIssue,
   MemoryHealth,
   PageHit,
+  PageGraphEdge,
   PageKind,
   PageSummary,
   ProjectGraphEdge,
@@ -82,6 +83,11 @@ interface ApiGraphEdge {
   to_path: string;
 }
 
+interface ApiPageLinkEdge {
+  from_path: string;
+  to_path: string;
+}
+
 interface ApiOverview {
   handoff?: Handoff | null;
   briefing: BriefingSnapshot;
@@ -137,7 +143,13 @@ export async function listPages(project: string): Promise<{ pages: PageSummary[]
   if (!project) return { pages: [] };
   try {
     const payload = await apiGet<ApiList<ApiPageSummary>>(`/workspaces/${encodeSegment(workspaceName)}/projects/${encodeSegment(project)}/pages`);
-    return { pages: unwrapList(payload, "pages").map(mapPageSummary) };
+    return {
+      // Generated operational history must not crowd a project's normal
+      // knowledge index. Exact-path reads still remain available.
+      pages: unwrapList(payload, "pages")
+        .map(mapPageSummary)
+        .filter((page) => !page.path.startsWith("_lint/")),
+    };
   } catch (error) {
     if (isNotFound(error)) return { pages: [] };
     throw error;
@@ -280,6 +292,22 @@ export async function getProjectGraph(): Promise<{ edges: ProjectGraphEdge[] }> 
   return { edges: aggregateGraphEdges(payload.edges ?? []) };
 }
 
+// Intra-project sibling of getProjectGraph — resolved links between pages
+// within a single project. No demo fixture: the "Local" view just shows
+// an empty graph in demo mode until one is needed.
+export async function getProjectPageGraph(project: string): Promise<{ edges: PageGraphEdge[] }> {
+  if (demoMode || !project) return { edges: [] };
+  try {
+    const payload = await apiGet<{ edges: ApiPageLinkEdge[] }>(
+      `/workspaces/${encodeSegment(workspaceName)}/projects/${encodeSegment(project)}/graph`,
+    );
+    return { edges: aggregatePageGraphEdges(payload.edges ?? []) };
+  } catch (error) {
+    if (isNotFound(error)) return { edges: [] };
+    throw error;
+  }
+}
+
 async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBase()}${path}`, {
     credentials: "same-origin",
@@ -290,6 +318,42 @@ async function apiGet<T>(path: string): Promise<T> {
     throw new ApiError(response.status, body.error ?? response.statusText);
   }
   return (await response.json()) as T;
+}
+
+// Narrow, documented exception to this client's otherwise read-only API
+// surface: the audit "mark reviewed" endpoints (see
+// decisions/read-only-frontend-api.md on the server side for the record
+// of that exception).
+async function apiPost(path: string, body: unknown): Promise<void> {
+  const response = await fetch(`${apiBase()}${path}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const responseBody = await response.json().catch(() => ({ error: response.statusText }));
+    throw new ApiError(response.status, responseBody.error ?? response.statusText);
+  }
+}
+
+/** Reviewed audit/drift issue ids, persisted server-side (survives a reload). */
+export async function getReviewedIssueIds(): Promise<Set<string>> {
+  if (demoMode) return new Set();
+  const payload = await apiGet<{ issue_ids: string[] }>(
+    `/workspaces/${encodeSegment(workspaceName)}/audit/reviewed`,
+  );
+  return new Set(payload.issue_ids ?? []);
+}
+
+export async function markIssueReviewed(issueId: string): Promise<void> {
+  if (demoMode) return;
+  await apiPost(`/workspaces/${encodeSegment(workspaceName)}/audit/review`, { issue_id: issueId });
+}
+
+export async function unmarkIssueReviewed(issueId: string): Promise<void> {
+  if (demoMode) return;
+  await apiPost(`/workspaces/${encodeSegment(workspaceName)}/audit/unreview`, { issue_id: issueId });
 }
 
 function apiBase() {
@@ -413,6 +477,18 @@ function aggregateGraphEdges(edges: ApiGraphEdge[]): ProjectGraphEdge[] {
       } satisfies ProjectGraphEdge);
     current.count += 1;
     current.paths.push(`${edge.from_path} -> ${edge.to_path}`);
+    grouped.set(key, current);
+  }
+  return Array.from(grouped.values());
+}
+
+function aggregatePageGraphEdges(edges: ApiPageLinkEdge[]): PageGraphEdge[] {
+  const grouped = new Map<string, PageGraphEdge>();
+  for (const edge of edges) {
+    if (!edge.from_path || !edge.to_path || edge.from_path === edge.to_path) continue;
+    const key = `${edge.from_path}->${edge.to_path}`;
+    const current = grouped.get(key) ?? { count: 0, from: edge.from_path, to: edge.to_path };
+    current.count += 1;
     grouped.set(key, current);
   }
   return Array.from(grouped.values());

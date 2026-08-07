@@ -2281,6 +2281,53 @@ mark {
 }
 
 /* Phase 3 — graph controls + edge detail */
+.graph-explorer {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.graph-construction {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  max-width: 680px;
+  padding: 30px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel) 86%, var(--amber));
+}
+
+.graph-construction > svg {
+  flex: 0 0 auto;
+  color: var(--amber);
+}
+
+.graph-construction h2 {
+  margin: 3px 0 8px;
+}
+
+.graph-construction p {
+  max-width: 540px;
+  margin: 0;
+  color: var(--muted);
+}
+
+.graph-v2-project-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.graph-v2-project-picker select {
+  max-width: min(320px, 70vw);
+}
+
 .graph-v2-controls {
   display: flex;
   flex-wrap: wrap;

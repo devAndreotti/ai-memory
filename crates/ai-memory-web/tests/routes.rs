@@ -81,7 +81,7 @@ async fn smoke_index_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -121,7 +121,7 @@ async fn smoke_project_page_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/w/default/scratch")
         .body(Body::empty())
@@ -157,7 +157,7 @@ async fn smoke_page_view_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/w/default/scratch/p/foo.md")
         .body(Body::empty())
@@ -199,7 +199,7 @@ async fn web_page_view_omits_author_chrome_for_anonymous_pages() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let resp = app
         .oneshot(
             Request::builder()
@@ -258,7 +258,7 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
     };
     wiki.write_page(req).await.unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let resp = app
         .oneshot(
             Request::builder()
@@ -314,7 +314,7 @@ async fn smoke_search_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=unique_term_xyz_abc")
         .body(Body::empty())
@@ -357,7 +357,7 @@ async fn web_links_percent_encode_route_segments() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/w/default/scratch%20%231")
         .body(Body::empty())
@@ -386,7 +386,7 @@ async fn smoke_page_not_found_returns_404() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/w/default/scratch/p/does-not-exist.md")
         .body(Body::empty())
@@ -414,7 +414,7 @@ async fn api_projects_returns_project_stats() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/projects")
         .body(Body::empty())
@@ -477,7 +477,7 @@ async fn api_workspaces_returns_workspace_stats() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces")
         .body(Body::empty())
@@ -538,7 +538,7 @@ async fn api_projects_can_filter_by_workspace() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/projects?workspace=practice")
         .body(Body::empty())
@@ -575,7 +575,7 @@ async fn api_pages_returns_latest_pages_only() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/scratch/pages")
         .body(Body::empty())
@@ -644,7 +644,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/scratch/pages")
         .body(Body::empty())
@@ -694,7 +694,7 @@ async fn api_page_returns_markdown_and_metadata() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/scratch/pages/foo.md")
         .body(Body::empty())
@@ -760,7 +760,7 @@ async fn api_search_can_scope_to_project() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=shared_unique_term&workspace=default&project=scratch&limit=1")
         .body(Body::empty())
@@ -839,7 +839,7 @@ async fn api_search_can_read_from_multiple_scopes() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=shared_scope_token&scope=client-a/product&scope=practice/unit-testing")
         .body(Body::empty())
@@ -904,7 +904,7 @@ async fn api_search_post_accepts_multi_scope_body() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let body = serde_json::json!({
         "q": "post_scope_token",
         "limit": 10,
@@ -933,7 +933,7 @@ async fn api_search_post_accepts_multi_scope_body() {
 async fn api_routes_do_not_accept_writes() {
     let (_tmp, store, wiki) = setup().await;
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .method(Method::POST)
         .uri("/projects")
@@ -943,11 +943,119 @@ async fn api_routes_do_not_accept_writes() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
+/// Narrow, documented exception to the read-only design: marking an audit
+/// issue reviewed persists server-side and survives being re-fetched via a
+/// fresh router instance (simulating a page reload) — the whole point of
+/// moving this off the frontend's local `useState`.
+#[tokio::test]
+async fn api_audit_review_persists_and_unreview_clears_it() {
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+
+    let issue_key = "stale:proj:notes/a.md";
+
+    // Nothing reviewed yet.
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/audit/reviewed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["issue_ids"].as_array().unwrap().is_empty());
+
+    // Mark reviewed via POST.
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/workspaces/default/audit/review")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "issue_id": issue_key }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // A brand-new router instance (simulating a reload / different
+    // browser) sees the reviewed state — it isn't local React state.
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/audit/reviewed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let ids: Vec<&str> = json["issue_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![issue_key]);
+
+    // Unreview clears it again.
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/workspaces/default/audit/unreview")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "issue_id": issue_key }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/audit/reviewed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["issue_ids"].as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn api_search_rejects_partial_scope() {
     let (_tmp, store, wiki) = setup().await;
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=anything&workspace=default")
         .body(Body::empty())
@@ -969,7 +1077,7 @@ async fn api_search_rejects_partial_scope() {
 async fn api_search_rejects_malformed_scope_param() {
     let (_tmp, store, wiki) = setup().await;
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=anything&scope=missing-project")
         .body(Body::empty())
@@ -988,7 +1096,7 @@ async fn api_search_rejects_malformed_scope_param() {
 async fn api_search_rejects_ambiguous_scope_inputs() {
     let (_tmp, store, wiki) = setup().await;
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=anything&workspace=default&project=scratch&scope=default/scratch")
         .body(Body::empty())
@@ -1015,7 +1123,7 @@ async fn api_project_routes_return_404_for_missing_project() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/missing/pages")
         .body(Body::empty())
@@ -1043,7 +1151,7 @@ async fn api_recent_and_briefing_return_project_data() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let recent_req = Request::builder()
         .uri("/workspaces/default/projects/scratch/recent?limit=1")
         .body(Body::empty())
@@ -1090,7 +1198,7 @@ async fn api_workspace_overview_returns_aggregated_overview() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/overview?limit=10")
         .body(Body::empty())
@@ -1177,7 +1285,7 @@ async fn api_workspace_overview_aggregates_briefing_and_health() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/overview?limit=10")
         .body(Body::empty())
@@ -1237,7 +1345,7 @@ async fn api_workspace_overview_includes_open_handoff() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/overview")
         .body(Body::empty())
@@ -1307,7 +1415,7 @@ async fn api_project_overview_aggregates_handoff_briefing_health() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/scratch/overview")
         .body(Body::empty())
@@ -1368,7 +1476,7 @@ async fn api_workspace_overview_health_detail_lists_pages() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/overview")
         .body(Body::empty())
@@ -1440,7 +1548,7 @@ async fn api_page_returns_resolved_links_and_backlinks() {
     .await
     .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
 
     // Source page exposes the outgoing link, no back-links.
     let src_req = Request::builder()
@@ -1502,7 +1610,7 @@ async fn api_page_returns_404_for_missing_page() {
         .unwrap();
 
     // workspace/project existem, mas a página não → 404 (não 500)
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces/default/projects/scratch/pages/does/not/exist.md")
         .body(Body::empty())
@@ -1522,7 +1630,7 @@ async fn api_search_empty_query_returns_empty_array() {
     let (_tmp, store, wiki) = setup().await;
 
     // q só com espaços (%20) → termo vazio após trim → 200 com [] (sem tocar o FTS)
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=%20%20")
         .body(Body::empty())
@@ -1544,7 +1652,7 @@ async fn api_search_empty_query_returns_empty_array() {
 async fn api_search_rejects_non_integer_limit() {
     let (_tmp, store, wiki) = setup().await;
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=anything&limit=abc")
         .body(Body::empty())
@@ -1564,7 +1672,7 @@ async fn api_search_rejects_invalid_percent_encoding() {
     let (_tmp, store, wiki) = setup().await;
 
     // %zz não é hex válido → o decoder manual da querystring rejeita com 400
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=%zz")
         .body(Body::empty())
@@ -1595,7 +1703,7 @@ async fn api_responses_set_cache_control_private() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/workspaces")
         .body(Body::empty())
@@ -1648,7 +1756,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     .await
     .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
 
     // First request: must return 200 with ETag and Cache-Control.
     let resp = app
@@ -1744,7 +1852,7 @@ async fn api_page_handler_etag_differs_per_page() {
     .await
     .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
 
     let etag_a = app
         .clone()
@@ -1799,7 +1907,7 @@ async fn api_error_responses_do_not_set_cache_control() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     // Request a page that does not exist — handler returns 404.
     let resp = app
         .oneshot(
@@ -1841,7 +1949,7 @@ async fn api_v1_page_omits_author_for_anonymous_writes() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let resp = app
         .oneshot(
             Request::builder()
@@ -1902,7 +2010,7 @@ async fn api_v1_page_surfaces_author_for_db_user_writes() {
     };
     wiki.write_page(req).await.unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let resp = app
         .oneshot(
             Request::builder()
@@ -1961,7 +2069,7 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
     wiki.write_page(wiki_req(ws, proj, "notes/etag.md", "shared body"))
         .await
         .unwrap();
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let resp = app
         .clone()
         .oneshot(
@@ -2044,7 +2152,7 @@ async fn api_search_snippet_escapes_body_html() {
         .await
         .unwrap();
 
-    let app = api_router(store.reader.clone(), wiki.clone());
+    let app = api_router(store.reader.clone(), wiki.clone(), store.writer.clone());
     let req = Request::builder()
         .uri("/search?q=xssuniqueterm")
         .body(Body::empty())

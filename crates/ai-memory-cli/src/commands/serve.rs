@@ -396,6 +396,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
+                store.writer.clone(),
                 WebMountSpec {
                     web_ui_dir: args.web_ui_dir.as_deref(),
                     cors_origins: &cors_origins,
@@ -1715,6 +1716,7 @@ fn mount_web_router(
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
+    writer: ai_memory_store::WriterHandle,
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
     if !enable_web {
@@ -1725,7 +1727,7 @@ fn mount_web_router(
     // call; nesting after the layer would silently bypass auth for /web/*.
     let router = router.nest(
         "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
+        build_api_router(&reader, &wiki, &writer, spec.cors_origins),
     );
 
     // Where the UI is mounted WITHIN the (already-applied) base path.
@@ -1744,6 +1746,7 @@ fn mount_web_router(
         router,
         reader,
         wiki,
+        writer,
         &slug,
         spec.base_href,
         mount,
@@ -1754,8 +1757,13 @@ fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = ai_memory_web::api_router(reader.clone(), wiki.clone());
+fn build_api_router(
+    reader: &ReaderPool,
+    wiki: &Wiki,
+    writer: &ai_memory_store::WriterHandle,
+    cors_origins: &[String],
+) -> axum::Router {
+    let api = ai_memory_web::api_router(reader.clone(), wiki.clone(), writer.clone());
     if cors_origins.is_empty() {
         return api;
     }
@@ -1825,6 +1833,7 @@ fn mount_builtin_browser(
     router: axum::Router,
     reader: ReaderPool,
     wiki: Wiki,
+    writer: ai_memory_store::WriterHandle,
     slug: &str,
     base_href: &str,
     mount: &str,
@@ -1833,7 +1842,7 @@ fn mount_builtin_browser(
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = ai_memory_web::router(reader, wiki).layer(
+    let web_router = ai_memory_web::router(reader, wiki, writer).layer(
         axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
     );
     info!(mount, base_href, "read-only wiki browser mounted");
@@ -2302,6 +2311,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: None,
                 cors_origins: &[],
@@ -2347,6 +2357,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: None,
                 cors_origins: &[],
@@ -2633,6 +2644,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
@@ -2712,6 +2724,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
@@ -2770,6 +2783,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
@@ -3073,6 +3087,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
@@ -3128,6 +3143,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
@@ -3172,6 +3188,7 @@ mod tests {
             true,
             store.reader.clone(),
             wiki,
+            store.writer.clone(),
             WebMountSpec {
                 web_ui_dir: None,
                 cors_origins: &cors_origins,

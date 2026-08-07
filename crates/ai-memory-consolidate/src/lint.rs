@@ -107,6 +107,18 @@ pub async fn run_lint(
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let mut findings = rule_based_findings(&candidates);
 
+    // Auto-link suggestions: candidates + bodies, so a page mentioning
+    // another page's exact path/title in plain prose gets a `[[...]]`
+    // suggestion. Read failures (rare — a page deleted mid-sweep) just drop
+    // that page from the check rather than failing the whole lint pass.
+    let mut pages_for_links = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        if let Ok(md) = wiki.read_page(workspace_id, project_id, &c.path) {
+            pages_for_links.push((c.path.clone(), c.title.clone(), md.body));
+        }
+    }
+    findings.extend(link_suggestion_findings(&pages_for_links));
+
     // Dangling cross-project links: a `[[project:path]]` dependency that does
     // not resolve. A broken inter-project edge is high-signal — surface it
     // even on the zero-LLM path.
@@ -213,15 +225,14 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                 detail: None,
             });
         }
-        // Duplicate-title tracking: peek the frontmatter for a `title` field.
-        if let Some(fm) = frontmatter.as_ref()
-            && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
-        {
-            titles
-                .entry(t.to_lowercase())
-                .or_default()
-                .push(c.path.as_str().to_string());
-        }
+        // Duplicate-title tracking: group by the page's real title (`pages.title`,
+        // always populated), not the optional frontmatter `title` key most
+        // pages never set (it's normally derived from the body's H1) — that
+        // used to make this check miss almost every real duplicate.
+        titles
+            .entry(c.title.to_lowercase())
+            .or_default()
+            .push(c.path.as_str().to_string());
     }
 
     for (title, paths) in titles {
@@ -236,6 +247,68 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
         }
     }
 
+    out
+}
+
+/// Cap on suggestions emitted for a single page — an index/overview page
+/// can legitimately mention many others; past this it's noise, not signal.
+const MAX_LINK_SUGGESTIONS_PER_PAGE: usize = 5;
+
+// ponytail: O(n^2) over the project's pages (body vs. every other page's
+// path/title). Fine at hundreds of pages run once/day; if a project grows
+// into the tens of thousands, index paths/titles instead of scanning.
+//
+// Suggest-only by design (decision: never auto-insert `[[...]]` into a
+// page's body) — this only proposes; nothing here mutates a page.
+fn link_suggestion_findings(pages: &[(PagePath, String, String)]) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for (path, title, body) in pages {
+        // `_lint/*.md` reports are auto-generated daily snapshots, not
+        // living content someone maintains — and every report's rendered
+        // findings naturally repeat other pages' titles (e.g. a
+        // rule_suggestion finding's message), which would otherwise flood
+        // this check with noise instead of real cross-references.
+        if path.as_str().starts_with("_lint/") {
+            continue;
+        }
+        let mut suggested = 0usize;
+        for (other_path, other_title, _) in pages {
+            if suggested >= MAX_LINK_SUGGESTIONS_PER_PAGE {
+                break;
+            }
+            if other_path == path {
+                continue;
+            }
+            // Exact path or exact title match only (no fuzzy matching —
+            // too easy to link the wrong project's `notes/setup.md`).
+            // Skip mentions already inside `[[...]]`: cheap heuristic, not
+            // a full markdown parse, so an already-linked mention can very
+            // rarely resuggest — harmless since this is advisory only.
+            // Skip title matches where other_title == this page's own title:
+            // a page's body starts with its own `# {title}` H1, so a
+            // same-titled page (the `duplicate` finding's territory, not
+            // this one's) would otherwise "mention" itself via that H1.
+            let already_linked = body.contains(&format!("[[{other_path}"));
+            let path_mentioned = !already_linked && body.contains(other_path.as_str());
+            let title_mentioned = !already_linked
+                && !other_title.is_empty()
+                && other_title != title
+                && body.contains(other_title.as_str());
+            if path_mentioned || title_mentioned {
+                out.push(LintFinding {
+                    kind: "link_suggestion".into(),
+                    severity: "info".into(),
+                    message: format!(
+                        "Page {path} mentions {other_path} (\"{other_title}\") in plain text \
+                         without an internal link. Consider adding [[{other_path}]]."
+                    ),
+                    pages: vec![path.as_str().to_string()],
+                    detail: None,
+                });
+                suggested += 1;
+            }
+        }
+    }
     out
 }
 
@@ -365,6 +438,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         }];
         let findings = rule_based_findings(&candidates);
         assert_eq!(findings.len(), 1);
@@ -382,6 +456,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki"}"#.into(),
+            title: "Karpathy Wiki".into(),
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -407,6 +482,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Never ship code without a test", "kind": "rule"}"#
                 .into(),
+            title: "Never ship code without a test".into(),
         };
         let findings = rule_based_findings(&[candidate]);
         let rules: Vec<_> = findings
@@ -431,11 +507,114 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
             findings.iter().any(|f| f.kind == "rule_suggestion"),
             "expected a rule_suggestion finding for _rules/ page",
+        );
+    }
+
+    // ── link_suggestion_findings ──────────────────────────────────────────
+
+    fn link_page(path: &str, title: &str, body: &str) -> (PagePath, String, String) {
+        (
+            ai_memory_core::PagePath::new(path).unwrap(),
+            title.to_string(),
+            body.to_string(),
+        )
+    }
+
+    /// A page mentioning another page's exact path in plain prose (no
+    /// `[[...]]`) gets a suggestion — the whole point of the feature.
+    #[test]
+    fn link_suggestion_flags_plain_path_mention() {
+        let pages = vec![
+            link_page("notes/a.md", "A", "See gotchas/foo.md for details."),
+            link_page("gotchas/foo.md", "Foo Gotcha", "Some gotcha content."),
+        ];
+        let findings = link_suggestion_findings(&pages);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == "link_suggestion" && f.pages == vec!["notes/a.md"]),
+            "expected a link_suggestion for the plain-text path mention: {findings:?}"
+        );
+    }
+
+    /// A mention already wrapped in `[[...]]` is a real link already — no
+    /// suggestion needed.
+    #[test]
+    fn link_suggestion_skips_already_linked_mentions() {
+        let pages = vec![
+            link_page("notes/a.md", "A", "See [[gotchas/foo.md]] for details."),
+            link_page("gotchas/foo.md", "Foo Gotcha", "Some gotcha content."),
+        ];
+        let findings = link_suggestion_findings(&pages);
+        assert!(
+            findings.iter().all(|f| f.kind != "link_suggestion"),
+            "must not suggest a mention that's already an internal link: {findings:?}"
+        );
+    }
+
+    /// No fuzzy matching: mentioning unrelated text (not another page's
+    /// exact path or title) never produces a suggestion.
+    #[test]
+    fn link_suggestion_requires_exact_match_no_fuzzy() {
+        let pages = vec![
+            link_page(
+                "notes/a.md",
+                "A",
+                "This talks about foo in general, not a specific page.",
+            ),
+            link_page("gotchas/foo.md", "Foo Gotcha", "Some gotcha content."),
+        ];
+        let findings = link_suggestion_findings(&pages);
+        assert!(
+            findings.iter().all(|f| f.kind != "link_suggestion"),
+            "must not fuzzy-match on partial/unrelated text: {findings:?}"
+        );
+    }
+
+    /// Suggest-only: the function returns findings, it never mutates a
+    /// page's body — asserting that shape is the whole safety property.
+    #[test]
+    fn link_suggestion_never_mutates_bodies() {
+        let pages = vec![
+            link_page("notes/a.md", "A", "See gotchas/foo.md for details."),
+            link_page("gotchas/foo.md", "Foo Gotcha", "Some gotcha content."),
+        ];
+        let original_bodies: Vec<String> = pages.iter().map(|(_, _, b)| b.clone()).collect();
+        let _ = link_suggestion_findings(&pages);
+        let after: Vec<String> = pages.iter().map(|(_, _, b)| b.clone()).collect();
+        assert_eq!(
+            original_bodies, after,
+            "link_suggestion_findings must not mutate bodies"
+        );
+    }
+
+    /// Regression: a daily `_lint/*.md` report naturally repeats other
+    /// pages' titles in its rendered findings — that must not flood the
+    /// report with self-referential noise.
+    #[test]
+    fn link_suggestion_skips_lint_report_pages_as_source() {
+        let pages = vec![
+            link_page(
+                "_lint/2026-08-07.md",
+                "Lint report 2026-08-07",
+                "## 1 — rule_suggestion (info)\n\nPage _rules/no-secrets-in-memory.md looks like a rule.",
+            ),
+            link_page(
+                "_rules/no-secrets-in-memory.md",
+                "Rule: No Secrets In Memory",
+                "Never save tokens.",
+            ),
+        ];
+        let findings = link_suggestion_findings(&pages);
+        assert!(
+            findings.iter().all(|f| f.kind != "link_suggestion"),
+            "a _lint/ report page must never be the source of a link_suggestion: {findings:?}"
         );
     }
 
@@ -453,6 +632,7 @@ mod tests {
             access_count: 5,
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
+            title: "Karpathy Wiki".into(),
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
@@ -507,6 +687,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.

@@ -150,6 +150,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         };
         assert!(!is_decayable(&c));
     }
@@ -165,6 +166,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         };
         assert!(!is_decayable(&c));
     }
@@ -180,6 +182,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: r#"{"pinned": true}"#.into(),
+            title: "Untitled".into(),
         };
         assert!(!is_decayable(&c));
     }
@@ -195,6 +198,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            title: "Untitled".into(),
         };
         assert!(is_decayable(&c));
     }

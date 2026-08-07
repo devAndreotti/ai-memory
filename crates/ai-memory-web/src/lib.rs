@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_store::ReaderPool;
+use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::Wiki;
 use axum::Router;
 
@@ -34,21 +34,28 @@ mod templates;
 
 pub use state::WebState;
 
+// Narrow, documented exception to the read-only design noted above:
+// `api_router`'s audit "mark reviewed" endpoints persist a small opt-in
+// review flag and touch nothing else (decisions/read-only-frontend-api.md
+// records this). `writer` is threaded into `router()` too only so
+// `WebState` stays one shared type — the HTML browser routes never use it.
+
 /// Build the read-only web router. Call once at server startup and
 /// `nest("/web", router)` it onto the existing axum app, OR mount at
 /// `/` if the web UI is the only HTTP surface.
-pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
-    let state = Arc::new(WebState::new(reader, wiki));
+pub fn router(reader: ReaderPool, wiki: Wiki, writer: WriterHandle) -> Router {
+    let state = Arc::new(WebState::new(reader, wiki, writer));
     routes::build(state)
 }
 
-/// Build the read-only JSON API router for third-party web UIs.
+/// Build the JSON API router for third-party web UIs (read-only except
+/// the audit "mark reviewed" endpoints — see module docs).
 ///
 /// The host should `nest("/api/v1", api_router(...))` alongside `/web`
 /// so custom frontends can browse memory without reading SQLite or wiki
 /// files directly.
-pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
-    let state = Arc::new(WebState::new(reader, wiki));
+pub fn api_router(reader: ReaderPool, wiki: Wiki, writer: WriterHandle) -> Router {
+    let state = Arc::new(WebState::new(reader, wiki, writer));
     routes::build_api(state)
 }
 

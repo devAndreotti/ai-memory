@@ -383,6 +383,13 @@ struct QueryArgs {
     /// workspace + project so you can tell where it came from.
     #[serde(default)]
     global: Option<bool>,
+    /// Restrict hits to pages of this semantic kind (`rule`, `decision`,
+    /// `fact`, or `gotcha` — the same classification shown in the web
+    /// cockpit's Kind filter). Omit to search all kinds. Applies to the
+    /// default single-project and explicit-`scopes` paths; not yet
+    /// applied when `global=true`.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1120,6 +1127,16 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        // When a kind filter is set, over-fetch before filtering so the
+        // caller still gets up to `limit` matching hits instead of an
+        // under-filled page (the underlying FTS rank doesn't know about
+        // kind, so naively limiting first then filtering would starve
+        // results on a project with mixed-kind pages).
+        let effective_limit = if args.kind.is_some() {
+            limit.saturating_mul(4).min(100)
+        } else {
+            limit
+        };
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
         // behave as `global=true`. Precedence is strict: an explicit
@@ -1192,7 +1209,7 @@ impl AiMemoryServer {
             let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
             for &(ws, proj) in scopes {
                 let hits = self
-                    .search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                    .search_project(ws, proj, &args.query, query_vec.as_deref(), effective_limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 for hit in hits {
@@ -1212,7 +1229,7 @@ impl AiMemoryServer {
                     .partial_cmp(&b.rank)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            hits.truncate(limit);
+            hits.truncate(effective_limit);
             Ok(hits)
         } else {
             let (ws, proj) = self
@@ -1222,10 +1239,26 @@ impl AiMemoryServer {
                     &aps_actor,
                 )
                 .await?;
-            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+            self.search_project(ws, proj, &args.query, query_vec.as_deref(), effective_limit)
                 .await
         };
-        let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let mut hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(wanted_kind) = args.kind.as_deref() {
+            let mut kept = Vec::with_capacity(hits.len());
+            for hit in hits {
+                let matches = self
+                    .reader
+                    .page_meta_by_id(hit.id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .is_some_and(|meta| meta.kind == wanted_kind);
+                if matches {
+                    kept.push(hit);
+                }
+            }
+            kept.truncate(limit);
+            hits = kept;
+        }
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
@@ -3691,6 +3724,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -3701,6 +3735,92 @@ mod tests {
             None => panic!("expected text content"),
         };
         assert!(text.contains("foo.md"), "expected hit; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_kind_filter_restricts_to_matching_kind() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        // setup_server() already wrote foo.md (plain path -> kind "fact")
+        // containing "karpathy". Add a gotcha-kind page sharing the same
+        // search term so an unfiltered query would match both.
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("gotchas/karpathy-quirk.md").unwrap(),
+                title: "Gotcha: Karpathy quirk".into(),
+                body: "Karpathy says compile, not retrieve. Watch out for this.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Unfiltered: both the fact and the gotcha page match.
+        let unfiltered = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    kind: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let unfiltered_text = unfiltered
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_else(|| panic!("expected text content"));
+        assert!(
+            unfiltered_text.contains("foo.md"),
+            "unfiltered should include the fact page:\n{unfiltered_text}"
+        );
+        assert!(
+            unfiltered_text.contains("gotchas/karpathy-quirk.md"),
+            "unfiltered should include the gotcha page:\n{unfiltered_text}"
+        );
+
+        // Filtered to kind=gotcha: only the gotcha page should survive.
+        let filtered = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    kind: Some("gotcha".into()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let filtered_text = filtered
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_else(|| panic!("expected text content"));
+        assert!(
+            filtered_text.contains("gotchas/karpathy-quirk.md"),
+            "kind=gotcha filter should keep the gotcha page:\n{filtered_text}"
+        );
+        assert!(
+            !filtered_text.contains("foo.md"),
+            "kind=gotcha filter must exclude the fact page:\n{filtered_text}"
+        );
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -3735,6 +3855,7 @@ mod tests {
             scopes: Vec::new(),
             workspace: workspace.map(str::to_string),
             global: None,
+            kind: None,
         };
 
         let result = server
@@ -3785,6 +3906,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -3905,6 +4027,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -3977,6 +4100,7 @@ mod tests {
                     }],
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 test_optional_parts(),
             )
@@ -4069,6 +4193,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        kind: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4132,6 +4257,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        kind: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4171,6 +4297,7 @@ mod tests {
                     }],
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 test_optional_parts(),
             )
@@ -4240,6 +4367,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        kind: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4300,6 +4428,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: Some("practice".into()),
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4613,6 +4742,7 @@ mod tests {
                     ],
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4682,6 +4812,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: Some(true),
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4761,6 +4892,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4790,6 +4922,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: Some("ops".into()),
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4823,6 +4956,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: Some(true),
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6273,6 +6407,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6304,6 +6439,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    kind: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

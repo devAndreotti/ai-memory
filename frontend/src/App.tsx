@@ -21,8 +21,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { CommandPalette, type PaletteTarget } from "./components/CommandPalette";
-import { DriftAudit } from "./components/DriftAudit";
-import { ProjectGraph } from "./components/ProjectGraph";
+import { GraphExplorer, UnderConstruction } from "./components/GraphExplorer";
 import { headingId, ReaderEnhancements } from "./components/ReaderEnhancements";
 import { ReaderAgentView, ReaderModeSwitch, type ReaderMode } from "./components/ReaderModeSwitch";
 import { SearchExplorer } from "./components/SearchExplorer";
@@ -111,7 +110,14 @@ export default function App() {
       );
       if (!alive) return;
       const nextPagesByProject = Object.fromEntries(pageEntries);
-      setProjects(projectResp.projects);
+      // Match project totals to the visible page list: generated `_lint/`
+      // history is operational output, not durable project knowledge.
+      setProjects(
+        projectResp.projects.map((project) => ({
+          ...project,
+          page_count: nextPagesByProject[project.project_name]?.length ?? 0,
+        })),
+      );
       setBriefing(briefingResp);
       setHandoff(handoffResp);
       setMemoryHealth(healthResp);
@@ -298,13 +304,14 @@ export default function App() {
           />
         )}
 
-        {!loading && view === "graph" && <ProjectGraph projects={projects} edges={graphEdges} onOpenProject={openProject} />}
+        {!loading && view === "graph" && (
+          <GraphExplorer />
+        )}
 
         {!loading && view === "audit" && (
-          <DriftAudit
-            issues={driftIssues}
-            onOpenProject={openProject}
-            onOpenPage={(project, path) => openPage(project, path)}
+          <UnderConstruction
+            title="Audit em construção"
+            description="Estamos preparando visão de saúde e revisão da memória. Esta área ficará disponível em breve."
           />
         )}
         </div>

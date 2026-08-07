@@ -153,3 +153,9 @@ export interface ProjectGraphEdge {
   paths: string[];
   kinds: PageKind[];
 }
+
+export interface PageGraphEdge {
+  from: string;
+  to: string;
+  count: number;
+}

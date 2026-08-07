@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+mod audit_review;
 mod auto_improve;
 pub mod decay;
 mod error;

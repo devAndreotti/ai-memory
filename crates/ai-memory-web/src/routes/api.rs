@@ -59,8 +59,24 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             axum::routing::get(overview_handler),
         )
         .route(
+            "/workspaces/{workspace}/audit/reviewed",
+            axum::routing::get(audit_reviewed_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/audit/review",
+            axum::routing::post(audit_review_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/audit/unreview",
+            axum::routing::post(audit_unreview_handler),
+        )
+        .route(
             "/workspaces/{workspace}/projects/{project}/overview",
             axum::routing::get(project_overview_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/graph",
+            axum::routing::get(project_page_graph_handler),
         )
         .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
@@ -99,6 +115,25 @@ async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, R
     let edges = state
         .reader
         .cross_project_edges(None)
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(serde_json::json!({ "edges": edges })).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// Intra-project page graph: every resolved link whose endpoints are both
+/// in the given project. The sibling of `graph_handler`, which is
+/// cross-project only. Powers the "Local" mode of the UI's graph view.
+async fn project_page_graph_handler(
+    State(state): State<Arc<WebState>>,
+    Path((workspace, project)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let (_workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let edges = state
+        .reader
+        .intra_project_edges(project_id)
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -561,6 +596,76 @@ async fn overview_handler(
         .into_response(),
         LIST_CACHE_MAX_AGE,
     ))
+}
+
+/// Reviewed audit/drift issue keys for a workspace — the frontend already
+/// computes the same stable `id` per issue client-side (e.g.
+/// `"stale:proj:notes/a.md"`); this just tells it which ones a human
+/// already marked reviewed, so that state survives a reload.
+async fn audit_reviewed_handler(
+    State(state): State<Arc<WebState>>,
+    Path(workspace): Path<String>,
+) -> Result<Response, Response> {
+    let workspace_id = state
+        .reader
+        .find_workspace(workspace.clone())
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
+    let keys = state
+        .reader
+        .reviewed_issue_keys(workspace_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::json!({ "issue_ids": keys })).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditReviewBody {
+    issue_id: String,
+}
+
+/// Mark one audit/drift issue reviewed. Narrow, documented exception to
+/// this API's read-only design — see the crate-level docs and
+/// `decisions/read-only-frontend-api.md`. Idempotent.
+async fn audit_review_handler(
+    State(state): State<Arc<WebState>>,
+    Path(workspace): Path<String>,
+    Json(body): Json<AuditReviewBody>,
+) -> Result<Response, Response> {
+    let workspace_id = state
+        .reader
+        .find_workspace(workspace.clone())
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
+    state
+        .writer
+        .mark_audit_issue_reviewed(workspace_id, body.issue_id, None)
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Clear a previously-reviewed mark. Idempotent — unmarking an issue that
+/// was never reviewed is a no-op, not an error.
+async fn audit_unreview_handler(
+    State(state): State<Arc<WebState>>,
+    Path(workspace): Path<String>,
+    Json(body): Json<AuditReviewBody>,
+) -> Result<Response, Response> {
+    let workspace_id = state
+        .reader
+        .find_workspace(workspace.clone())
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
+    state
+        .writer
+        .unmark_audit_issue_reviewed(workspace_id, body.issue_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn project_overview_handler(
