@@ -19,34 +19,79 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{AgentChoice, InstallHooksArgs, McpClient};
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
+use crate::cli::{AgentChoice, InstallHooksArgs, McpClient, ProjectStrategyArg};
+use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
-    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
-    build_claude_code_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_profile_payload_for_agent, hook_script_for_claude_code, hook_script_for_current_platform,
-    ts_string_literal,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
+    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
+    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value, build_profile_payload_for_agent,
+    hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
+    local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
-/// `~/.claude/settings.json` — Claude Code hooks live under `hooks`.
+const CLAUDE_PROMPT_EVENT: &str = "UserPromptSubmit";
+
+/// Claude Code's settings file — hooks live under `hooks`.
+/// `$CLAUDE_CONFIG_DIR/settings.json` when the var is set, else
+/// `~/.claude/settings.json`.
 pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    claude_settings_path_in(std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env (mirrors
+/// `install_mcp::kimi_code_home`).
+fn claude_settings_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::claude_config_dir(env_override) {
+        return Ok(dir.join("settings.json"));
+    }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.claude/settings.json")?
         .join(".claude")
         .join("settings.json"))
 }
 
+/// Codex's hooks file — `$CODEX_HOME/hooks.json` when the var is set, else
 /// `~/.codex/hooks.json`.
+///
+/// `CODEX_HOME` relocates Codex's whole config home, so hooks written to the
+/// default path are simply never loaded by a Codex configured that way: capture
+/// silently does nothing, with a successful-looking install. ai-memory already
+/// honors the variable when it resolves that Codex's transcripts
+/// (`ManagedHarness::Codex` in `ai-memory-workstream`), so ignoring it here left
+/// one half of the same install pointing somewhere the other half did not.
 pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    codex_hooks_path_in(std::env::var_os("CODEX_HOME"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`claude_settings_path_in`]).
+fn codex_hooks_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("hooks.json"));
+    }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.codex/hooks.json")?
         .join(".codex")
         .join("hooks.json"))
+}
+
+/// `~/.commandcode/settings.json`.
+pub(crate) fn command_code_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.commandcode/settings.json")?
+        .join(".commandcode")
+        .join("settings.json"))
 }
 
 /// `~/.cursor/hooks.json`.
@@ -76,9 +121,7 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.grok/hooks/ai-memory.json")?
-        .join(".grok")
+    Ok(install_mcp::grok_home()?
         .join("hooks")
         .join("ai-memory.json"))
 }
@@ -95,6 +138,22 @@ pub(crate) fn zero_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
+pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.devin/hooks.v1.json")?
+        .join(".devin")
+        .join("hooks.v1.json"))
+}
+
+/// `~/.devin/config.json` — Devin CLI lifecycle hooks (alternative target under `hooks` key).
+pub(crate) fn devin_config_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.devin/config.json")?
+        .join(".devin")
+        .join("config.json"))
+}
+
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -105,33 +164,152 @@ pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
         .join("ai-memory.ts"))
 }
 
+/// `$PI_CODING_AGENT_DIR/extensions/ai-memory.ts` when the var is set, else
 /// `~/.omp/agent/extensions/ai-memory.ts` — OMP lifecycle extension.
-pub(crate) fn omp_extension_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.omp/agent/extensions")?
-        .join(".omp")
-        .join("agent")
-        .join("extensions")
-        .join("ai-memory.ts"))
+///
+/// `PI_CODING_AGENT_DIR` relocates OMP's whole agent config home
+/// (`~/.omp/agent`), so extensions written to the default path are never
+/// loaded by an OMP configured that way: capture silently does nothing, with
+/// a successful-looking install. ai-memory already honors the variable when
+/// it resolves OMP transcripts (`ManagedHarness::Omp` in
+/// `ai-memory-workstream`), so ignoring it here left one half of the same
+/// install pointing somewhere the other half did not.
+pub(crate) fn omp_extension_path(profile: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    // Bind the OsString before borrowing from it: `var_os(..).as_ref()` in a
+    // single expression drops the temporary at the end of the statement.
+    let env_profile = std::env::var_os("OMP_PROFILE");
+    let profile = profile.or_else(|| env_profile.as_ref().and_then(|s| s.to_str()));
+    omp_extension_path_in(std::env::var_os("PI_CODING_AGENT_DIR"), profile)
 }
 
-/// `~/.pi/agent/extensions/ai-memory.ts` — Pi lifecycle + MCP bridge extension.
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`codex_hooks_path_in`]).
+fn omp_extension_path_in(
+    env_override: Option<std::ffi::OsString>,
+    profile: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    // Precedence: `PI_CODING_AGENT_DIR` wins over `--profile`.
+    //
+    // OMP documents each separately — the variable "can override the agent
+    // directory", and `--profile <name>` moves it to
+    // `~/.omp/profiles/<name>/agent` — but does not define what happens when
+    // both are set. Rather than guess at a composition (an earlier revision
+    // derived `$DIR/profiles/<name>/agent`, and re-rooted differently
+    // depending on whether the path's last component happened to be named
+    // "agent", so the result changed with the directory's *name*), this
+    // takes the reading each is documented to have: the variable names the
+    // agent directory outright, so when it is set that is the agent
+    // directory. The profile then has nothing left to relocate, and the
+    // caller says so instead of silently picking one.
+    let base_dir = if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        dir
+    } else {
+        let root = home_dir()
+            .context("could not locate $HOME for ~/.omp")?
+            .join(".omp");
+        if let Some(profile_name) = profile {
+            root.join("profiles").join(profile_name).join("agent")
+        } else {
+            root.join("agent")
+        }
+    };
+    Ok(base_dir.join("extensions").join("ai-memory-omp.ts"))
+}
+
+/// `$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts` when the var is set, else
+/// `~/.pi/agent/extensions/ai-memory-pi.ts` — Pi lifecycle + MCP bridge extension.
+///
+/// `PI_CODING_AGENT_DIR` relocates Pi's whole agent config home
+/// (`~/.pi/agent`), so extensions written to the default path are never
+/// loaded by a Pi configured that way: capture silently does nothing, with a
+/// successful-looking install. ai-memory already honors the variable when it
+/// resolves Pi transcripts (`ManagedHarness::Pi` in `ai-memory-workstream`),
+/// so ignoring it here left one half of the same install pointing somewhere
+/// the other half did not.
 pub(crate) fn pi_extension_path() -> anyhow::Result<std::path::PathBuf> {
+    pi_extension_path_in(std::env::var_os("PI_CODING_AGENT_DIR"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`codex_hooks_path_in`]).
+fn pi_extension_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("extensions").join("ai-memory-pi.ts"));
+    }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.pi/agent/extensions")?
         .join(".pi")
         .join("agent")
         .join("extensions")
-        .join("ai-memory.ts"))
+        .join("ai-memory-pi.ts"))
+}
+
+/// `$KIMI_CODE_HOME/config.toml` when set, else `~/.kimi-code/config.toml`.
+/// Kimi Code keeps hooks as `[[hooks]]` entries inside the same
+/// config.toml that stores the user's providers/model, so the apply
+/// path merges TOML-aware instead of rewriting the file.
+pub(crate) fn kimi_code_config_path() -> anyhow::Result<std::path::PathBuf> {
+    kimi_code_config_path_in(std::env::var_os("KIMI_CODE_HOME"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env (mirrors
+/// `install_mcp::kimi_code_home`).
+fn kimi_code_config_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir).join("config.toml"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.kimi-code/config.toml")?
+        .join(".kimi-code")
+        .join("config.toml"))
+}
+
+/// `$KIRO_HOME/agents` when set, else `~/.kiro/agents`. The Kiro CLI v2
+/// engine embeds hooks inside per-agent config JSONs in this directory;
+/// there is no global v2 hook surface, and the built-in default agent
+/// has no file on disk. `KIRO_HOME` relocation is honored by the real
+/// binary (verified against kiro-cli 2.16.0: settings are written under
+/// `$KIRO_HOME` when set).
+pub(crate) fn kiro_cli_agents_dir() -> anyhow::Result<std::path::PathBuf> {
+    kiro_cli_home_join(std::env::var_os("KIRO_HOME"), "agents")
+}
+
+/// `$KIRO_HOME/hooks/ai-memory.json` when set, else
+/// `~/.kiro/hooks/ai-memory.json`. Kiro v3 loads each standalone JSON file in
+/// this directory; using one ai-memory-owned file avoids mutating unrelated
+/// registrations.
+pub(crate) fn kiro_cli_v3_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(kiro_cli_home_join(std::env::var_os("KIRO_HOME"), "hooks")?.join("ai-memory.json"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env (mirrors
+/// `kimi_code_config_path_in`).
+fn kiro_cli_home_join(
+    env_override: Option<std::ffi::OsString>,
+    child: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir).join(child));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.kiro")?
+        .join(".kiro")
+        .join(child))
 }
 
 /// Run the `install-hooks` subcommand.
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
-pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
-    let inferred = if args.server_url == DEFAULT_SERVER_URL {
-        infer_installed_mcp_config(args.agent)
+pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
+    let inferred = if args.server_url.is_none() {
+        infer_installed_mcp_config(args.agent)?
     } else {
         None
     };
@@ -154,7 +332,50 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("[ai-memory] hooks installing for user: {user}");
     }
+    let generated = matches!(
+        args.agent,
+        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Pi | AgentChoice::Openclaw
+    );
+    if generated || local_hook_policy_v1_supported() {
+        eprintln!(
+            "[ai-memory] capture-policy capability v1 enforced by this selected integration; re-run --apply to refresh existing installs."
+        );
+    } else {
+        eprintln!(
+            "[ai-memory] selected shell/PowerShell compatibility path does not enforce capture-policy v1; use a native platform selection or generated integration."
+        );
+    }
+    // Assistant/Stop capture is Claude Code + native-platform only (#196). No
+    // silent fallback: bail so an operator on a script-fallback platform or a
+    // different agent is told the flag has no effect instead of installing a
+    // command whose capture would be silently dropped.
+    if args.capture_assistant && !capture_assistant_allowed(args.agent) {
+        anyhow::bail!(
+            "--capture-assistant requires --agent claude-code on a native hook platform \
+             (PosixNative/WindowsNative). The current selection uses the script fallback or a \
+             different agent, where the opt-in cannot take effect. Remove --capture-assistant or \
+             switch to a native Claude Code install."
+        );
+    }
+    if (args.no_capture_prompts || args.capture_prompts)
+        && !prompt_capture_options_allowed(args.agent)
+    {
+        anyhow::bail!(
+            "--no-capture-prompts and --capture-prompts require --agent claude-code. Other \
+             agents may use their prompt hook to deliver handoff context, so removing it could \
+             break cross-agent continuity."
+        );
+    }
     if args.apply {
+        // Preserve a project-strategy an earlier `--apply` baked when this run
+        // did not pass `--project-strategy`. Without this, a bare re-apply —
+        // notably the auto-refresh in `ai-memory upgrade` — re-renders the hook
+        // commands with no strategy and silently reverts a `repo-root` install
+        // to `basename`. An explicit `--project-strategy` (including `basename`)
+        // is honored as-is, so an intentional downgrade still works. Resolving
+        // into `args` here means every downstream renderer picks it up with no
+        // per-agent plumbing.
+        args.project_strategy = install_project_strategy(&args);
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
@@ -172,6 +393,16 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             AgentChoice::Codex => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_codex_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
+            AgentChoice::CommandCode => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_command_code_settings(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::Cursor => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -196,17 +427,56 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
+            AgentChoice::Devin => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
+            AgentChoice::KimiCode => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
+            AgentChoice::KiroCli => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kiro_cli_agent_configs(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
+            }
+            AgentChoice::KiroCliV3 => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     match args.agent {
         AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
         AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
-        AgentChoice::Omp => render_omp_extension(&server_url, auth, strategy),
+        AgentChoice::Omp => {
+            render_omp_extension(&server_url, auth, strategy, args.profile.as_deref())
+        }
         AgentChoice::ClaudeCode => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_claude_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            let settings_path = match &args.config_file {
+                Some(p) => p.clone(),
+                None => claude_settings_path()?,
+            };
+            render_claude_code(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                &settings_path,
+                ClaudeCaptureScope {
+                    assistant: args.capture_assistant,
+                    prompts: install_claude_prompt_capture(&args),
+                },
+            )
         }
         AgentChoice::Codex => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -217,6 +487,17 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                 auth,
                 strategy,
                 &[CODEX_PROFILE.events],
+            )
+        }
+        AgentChoice::CommandCode => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_agent(
+                "command-code",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[COMMAND_CODE_PROFILE.events],
             )
         }
         AgentChoice::Cursor => {
@@ -257,9 +538,25 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Devin => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth, strategy);
             Ok(())
+        }
+        AgentChoice::KimiCode => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_kimi_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
+        AgentChoice::KiroCli => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_kiro_cli(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
+        AgentChoice::KiroCliV3 => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
     }
 }
@@ -268,6 +565,224 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
 struct InferredMcpConfig {
     hook_server_url: Option<String>,
     auth_token: Option<String>,
+}
+
+/// The project-strategy to install for `args`: the explicit `--project-strategy`
+/// when one was given, otherwise the strategy an earlier `--apply` baked into
+/// the agent's existing config (so a bare re-apply preserves it instead of
+/// reverting to basename). `None` means "bake nothing", unchanged from before.
+fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyArg> {
+    if args.project_strategy.is_some() {
+        return args.project_strategy;
+    }
+    // Kiro v2 can update several agent configs in one run. Each config may
+    // carry a different previously-baked strategy, so recover it per target in
+    // `apply_to_kiro_cli_agent_configs` instead of choosing one globally.
+    if args.agent == AgentChoice::KiroCli {
+        return None;
+    }
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(|existing| baked_project_strategy(args.agent, existing))
+}
+
+/// Whether the Claude Code install should include its prompt-capture hook.
+/// Explicit flags win. A bare apply preserves the state of an existing
+/// ai-memory install so `upgrade` cannot silently restore a privacy opt-out.
+fn install_claude_prompt_capture(args: &InstallHooksArgs) -> bool {
+    if args.no_capture_prompts {
+        return false;
+    }
+    if args.capture_prompts || !args.apply {
+        return true;
+    }
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_claude_prompt_capture)
+        .unwrap_or(true)
+}
+
+/// Recover prompt-capture state only from hook entries owned by ai-memory.
+/// `None` means this is not an existing ai-memory Claude Code install.
+fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let has_ai_memory_hooks = hooks.values().any(|value| {
+        value
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
+    });
+    if !has_ai_memory_hooks {
+        return None;
+    }
+    Some(
+        hooks
+            .get(CLAUDE_PROMPT_EVENT)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry)),
+    )
+}
+
+/// Read the config file `--apply` will update for the selected agent.
+fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
+    let path = if let Some(path) = &args.config_file {
+        if args.agent == AgentChoice::Openclaw {
+            path.join(openclaw_plugin::ENTRYPOINT_TS)
+        } else {
+            path.clone()
+        }
+    } else {
+        match args.agent {
+            AgentChoice::ClaudeCode => claude_settings_path().ok()?,
+            AgentChoice::Codex => codex_hooks_path().ok()?,
+            AgentChoice::CommandCode => command_code_settings_path().ok()?,
+            AgentChoice::Cursor => cursor_hooks_path().ok()?,
+            AgentChoice::GeminiCli => gemini_settings_path().ok()?,
+            AgentChoice::OpenCode => opencode_plugin_path().ok()?,
+            AgentChoice::Pi => pi_extension_path().ok()?,
+            AgentChoice::Omp => omp_extension_path(args.profile.as_deref()).ok()?,
+            AgentChoice::Openclaw => openclaw_plugin::default_plugin_dir()
+                .ok()?
+                .join(openclaw_plugin::ENTRYPOINT_TS),
+            AgentChoice::AntigravityCli => antigravity_hooks_path().ok()?,
+            AgentChoice::Grok => grok_hooks_path().ok()?,
+            AgentChoice::Zero => zero_hooks_path().ok()?,
+            AgentChoice::Devin => devin_hooks_path().ok()?,
+            AgentChoice::KimiCode => kimi_code_config_path().ok()?,
+            AgentChoice::KiroCli => return None,
+            AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
+        }
+    };
+    std::fs::read_to_string(path).ok()
+}
+
+/// Recover a strategy only from configuration entries ai-memory owns. Shared
+/// JSON/TOML config files may contain unrelated hooks, while generated
+/// TypeScript files carry an explicit ownership header.
+fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectStrategyArg> {
+    match agent {
+        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
+            let marker = match agent {
+                AgentChoice::OpenCode => "--agent opencode --apply`.",
+                AgentChoice::Pi => "--agent pi --apply`.",
+                AgentChoice::Omp => "--agent omp --apply`.",
+                AgentChoice::Openclaw => "--agent openclaw --apply`.",
+                _ => return None,
+            };
+            existing
+                .lines()
+                .next()
+                .filter(|line| {
+                    line.starts_with("// Auto-generated by `ai-memory install-hooks ")
+                        && line.ends_with(marker)
+                })
+                .and_then(|_| project_strategy_from_text(existing))
+        }
+        AgentChoice::KimiCode => {
+            let document: toml_edit::DocumentMut = existing.parse().ok()?;
+            document
+                .get("hooks")
+                .and_then(toml_edit::Item::as_array_of_tables)
+                .and_then(|hooks| {
+                    hooks.iter().find_map(|entry| {
+                        if !is_ai_memory_toml_hook_entry(entry) {
+                            return None;
+                        }
+                        entry
+                            .get("command")
+                            .and_then(|item| item.as_str())
+                            .and_then(project_strategy_from_text)
+                    })
+                })
+        }
+        AgentChoice::KiroCliV3 => {
+            let root: serde_json::Value = serde_json::from_str(existing).ok()?;
+            root.get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|hooks| {
+                    hooks.iter().find_map(|entry| {
+                        is_ai_memory_kiro_v3_hook_entry(entry)
+                            .then(|| {
+                                entry
+                                    .pointer("/action/command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(project_strategy_from_text)
+                            })
+                            .flatten()
+                    })
+                })
+        }
+        _ => serde_json::from_str(existing)
+            .ok()
+            .as_ref()
+            .and_then(project_strategy_from_json),
+    }
+}
+
+fn project_strategy_from_json(value: &serde_json::Value) -> Option<ProjectStrategyArg> {
+    if is_ai_memory_hook_entry(value) {
+        if let Some(strategy) = value
+            .get("command")
+            .and_then(|command| command.as_str())
+            .and_then(project_strategy_from_text)
+        {
+            return Some(strategy);
+        }
+        if let Some(args) = value.get("args").and_then(|args| args.as_array()) {
+            let args: Vec<&str> = args.iter().filter_map(|arg| arg.as_str()).collect();
+            for (index, arg) in args.iter().enumerate() {
+                if let Some(value) = arg.strip_prefix("--project-strategy=")
+                    && is_repo_root_strategy(value)
+                {
+                    return Some(ProjectStrategyArg::RepoRoot);
+                }
+                if *arg == "--project-strategy"
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|value| is_repo_root_strategy(value))
+                {
+                    return Some(ProjectStrategyArg::RepoRoot);
+                }
+            }
+        }
+    }
+
+    match value {
+        serde_json::Value::Array(values) => values.iter().find_map(project_strategy_from_json),
+        serde_json::Value::Object(values) => values.values().find_map(project_strategy_from_json),
+        _ => None,
+    }
+}
+
+/// Only `repo-root` is baked (`basename` removes the marker), so it is the sole
+/// value recovered from legacy shell commands and generated source.
+fn project_strategy_from_text(existing: &str) -> Option<ProjectStrategyArg> {
+    for marker in [
+        "AI_MEMORY_PROJECT_STRATEGY=",
+        "--project-strategy=",
+        "--project-strategy ",
+        "const DEFAULT_PROJECT_STRATEGY =",
+    ] {
+        for rest in existing.split(marker).skip(1) {
+            let token: String = rest
+                .trim_start_matches(|character: char| {
+                    character.is_ascii_whitespace() || matches!(character, '\'' | '"')
+                })
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .collect();
+            if is_repo_root_strategy(&token) {
+                return Some(ProjectStrategyArg::RepoRoot);
+            }
+        }
+    }
+    None
+}
+
+fn is_repo_root_strategy(value: &str) -> bool {
+    matches!(value, "repo-root" | "repo_root")
 }
 
 /// Reject `--as-user X` without a usable `--auth-token`. P1.8
@@ -299,14 +814,14 @@ fn effective_hook_server_url(
     args: &InstallHooksArgs,
     inferred: Option<&InferredMcpConfig>,
 ) -> String {
-    let raw = if args.server_url != DEFAULT_SERVER_URL {
-        args.server_url.clone()
+    let raw = if let Some(url) = &args.server_url {
+        url.clone()
     } else if config.server_url_configured() {
         config.server_url.clone()
     } else if let Some(url) = inferred.and_then(|mcp| mcp.hook_server_url.clone()) {
         url
     } else {
-        return args.server_url.clone();
+        return DEFAULT_SERVER_URL.to_string();
     };
     apply_base_path_to_hook_url(&normalise_hook_server_url(&raw), &config.base_path)
 }
@@ -328,7 +843,7 @@ fn apply_base_path_to_hook_url(url: &str, base_path: &str) -> String {
     if !existing_path.is_empty() {
         return url.to_string();
     }
-    let prefix = crate::commands::serve::normalize_prefix(base_path);
+    let prefix = ai_memory_web::normalize_prefix(base_path);
     if prefix.is_empty() {
         origin
     } else {
@@ -336,43 +851,146 @@ fn apply_base_path_to_hook_url(url: &str, base_path: &str) -> String {
     }
 }
 
-fn infer_installed_mcp_config(agent: AgentChoice) -> Option<InferredMcpConfig> {
-    let client = mcp_client_for_agent(agent)?;
-    let path = install_mcp::mcp_config_path(client).ok()?;
-    let content = fs::read_to_string(path).ok()?;
+fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpConfig>> {
+    if agent == AgentChoice::Grok {
+        let cwd = std::env::current_dir()
+            .context("could not resolve current dir for Grok project configuration")?;
+        let repo_root = ai_memory_consolidate::discover_repo_root(&cwd).ok();
+        if let Some(project_config) = find_grok_project_overlay(&cwd, repo_root.as_deref()) {
+            anyhow::bail!(
+                "Grok project configuration {} may override GROK_HOME; pass explicit --server-url and --auth-token rather than inferring MCP settings",
+                project_config.display()
+            );
+        }
+    }
+    let Some(client) = mcp_client_for_agent(agent) else {
+        return Ok(None);
+    };
+    let path = install_mcp::mcp_config_path(client)?;
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
     match client {
-        McpClient::ClaudeCode => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url")
-        }
-        McpClient::Codex => infer_codex_mcp_config(&content),
-        McpClient::OpenCode => infer_json_mcp_config(&content, &["mcp", "ai-memory"], "url"),
-        McpClient::Cursor => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
-        McpClient::GeminiCli => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "httpUrl")
-        }
-        McpClient::Openclaw => {
-            infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url")
-        }
-        McpClient::Omp => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
-        McpClient::Zero => infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url"),
-        McpClient::Pi => None,
-        McpClient::AntigravityCli => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "serverUrl")
-        }
-        McpClient::ClaudeDesktop => None,
+        McpClient::ClaudeCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        // Codex uses `http_headers`; Grok uses `headers`. The shared TOML
+        // inferencer accepts both.
+        McpClient::Codex => Ok(infer_toml_mcp_config(&content)),
+        McpClient::CommandCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Grok => infer_grok_mcp_config(&content),
+        McpClient::OpenCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "ai-memory"],
+            "url",
+        )),
+        McpClient::Cursor => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::GeminiCli => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "httpUrl",
+        )),
+        McpClient::Openclaw => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Omp => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Zero => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Pi => Ok(None),
+        McpClient::AntigravityCli => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "serverUrl",
+        )),
+        McpClient::Devin => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::KimiCode | McpClient::KiroCli => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::ClaudeDesktop => Ok(None),
+        // MCP-only client: no AgentChoice counterpart routes here.
+        McpClient::Swival => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
         // Code Copilot directly.
-        McpClient::VsCodeCopilot => {
-            infer_json_mcp_config(&content, &["servers", "ai-memory"], "url")
-        }
+        McpClient::VsCodeCopilot => Ok(infer_json_mcp_config(
+            &content,
+            &["servers", "ai-memory"],
+            "url",
+        )),
+        // MCP-only client: no AgentChoice counterpart routes here.
+        McpClient::Zed => Ok(infer_json_mcp_config(
+            &content,
+            &["context_servers", "ai-memory"],
+            "url",
+        )),
     }
+}
+
+/// Grok loads project settings from every directory between the repository
+/// root and CWD. Outside a repository, only the active directory is relevant.
+fn grok_project_overlay_paths(cwd: &Path, repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let start = repo_root
+        .filter(|root| cwd.starts_with(root))
+        .unwrap_or(cwd);
+    let mut directories = Vec::new();
+    let mut current = cwd;
+    loop {
+        directories.push(current.to_path_buf());
+        if current == start {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    directories.reverse();
+    directories
+        .into_iter()
+        .map(|directory| directory.join(".grok").join("config.toml"))
+        .collect()
+}
+
+fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBuf> {
+    grok_project_overlay_paths(cwd, repo_root)
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),
+        AgentChoice::CommandCode => Some(McpClient::CommandCode),
         AgentChoice::Cursor => Some(McpClient::Cursor),
         AgentChoice::GeminiCli => Some(McpClient::GeminiCli),
         AgentChoice::OpenCode => Some(McpClient::OpenCode),
@@ -380,9 +998,13 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
         AgentChoice::Zero => Some(McpClient::Zero),
-        // Grok manages its own MCP config under ~/.grok/; we don't
-        // auto-infer a hook server URL from it.
-        AgentChoice::Pi | AgentChoice::Grok => None,
+        AgentChoice::Grok => Some(McpClient::Grok),
+        AgentChoice::Devin => Some(McpClient::Devin),
+        AgentChoice::KimiCode => Some(McpClient::KimiCode),
+        // Pi bridges MCP through its generated extension, not a native
+        // mcp.json the installer can scrape.
+        AgentChoice::Pi => None,
+        AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
     }
 }
 
@@ -411,12 +1033,14 @@ fn infer_json_mcp_config(
     })
 }
 
-fn infer_codex_mcp_config(content: &str) -> Option<InferredMcpConfig> {
+/// Infer hook server URL + bearer from a TOML `[mcp_servers.ai-memory]`
+/// entry (Codex `http_headers` or Grok `headers`).
+fn infer_toml_mcp_config(content: &str) -> Option<InferredMcpConfig> {
     let doc: toml_edit::DocumentMut = content.parse().ok()?;
     // `toml_edit::Item`'s `Index` impl panics on missing keys, so this
     // walks the table chain with `.get()` instead. A user with
     // `[mcp_servers.context7]` but no `[mcp_servers.ai-memory]` is a
-    // perfectly valid hooks-only Codex setup (issue #53) — return None
+    // perfectly valid hooks-only Codex/Grok setup (issue #53) — return None
     // rather than abort the whole install with a stack trace.
     let server = doc.get("mcp_servers")?.get("ai-memory")?;
 
@@ -439,12 +1063,96 @@ fn infer_codex_mcp_config(content: &str) -> Option<InferredMcpConfig> {
     })
 }
 
+/// Infer Grok's TOML entry after resolving its supported `${VAR}` and
+/// `${VAR:-default}` placeholders. Refuse missing variables so generated hook
+/// commands never contain a literal placeholder.
+fn infer_grok_mcp_config(content: &str) -> Result<Option<InferredMcpConfig>> {
+    let doc: toml_edit::DocumentMut = match content.parse() {
+        Ok(doc) => doc,
+        Err(_) => return Ok(None),
+    };
+    let Some(server) = doc
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("ai-memory"))
+    else {
+        return Ok(None);
+    };
+    let hook_server_url = server
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(expand_grok_placeholders)
+        .transpose()?
+        .as_deref()
+        .and_then(hook_server_url_from_mcp_url);
+    let auth_token = server
+        .get("headers")
+        .and_then(|headers| headers.get("Authorization"))
+        .and_then(|value| value.as_str())
+        .map(expand_grok_placeholders)
+        .transpose()?
+        .as_deref()
+        .and_then(bearer_token_from_header);
+    if hook_server_url.is_none() && auth_token.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(InferredMcpConfig {
+        hook_server_url,
+        auth_token,
+    }))
+}
+
+fn expand_grok_placeholders(value: &str) -> Result<String> {
+    expand_grok_placeholders_with(value, |name| std::env::var(name).ok())
+}
+
+fn expand_grok_placeholders_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let end = after_start
+            .find('}')
+            .context("unterminated Grok ${...} placeholder")?;
+        let expression = &after_start[..end];
+        let (name, default) = expression
+            .split_once(":-")
+            .map_or((expression, None), |(name, default)| (name, Some(default)));
+        if name.is_empty()
+            || !name.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || ch.is_ascii_alphabetic())
+            })
+        {
+            anyhow::bail!("invalid Grok environment placeholder `${{{expression}}}`");
+        }
+        let replacement = lookup(name)
+            .filter(|value| !value.is_empty())
+            .or_else(|| default.map(ToOwned::to_owned))
+            .with_context(|| format!("Grok MCP placeholder `${{{name}}}` is unset; pass explicit --server-url and --auth-token"))?;
+        output.push_str(&replacement);
+        remaining = &after_start[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
+}
+
 fn hook_server_url_from_mcp_url(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    // Drop query/fragment BEFORE the `/mcp` peel: Kimi Code's
+    // `?flavor=moonshot` marker must never leak into hook URLs (and it
+    // would stop the suffix from matching).
+    let base = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    if base.is_empty() {
         return None;
     }
-    Some(trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_string())
+    Some(base.strip_suffix("/mcp").unwrap_or(base).to_string())
 }
 
 fn bearer_token_from_header(header: &str) -> Option<String> {
@@ -521,9 +1229,75 @@ fn overlay_event_hooks(
     map.insert(event.to_string(), serde_json::Value::Array(entries));
 }
 
+/// Remove only ai-memory's entries for one event. Delete the event key when
+/// no third-party hooks remain so a rendered opt-out stays minimal.
+fn remove_ai_memory_event_hooks(map: &mut serde_json::Map<String, serde_json::Value>, event: &str) {
+    overlay_event_hooks(map, event, &serde_json::Value::Array(Vec::new()));
+    if map
+        .get(event)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        map.remove(event);
+    }
+}
+
+fn overlay_kiro_cli_event_hooks(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    our_value: &serde_json::Value,
+) {
+    let mut entries: Vec<serde_json::Value> = map
+        .get(event)
+        .and_then(|value| value.as_array())
+        .map(|existing| {
+            existing
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_ai_memory_kiro_hook_command)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(ours) = our_value.as_array() {
+        entries.extend(ours.iter().cloned());
+    }
+    map.insert(event.to_string(), serde_json::Value::Array(entries));
+}
+
 /// Mutate `~/.claude/settings.json` in place: replace the hook entries
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
+/// Whether `--capture-assistant` may take effect for this agent + platform
+/// (#196): Claude Code on a native hook platform only. Any other agent or a
+/// script-fallback platform cannot honor the opt-in, so the installer bails
+/// instead of enabling it silently.
+fn capture_assistant_allowed(agent: AgentChoice) -> bool {
+    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+}
+
+fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
+    agent == AgentChoice::ClaudeCode
+}
+
+fn configure_claude_prompt_capture(
+    mut payload: serde_json::Value,
+    capture_prompts: bool,
+) -> serde_json::Value {
+    if !capture_prompts
+        && let Some(hooks) = payload
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        hooks.remove(CLAUDE_PROMPT_EVENT);
+    }
+    payload
+}
+
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -531,20 +1305,68 @@ fn apply_to_claude_code_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
+    apply_to_claude_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_claude_code_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "claude-code", staging_data_local)?;
+    let command_dir = staged_command_dir(&staged, "claude-code");
+    let capture_prompts = install_claude_prompt_capture(args);
+    let payload = configure_claude_prompt_capture(
+        crate::commands::render_shared::build_claude_code_script_payload_for_test(
+            &command_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            args.capture_assistant,
+        ),
+        capture_prompts,
+    );
+    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+}
+
+fn apply_to_claude_code_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "claude-code");
+    let capture_prompts = install_claude_prompt_capture(args);
+    let payload = configure_claude_prompt_capture(
+        build_claude_code_payload_with_data_dir(
+            &command_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            args.capture_assistant,
+        ),
+        capture_prompts,
+    );
+    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+}
+
+fn apply_to_claude_code_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+    capture_prompts: bool,
+) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => claude_settings_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
-    let command_dir = staged_command_dir(&staged, "claude-code");
-    let strategy = args.project_strategy.baked();
-    let payload = build_claude_code_payload_with_data_dir(
-        &command_dir,
-        server_url,
-        auth_token,
-        Some(data_dir),
-        strategy,
-    );
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -564,6 +1386,9 @@ fn apply_to_claude_code_settings(
                 .context("`hooks` is present in settings.json but not an object")?;
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
+            }
+            if !capture_prompts {
+                remove_ai_memory_event_hooks(hooks, CLAUDE_PROMPT_EVENT);
             }
             Ok(())
         })
@@ -601,7 +1426,7 @@ fn apply_to_grok_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "grok")?;
     let command_dir = staged_command_dir(&staged, "grok");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = build_grok_payload_with_data_dir(
         &command_dir,
         server_url,
@@ -621,6 +1446,193 @@ fn apply_to_grok_settings(
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
                 .context("`hooks` is present in ai-memory.json but not an object")?;
+            for (event, value) in &our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// Mutate Devin's hook config (either `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key).
+/// Devin uses the same nested hook JSON shape as Claude Code/Grok, but with DEVIN_EVENTS
+/// (PostCompaction instead of PreCompact, no subagent events). SessionStart injects
+/// the handoff via hookSpecificOutput.additionalContext.
+fn apply_to_devin_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "devin")?;
+    apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_devin_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "devin", staging_data_local)?;
+    apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+fn apply_to_devin_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => devin_hooks_path()?,
+    };
+    let command_dir = staged_command_dir(staged, "devin");
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = build_devin_payload_with_data_dir(
+        &command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: build_devin_payload didn't return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        // For hooks.v1.json, the entire file IS the hooks object
+        // For config.json hooks key, we merge into the hooks object
+        if path.file_name() == Some("hooks.v1.json".as_ref()) {
+            mutate_json(existing, |root| {
+                for (event, value) in &our_hooks {
+                    overlay_event_hooks(root, event, value);
+                }
+                Ok(())
+            })
+        } else {
+            mutate_json(existing, |root| {
+                let hooks = root
+                    .entry("hooks")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`hooks` is present in config.json but not an object")?;
+                for (event, value) in &our_hooks {
+                    overlay_event_hooks(hooks, event, value);
+                }
+                Ok(())
+            })
+        }
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// Mutate `~/.commandcode/settings.json` so Command Code fires the stable
+/// four-event lifecycle integration. Command Code's schema requires the outer
+/// `matcher` to be omitted for SessionStart and Stop, so its profile must not
+/// reuse the otherwise similar Claude/Codex payload byte-for-byte.
+fn apply_to_command_code_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "command-code")?;
+    apply_to_command_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_command_code_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "command-code", staging_data_local)?;
+    let command_dir = staged_command_dir(&staged, "command-code");
+    let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
+        &COMMAND_CODE_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "command-code",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_command_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_command_code_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "command-code");
+    let payload = build_profile_payload_for_agent(
+        &COMMAND_CODE_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "command-code",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_command_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_command_code_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(path) => path.clone(),
+        None => command_code_settings_path()?,
+    };
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: Command Code payload did not return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in settings.json but not an object")?;
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
             }
@@ -670,21 +1682,62 @@ fn apply_to_codex_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "codex")?;
+    apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_codex_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "codex", staging_data_local)?;
+    let command_dir = staged_command_dir(&staged, "codex");
+    let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
+        &super::render_shared::CODEX_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "codex",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_codex_settings_with_payload(payload, args)
+}
+
+fn apply_to_codex_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "codex");
+    let payload = build_profile_payload_for_agent(
+        &super::render_shared::CODEX_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "codex",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_codex_settings_with_payload(payload, args)
+}
+
+fn apply_to_codex_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => codex_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "codex")?;
-    let command_dir = staged_command_dir(&staged, "codex");
-    let strategy = args.project_strategy.baked();
-    let outcome = merge_codex_hooks(
-        &command_dir,
-        server_url,
-        auth_token,
-        data_dir,
-        strategy,
-        &path,
-    )?;
+    let outcome = merge_codex_payload(payload, &path)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -709,6 +1762,7 @@ fn apply_to_codex_settings(
     Ok(())
 }
 
+#[cfg(test)]
 fn merge_codex_hooks(
     staged: &Path,
     server_url: &str,
@@ -729,6 +1783,10 @@ fn merge_codex_hooks(
         Some(data_dir),
         project_strategy,
     );
+    merge_codex_payload(payload, config_path)
+}
+
+fn merge_codex_payload(payload: serde_json::Value, config_path: &Path) -> Result<ApplyOutcome> {
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -787,7 +1845,7 @@ fn apply_to_cursor_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "cursor")?;
     let command_dir = staged_command_dir(&staged, "cursor");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_cursor_hooks(
         &command_dir,
         server_url,
@@ -879,7 +1937,7 @@ fn apply_to_gemini_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_gemini_hooks(
         &command_dir,
         server_url,
@@ -963,7 +2021,7 @@ fn apply_to_antigravity_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_antigravity_hooks(
         &command_dir,
         server_url,
@@ -982,8 +2040,15 @@ fn apply_to_antigravity_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    println!();
+    print!("{ANTIGRAVITY_FINALIZATION_GUIDANCE}");
     Ok(())
 }
+
+const ANTIGRAVITY_FINALIZATION_GUIDANCE: &str = "\
+Antigravity `Stop` ends one execution loop, not the conversation. After the\n\
+final turn, run `ai-memory finalize-session --agent antigravity-cli` to create\n\
+the final summary and handoff and to queue opt-in SessionEnd consolidation.\n";
 
 fn merge_antigravity_hooks(
     staged: &Path,
@@ -1022,6 +2087,497 @@ fn merge_antigravity_hooks(
     })
 }
 
+/// Mutate Kimi Code's `config.toml` (`$KIMI_CODE_HOME/config.toml` when
+/// the var is set, else `~/.kimi-code/config.toml`) so Kimi Code fires
+/// the ai-memory scripts on its lifecycle events.
+///
+/// Kimi Code stores hooks as `[[hooks]]` array-of-tables entries inside
+/// the SAME config.toml that carries the user's providers and model,
+/// and any unknown key on a hook entry makes the whole config fail to
+/// load. The merge is therefore TOML-aware via `toml_edit` (the rest of
+/// the document is preserved as parsed) and each entry carries exactly
+/// `event` + `command` — `matcher` omitted (Kimi Code matches
+/// everything) and `timeout` omitted (30s default).
+fn apply_to_kimi_code_config(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => kimi_code_config_path()?,
+    };
+    let staged = stage_hook_scripts(hooks_dir, "kimi-code")?;
+    let command_dir = staged_command_dir(&staged, "kimi-code");
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let outcome = merge_kimi_code_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+fn merge_kimi_code_hooks(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<ApplyOutcome> {
+    let commands = kimi_code_hook_commands(
+        staged,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    apply_atomic(config_path, |existing| {
+        mutate_toml(existing, |doc| upsert_kimi_code_hooks(doc, &commands))
+    })
+}
+
+/// Insert or refresh ai-memory's `[[hooks]]` entries: drop any prior
+/// entry whose command references our staged scripts (so re-runs update
+/// in place instead of duplicating), append the fresh set, and leave
+/// every third-party `[[hooks]]` entry — and every other table in
+/// config.toml — untouched.
+fn upsert_kimi_code_hooks(
+    doc: &mut toml_edit::DocumentMut,
+    commands: &[(&str, String)],
+) -> Result<()> {
+    use toml_edit::{ArrayOfTables, Item, Table, value};
+
+    if doc.get("hooks").is_none() {
+        doc.insert("hooks", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let hooks = doc
+        .get_mut("hooks")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("`hooks` is present in config.toml but not an array of tables")?;
+
+    let stale: Vec<usize> = hooks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| is_ai_memory_toml_hook_entry(entry).then_some(i))
+        .collect();
+    for i in stale.into_iter().rev() {
+        hooks.remove(i);
+    }
+    for (event, command) in commands {
+        let mut entry = Table::new();
+        entry["event"] = value(*event);
+        entry["command"] = value(command);
+        hooks.push(entry);
+    }
+    Ok(())
+}
+
+/// True if a `[[hooks]]` table belongs to ai-memory — i.e. its command
+/// references our staged script path or the inlined `AI_MEMORY_*` env
+/// vars. Broad matching is intentional (mirrors the shell-form branch
+/// of `is_ai_memory_hook_entry`): old installs may identify us by the
+/// script path or by the env prefix alone.
+fn is_ai_memory_toml_hook_entry(entry: &toml_edit::Table) -> bool {
+    let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    let lower = command.to_ascii_lowercase();
+    lower.contains("ai-memory") || lower.contains("ai_memory")
+}
+
+/// Merge ai-memory's camelCase hook entries into every existing Kiro CLI
+/// v2 agent config (`~/.kiro/agents/*.json`, or the single file passed
+/// via `--config-file`).
+///
+/// The v2 engine has no global hook surface: hooks fire only for the
+/// agent config that is active, so the installer updates each config the
+/// user already has. It never invents one — a fabricated agent config
+/// would not be the active agent (the built-in default has no file on
+/// disk), so hooks in it would never fire and the install would look
+/// successful while capturing nothing.
+fn apply_to_kiro_cli_agent_configs(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    // Resolve targets before staging anything so a missing-agent-config
+    // bail leaves no half-done install behind.
+    let targets: Vec<PathBuf> = match &args.config_file {
+        Some(p) => {
+            anyhow::ensure!(
+                p.is_file(),
+                "{} does not exist. Kiro CLI v2 hooks live inside an existing agent config; \
+                 create one first (`kiro-cli agent create`) and re-run. For Kiro v3, select \
+                 the explicit `--agent kiro-cli-v3` standalone-hook target instead.",
+                p.display()
+            );
+            vec![p.clone()]
+        }
+        None => list_kiro_cli_agent_configs(&kiro_cli_agents_dir()?)?,
+    };
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "no Kiro CLI agent configs found in {}. The v2 engine only fires hooks defined in an \
+         agent config and the built-in default agent has no file on disk, so create an agent \
+         first (`kiro-cli agent create`, then `kiro-cli agent set-default <name>`) and re-run. \
+         For Kiro v3, select the explicit `--agent kiro-cli-v3` standalone-hook target instead.",
+        kiro_cli_agents_dir()?.display()
+    );
+    let prepared = preflight_kiro_cli_agent_configs(
+        targets,
+        hooks_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        args.project_strategy,
+    )?;
+
+    let staged = stage_hook_scripts(hooks_dir, "kiro-cli")?;
+    let command_dir = staged_command_dir(&staged, "kiro-cli");
+    for (path, strategy) in prepared {
+        let outcome = merge_kiro_cli_agent_hooks(
+            &command_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            strategy.and_then(ProjectStrategyArg::baked),
+            &path,
+        )?;
+        println!(
+            "✓ {} {} ({})",
+            outcome.verb(),
+            path.display(),
+            match outcome {
+                ApplyOutcome::Created => "new file",
+                ApplyOutcome::Updated => "backup written next to it",
+                ApplyOutcome::NoOp => "already up to date",
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Parse and validate every Kiro v2 target before staging scripts or writing
+/// any config. The strategy is recovered per file because Kiro can update
+/// several independently-configured agents in one invocation.
+fn preflight_kiro_cli_agent_configs(
+    targets: Vec<PathBuf>,
+    command_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    explicit_strategy: Option<ProjectStrategyArg>,
+) -> Result<Vec<(PathBuf, Option<ProjectStrategyArg>)>> {
+    let mut prepared = Vec::with_capacity(targets.len());
+    for path in targets {
+        let existing =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let strategy =
+            explicit_strategy.or_else(|| baked_project_strategy(AgentChoice::KiroCli, &existing));
+        render_kiro_cli_agent_hooks(
+            &existing,
+            command_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            strategy.and_then(ProjectStrategyArg::baked),
+            &path,
+        )?;
+        prepared.push((path, strategy));
+    }
+    Ok(prepared)
+}
+
+/// Merge ai-memory's v2 hook entries into one Kiro agent config,
+/// preserving every third-party entry under the same triggers and every
+/// non-hook field of the agent definition.
+fn merge_kiro_cli_agent_hooks(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<ApplyOutcome> {
+    apply_atomic(config_path, |existing| {
+        render_kiro_cli_agent_hooks(
+            existing,
+            staged,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy,
+            config_path,
+        )
+    })
+}
+
+fn render_kiro_cli_agent_hooks(
+    existing: &str,
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<String> {
+    let our_hooks = build_kiro_cli_v2_hooks_value(
+        staged,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    mutate_json(existing, |root| {
+        let hooks = root
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "`hooks` in {} is present but not an object",
+                    config_path.display()
+                )
+            })?;
+        for (event, value) in &our_hooks {
+            overlay_kiro_cli_event_hooks(hooks, event, value);
+        }
+        Ok(())
+    })
+}
+
+fn apply_to_kiro_cli_v3_hooks(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(path) => path.clone(),
+        None => kiro_cli_v3_hooks_path()?,
+    };
+    let existing = match fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+
+    // Validate before staging scripts so an incompatible registration file
+    // cannot leave a partial installation behind.
+    render_kiro_cli_v3_hooks(
+        &existing, hooks_dir, server_url, auth_token, data_dir, strategy, &path,
+    )?;
+
+    let staged = stage_hook_scripts(hooks_dir, "kiro-cli")?;
+    let command_dir = staged_command_dir(&staged, "kiro-cli");
+    let outcome = merge_kiro_cli_v3_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+fn merge_kiro_cli_v3_hooks(
+    command_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<ApplyOutcome> {
+    apply_atomic(config_path, |existing| {
+        render_kiro_cli_v3_hooks(
+            existing,
+            command_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy,
+            config_path,
+        )
+    })
+}
+
+fn render_kiro_cli_v3_hooks(
+    existing: &str,
+    command_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<String> {
+    let desired = build_kiro_cli_v3_hooks_value(
+        command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let desired_hooks = desired
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .expect("static Kiro v3 hook payload has a hooks array")
+        .clone();
+
+    mutate_json(existing, |root| {
+        match root.get("version") {
+            Some(serde_json::Value::String(version)) if version == "v1" => {}
+            Some(serde_json::Value::String(version)) => anyhow::bail!(
+                "unsupported Kiro hook schema version `{version}` in {}; expected `v1`",
+                config_path.display()
+            ),
+            Some(_) => anyhow::bail!(
+                "`version` in {} is present but not a string",
+                config_path.display()
+            ),
+            None => {
+                root.insert(
+                    "version".to_string(),
+                    serde_json::Value::String("v1".to_string()),
+                );
+            }
+        }
+
+        let hooks = root
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .with_context(|| {
+                format!(
+                    "`hooks` in {} is present but not an array",
+                    config_path.display()
+                )
+            })?;
+
+        for entry in hooks.iter() {
+            if let Some(name) = entry.get("name").and_then(serde_json::Value::as_str)
+                && kiro_cli_v3_hook_name_is_reserved(name)
+                && !is_ai_memory_kiro_v3_hook_entry(entry)
+            {
+                anyhow::bail!(
+                    "Kiro v3 hook `{name}` in {} uses ai-memory's reserved name but is not an \
+                     ai-memory hook; rename it before installing",
+                    config_path.display()
+                );
+            }
+        }
+        hooks.retain(|entry| !is_ai_memory_kiro_v3_hook_entry(entry));
+        hooks.extend(desired_hooks);
+        Ok(())
+    })
+}
+
+fn kiro_cli_v3_hook_name_is_reserved(name: &str) -> bool {
+    KIRO_CLI_V3_EVENTS.iter().any(|(_, script)| {
+        script
+            .strip_suffix(".sh")
+            .is_some_and(|stem| name == format!("ai-memory-{stem}"))
+    })
+}
+
+pub(crate) fn is_ai_memory_kiro_v3_hook_entry(entry: &serde_json::Value) -> bool {
+    let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(trigger) = entry.get("trigger").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let known_pair = KIRO_CLI_V3_EVENTS.iter().any(|(expected_trigger, script)| {
+        *expected_trigger == trigger
+            && script
+                .strip_suffix(".sh")
+                .is_some_and(|stem| name == format!("ai-memory-{stem}"))
+    });
+    known_pair
+        && entry
+            .pointer("/action/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("command")
+        && entry
+            .pointer("/action/command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_ai_memory_kiro_hook_command)
+}
+
+/// Every `*.json` agent config in the Kiro CLI global agents directory,
+/// sorted for deterministic apply order. A missing directory is an empty
+/// list, not an error — the caller decides how to report it.
+pub(crate) fn list_kiro_cli_agent_configs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+    let mut configs = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+        let path = entry.path();
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        if metadata.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            configs.push(path);
+        }
+    }
+    configs.sort();
+    Ok(configs)
+}
+
+pub(crate) fn is_ai_memory_kiro_hook_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let generated_script =
+        lower.contains("/hooks/kiro-cli/") || lower.contains("\\hooks\\kiro-cli\\");
+    let ai_memory_executable = lower.contains("ai-memory") || lower.contains("ai_memory");
+    let native_hook = ai_memory_executable
+        && lower.contains(" hook ")
+        && lower.contains("--agent kiro-cli")
+        && lower.contains("--server-url");
+    (generated_script || native_hook)
+        && KIRO_CLI_V2_EVENTS.iter().any(|(_, script)| {
+            let stem = script.trim_end_matches(".sh");
+            lower.contains(script)
+                || lower.contains(&format!("{stem}.ps1"))
+                || lower.contains(&format!("--event {stem}"))
+        })
+}
+
 /// Generate an OpenCode plugin at `~/.config/opencode/plugins/ai-memory.ts`.
 ///
 /// OpenCode's integration surface is a TypeScript plugin, not a JSON
@@ -1038,7 +2594,7 @@ fn apply_to_opencode_plugin(
         Some(p) => p.clone(),
         None => opencode_plugin_path()?,
     };
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_opencode_plugin(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -1091,6 +2647,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
         return format!(
             "{TS_TOML_FLAG}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+  const managedRun = process.env.AI_MEMORY_RUN_ID;
+  if (managedRun) url.searchParams.set("managed_run", managedRun);
   const marker = findMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
@@ -1120,6 +2678,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
         );
     };
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+  const managedRun = process.env.AI_MEMORY_RUN_ID;
+  if (managedRun) url.searchParams.set("managed_run", managedRun);
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
   let workspace: string | undefined;
@@ -1185,6 +2745,7 @@ fn build_opencode_plugin(
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let capture_policy = ts_capture_policy_v1();
     format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -1193,13 +2754,14 @@ fn build_opencode_plugin(
 
 import type {{ Plugin }} from "@opencode-ai/plugin";
 import {{ execFileSync }} from "node:child_process";
-import {{ existsSync, readFileSync }} from "node:fs";
-import {{ basename, dirname, join, resolve }} from "node:path";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
+import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "open-code";
 {token_line}
+{capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
   if (typeof AbortSignal === "undefined") return undefined;
@@ -1301,10 +2863,24 @@ function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
   const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {{
+    boundary = home;
+  }} else if (home) {{
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {{
+      if (existsSync(join(probe, ".git"))) {{
+        boundary = probe;
+        break;
+      }}
+      probe = dirname(probe);
+    }}
+    boundary ??= dir;
+  }}
   while (dir && dir !== dirname(dir)) {{
     const marker = join(dir, ".ai-memory.toml");
     if (existsSync(marker)) return marker;
-    if (home && dir === home) return undefined;
+    if (boundary && dir === boundary) return undefined;
     dir = dirname(dir);
   }}
   return undefined;
@@ -1363,7 +2939,7 @@ function textFromParts(parts: unknown): string {{
 
 const sessionCwds = new Map<string, string>();
 const startedSessions = new Set<string>();
-const handoffChecked = new Set<string>();
+const handoffFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
 
 function cwdFor(id: string | undefined, directory: string): string {{
@@ -1378,7 +2954,12 @@ function startSession(id: string | undefined, cwd: string, extra: Record<string,
   if (!id || startedSessions.has(id)) return;
   startedSessions.add(id);
   rememberCwd(id, cwd);
-  postHook("session-start", {{ sessionID: id, cwd, ...extra }});
+  // Generated integrations inject through fetchHandoff below. In managed mode
+  // a queued SessionStart response is not model-visible and must not consume
+  // the workstream context before that synchronous fetch receives it.
+  if (!process.env.AI_MEMORY_RUN_ID) {{
+    postHook("session-start", {{ sessionID: id, cwd, ...extra }});
+  }}
 }}
 
 function endSession(id: string | undefined, directory: string, cwd?: string): void {{
@@ -1386,7 +2967,7 @@ function endSession(id: string | undefined, directory: string, cwd?: string): vo
   const resolvedCwd = cwd || cwdFor(id, directory);
   postHook("session-end", {{ sessionID: id, cwd: resolvedCwd }});
   sessionCwds.delete(id);
-  handoffChecked.delete(id);
+  handoffFetches.delete(id);
   preCompactLast.delete(id);
 }}
 
@@ -1405,17 +2986,20 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
   try {{
-    enqueueHook(event, url, payload);
+    enqueueHook(event, url, policy.payload);
   }} catch (_e) {{
     // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  if (id) url.searchParams.set("session_id", id);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -1508,10 +3092,14 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
     }},
     "experimental.chat.system.transform": async (input, output) => {{
       const id = sessionID(input);
-      if (!id || handoffChecked.has(id)) return;
-      handoffChecked.add(id);
+      if (!id) return;
       startSession(id, cwdFor(id, directory));
-      const handoff = await fetchHandoff(cwdFor(id, directory));
+      let pending = handoffFetches.get(id);
+      if (!pending) {{
+        pending = fetchHandoff(cwdFor(id, directory), id);
+        handoffFetches.set(id, pending);
+      }}
+      const handoff = await pending;
       if (handoff) (output as any).system.push(handoff);
     }},
   }};
@@ -1524,7 +3112,90 @@ export default AiMemoryHooks;
     )
 }
 
-/// Generate an Oh My Pi extension at `~/.omp/agent/extensions/ai-memory.ts`.
+/// Warn when Pi and OMP resolve to the same extensions directory.
+///
+/// Agent-distinct filenames stop the two installs from overwriting each
+/// other, but they do not make sharing a directory safe. OMP discovers
+/// **every** direct `*.ts` under its extensions directory, so with both
+/// files present each agent loads both extensions — and since the Pi
+/// extension is the OMP one with `const AGENT` swapped, and neither guards
+/// on its host, every lifecycle event is captured twice under two different
+/// agent identities.
+///
+/// That is not a regression this installer can fix by itself: both agents
+/// honour the same `PI_CODING_AGENT_DIR`, so the collision is upstream. What
+/// it can do is refuse to be silent about it, and name the two ways out.
+fn warn_if_agents_share_extensions_dir(this_agent: &str, this_path: &Path) {
+    let other = match this_agent {
+        "pi" => omp_extension_path(None),
+        "omp" => pi_extension_path(),
+        _ => return,
+    };
+    let Ok(other_path) = other else { return };
+    let (Some(a), Some(b)) = (this_path.parent(), other_path.parent()) else {
+        return;
+    };
+    if a != b {
+        return;
+    }
+    eprintln!(
+        "warning: Pi and OMP both resolve to {} — they share PI_CODING_AGENT_DIR.\n\
+         \x20 Each agent loads every *.ts in that directory, so installing both\n\
+         \x20 captures each event twice, once as `pi` and once as `omp`.\n\
+         \x20 Give them separate homes, or scope OMP to a profile:\n\
+         \x20     ai-memory install-hooks --agent omp --profile <name> --apply",
+        a.display()
+    );
+}
+
+/// Remove a pre-rename `ai-memory.ts` sitting beside the new agent-distinct
+/// file, so the agent does not load both.
+///
+/// **Only removes a file this tool generated.** `uninstall` gates every
+/// delete behind `generated_file_is_ours`, and `removal.rs` asserts that a
+/// user-owned file which merely happens to be named `ai-memory.ts` survives
+/// (`uninstall_omp_extension_deletes_only_generated_file`). An unconditional
+/// delete here would let `install-hooks --apply` destroy exactly what
+/// `uninstall` refuses to touch — a worse outcome than the stale file,
+/// because it is silent and hits a path the operator did not ask to modify.
+///
+/// The marker is the generated banner plus the agent constant, matching the
+/// pair `generated_file_is_ours` checks.
+///
+/// `agent` scopes the match to the caller's own agent. Pi and OMP can share
+/// one extensions directory (both honour `PI_CODING_AGENT_DIR`), and a
+/// legacy `ai-memory.ts` there belongs to whichever installed last. Removing
+/// the *other* agent's file would silently stop its capture until the
+/// operator happened to reinstall it.
+fn remove_legacy_extension(new_path: &Path, agent: &str) {
+    let legacy = new_path.with_file_name("ai-memory.ts");
+    if legacy == new_path || !legacy.exists() {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(&legacy) else {
+        return;
+    };
+    let banner = format!("Auto-generated by `ai-memory install-hooks --agent {agent} --apply`");
+    let agent_const = format!("const AGENT = \"{agent}\";");
+    let ours = content.contains(&banner) && content.contains(&agent_const);
+    if !ours {
+        println!(
+            "note: left {} in place — it was not generated by this agent's \
+             installer. Remove it yourself if the agent should stop loading it.",
+            legacy.display()
+        );
+        return;
+    }
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => println!("✓ Removed superseded extension {}", legacy.display()),
+        Err(e) => eprintln!(
+            "[ai-memory] warning: could not remove superseded extension {}: {e}",
+            legacy.display()
+        ),
+    }
+}
+
+/// Generate an Oh My Pi extension at `~/.omp/agent/extensions/ai-memory-omp.ts`.
 ///
 /// OMP discovers direct `*.ts` / `*.js` files under `~/.omp/agent/extensions/`
 /// at startup, so no separate settings merge is needed. The extension uses OMP's
@@ -1535,7 +3206,7 @@ fn apply_to_omp_extension(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = resolve_omp_extension_path(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_omp_extension(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -1549,6 +3220,10 @@ fn apply_to_omp_extension(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+
+    warn_if_agents_share_extensions_dir("omp", &path);
+    remove_legacy_extension(&path, "omp");
+
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
         println!(
@@ -1560,12 +3235,40 @@ fn apply_to_omp_extension(
     Ok(())
 }
 
+fn omp_extension_hint_in(
+    env_override: Option<std::ffi::OsString>,
+    profile: Option<&str>,
+) -> String {
+    omp_extension_path_in(env_override, profile).map_or_else(
+        |_| {
+            if let Some(name) = profile {
+                format!("~/.omp/profiles/{}/agent/extensions/ai-memory-omp.ts", name)
+            } else {
+                "~/.omp/agent/extensions/ai-memory-omp.ts".to_string()
+            }
+        },
+        |p| p.display().to_string(),
+    )
+}
+
+/// See [`omp_extension_hint_in`]; same reasoning for Pi.
+fn pi_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
+    pi_extension_path_in(env_override).map_or_else(
+        |_| "~/.pi/agent/extensions/ai-memory-pi.ts".to_string(),
+        |p| p.display().to_string(),
+    )
+}
+
 fn render_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    profile: Option<&str>,
 ) -> Result<()> {
-    println!("// Oh My Pi / OMP extension — write to ~/.omp/agent/extensions/ai-memory.ts");
+    println!(
+        "// Oh My Pi / OMP extension — write to {}",
+        omp_extension_hint_in(std::env::var_os("PI_CODING_AGENT_DIR"), profile)
+    );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OMP after changing extensions; config is loaded at startup.");
     println!();
@@ -1580,7 +3283,13 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
     if let Some(p) = &args.config_file {
         return Ok(p.clone());
     }
-    omp_extension_path()
+    // See `omp_extension_path`: bind before borrowing.
+    let env_profile = std::env::var_os("OMP_PROFILE");
+    let profile = args
+        .profile
+        .as_deref()
+        .or_else(|| env_profile.as_ref().and_then(|s| s.to_str()));
+    omp_extension_path(profile)
 }
 
 fn apply_to_pi_extension(
@@ -1589,7 +3298,7 @@ fn apply_to_pi_extension(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_pi_extension(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -1603,6 +3312,10 @@ fn apply_to_pi_extension(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+
+    warn_if_agents_share_extensions_dir("pi", &path);
+    remove_legacy_extension(&path, "pi");
+
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
         println!("Pi loads TypeScript extensions from ~/.pi/agent/extensions/ on next start.");
@@ -1616,7 +3329,10 @@ fn render_pi_extension(
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
 ) -> Result<()> {
-    println!("// Pi extension — write to ~/.pi/agent/extensions/ai-memory.ts");
+    println!(
+        "// Pi extension — write to {}",
+        pi_extension_hint_in(std::env::var_os("PI_CODING_AGENT_DIR"))
+    );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart Pi after changing extensions; MCP tools are bridged by this file.");
     println!();
@@ -1757,6 +3473,7 @@ fn build_omp_extension(
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let capture_policy = ts_capture_policy_v1();
     format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent omp --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -1764,13 +3481,14 @@ fn build_omp_extension(
 // re-run.
 
 import {{ execFileSync }} from "node:child_process";
-import {{ existsSync, readFileSync }} from "node:fs";
-import {{ basename, dirname, join, resolve }} from "node:path";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
+import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "omp";
 {token_line}
+{capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
   if (typeof AbortSignal === "undefined") return undefined;
@@ -1850,10 +3568,24 @@ function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
   const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {{
+    boundary = home;
+  }} else if (home) {{
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {{
+      if (existsSync(join(probe, ".git"))) {{
+        boundary = probe;
+        break;
+      }}
+      probe = dirname(probe);
+    }}
+    boundary ??= dir;
+  }}
   while (dir && dir !== dirname(dir)) {{
     const marker = join(dir, ".ai-memory.toml");
     if (existsSync(marker)) return marker;
-    if (home && dir === home) return undefined;
+    if (boundary && dir === boundary) return undefined;
     dir = dirname(dir);
   }}
   return undefined;
@@ -1942,7 +3674,12 @@ function startSession(ctx: any, extra: Record<string, unknown> = {{}}): void {{
   const id = sessionID(ctx);
   if (!id || startedSessions.has(id)) return;
   startedSessions.add(id);
-  postHook("session-start", {{ ...sessionPayload(ctx), ...extra }});
+  // Generated integrations inject through fetchHandoff below. In managed mode
+  // a queued SessionStart response is not model-visible and must not consume
+  // the workstream context before that synchronous fetch receives it.
+  if (!process.env.AI_MEMORY_RUN_ID) {{
+    postHook("session-start", {{ ...sessionPayload(ctx), ...extra }});
+  }}
 }}
 
 function postPreCompact(ctx: any): void {{
@@ -1960,17 +3697,20 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
   try {{
-    enqueueHook(event, url, payload);
+    enqueueHook(event, url, policy.payload);
   }} catch (_e) {{
     // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  if (id) url.searchParams.set("session_id", id);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -2000,7 +3740,7 @@ export default function AiMemoryExtension(api: any): void {{
     const id = sessionID(ctx);
     if (!id || handoffChecked.has(id)) return;
     handoffChecked.add(id);
-    const handoff = await fetchHandoff(ctx?.cwd ?? "");
+    const handoff = await fetchHandoff(ctx?.cwd ?? "", id);
     if (!handoff) return;
     return {{
       message: {{
@@ -2122,6 +3862,10 @@ fn render_agent_output(
     if let Some(instruction) = manual_agent_project_strategy_instruction(project_strategy) {
         out.push_str(&instruction);
         out.push('\n');
+    }
+    if label == "antigravity-cli" {
+        out.push('\n');
+        out.push_str(ANTIGRAVITY_FINALIZATION_GUIDANCE);
     }
     out
 }
@@ -2406,18 +4150,43 @@ fn exe_dir_guess() -> Option<PathBuf> {
 // CLAUDE_CODE_EVENTS + build_claude_code_payload now live in
 // `super::render_shared`, shared with `setup-agent`.
 
+/// Which optional capture surfaces the generated Claude Code settings should
+/// include.
+///
+/// Grouped rather than passed as two positional bools: at the call site
+/// `true, false` said nothing about which surface was which, and the pair is
+/// exactly the privacy-relevant part of this install — worth naming.
+#[derive(Debug, Clone, Copy)]
+struct ClaudeCaptureScope {
+    /// Include the assistant-message capture hook (double opt-in, off by
+    /// default).
+    assistant: bool,
+    /// Include the `UserPromptSubmit` hook. When false the entry is omitted
+    /// entirely, so the agent never emits prompt text at all.
+    prompts: bool,
+}
+
 fn render_claude_code(
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    settings_path: &Path,
+    capture: ClaudeCaptureScope,
 ) -> Result<()> {
+    let ClaudeCaptureScope {
+        assistant: capture_assistant,
+        prompts: capture_prompts,
+    } = capture;
     // Soft check: warn (don't bail) if a script is missing. The user
     // may be running this command inside docker against a host path
     // that exists only on the host's filesystem — bailing would
     // sabotage the docker-only flow `setup-agent` enables.
-    for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+    for (event, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+        if !capture_prompts && event == CLAUDE_PROMPT_EVENT {
+            continue;
+        }
         let script = hook_script_for_claude_code(script);
         let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
@@ -2430,21 +4199,31 @@ fn render_claude_code(
             );
         }
     }
-    let payload = build_claude_code_payload_with_data_dir(
-        hooks_dir,
-        server_url,
-        auth_token,
-        Some(data_dir),
-        project_strategy,
+    let payload = configure_claude_prompt_capture(
+        build_claude_code_payload_with_data_dir(
+            hooks_dir,
+            server_url,
+            auth_token,
+            Some(data_dir),
+            project_strategy,
+            capture_assistant,
+        ),
+        capture_prompts,
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing claude code hook config")?;
-    println!("# Claude Code hook config — merge into ~/.claude/settings.json");
+    println!(
+        "# Claude Code hook config — merge into {}",
+        settings_path.display()
+    );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.claude/settings.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            settings_path.display()
+        );
     }
     println!();
     println!("{serialized}");
@@ -2482,12 +4261,19 @@ fn render_grok(
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing grok hook config")?;
-    println!("# Grok Build CLI hook config — write to ~/.grok/hooks/ai-memory.json");
+    let config_path = grok_hooks_path()?;
+    println!(
+        "# Grok Build CLI hook config — write to {}",
+        config_path.display()
+    );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.grok/hooks/ai-memory.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            config_path.display()
+        );
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but handoff injection does not. Recover a prior session's");
@@ -2515,7 +4301,7 @@ fn apply_to_zero_hooks(
         Some(p) => p.clone(),
         None => zero_hooks_path()?,
     };
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = super::render_shared::build_zero_hooks_config(
         server_url,
         auth_token,
@@ -2604,15 +4390,300 @@ fn render_zero(
     Ok(())
 }
 
+fn render_devin(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in super::render_shared::DEVIN_EVENTS {
+        let script = hook_script_for_claude_code(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let payload = build_devin_payload_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing devin hook config")?;
+    println!(
+        "# Devin CLI hook config — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key"
+    );
+    println!("# Hook scripts: {}", hooks_dir.display());
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!(
+            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
+        );
+    }
+    println!(
+        "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart."
+    );
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print Kimi Code's `[[hooks]]` TOML fragment to stdout (dry-run
+/// counterpart of [`apply_to_kimi_code_config`]). Rendered through the
+/// same upsert path the apply mode uses, so the printout is byte-for-
+/// byte what `--apply` would append to config.toml.
+fn render_kimi_code(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in KIMI_CODE_EVENTS {
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let commands = kimi_code_hook_commands(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut doc = toml_edit::DocumentMut::new();
+    upsert_kimi_code_hooks(&mut doc, &commands)?;
+    println!("# Kimi Code hook config — merge into $KIMI_CODE_HOME/config.toml");
+    println!("# (~/.kimi-code/config.toml when KIMI_CODE_HOME is unset), or re-run");
+    println!("# with --apply to merge it in place, preserving providers/model and");
+    println!("# any third-party [[hooks]] entries already in the file.");
+    println!("# Hook scripts: {}", hooks_dir.display());
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat config.toml as sensitive (chmod 600).");
+    }
+    println!();
+    print!("{doc}");
+    Ok(())
+}
+
+fn render_kiro_cli(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in KIRO_CLI_V2_EVENTS {
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let hooks = build_kiro_cli_v2_hooks_value(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    println!("// Kiro CLI v2-engine hooks — merge the \"hooks\" object into each");
+    println!("// agent config under $KIRO_HOME/agents (~/.kiro/agents when unset),");
+    println!("// or re-run with --apply to merge into every existing agent config,");
+    println!("// preserving third-party hook entries. The v2 engine fires hooks");
+    println!("// only for the active agent config; the built-in default agent has");
+    println!("// no file, so create one first (`kiro-cli agent create`). Do not reuse");
+    println!("// this v2 registration for v3; use `--agent kiro-cli-v3` instead.");
+    println!("// Hook scripts: {}", hooks_dir.display());
+    println!("// AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("//       Treat agent configs as sensitive (chmod 600).");
+    }
+    println!();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+            .expect("static hook payload serializes")
+    );
+    Ok(())
+}
+
+fn render_kiro_cli_v3(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    for (_, script) in KIRO_CLI_V3_EVENTS {
+        let abs = hooks_dir.join(hook_script_for_current_platform(script).as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. If this command is running \
+                 inside docker against a host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let payload = build_kiro_cli_v3_hooks_value(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    println!("// Kiro CLI v3 hooks — write this document to");
+    println!("// $KIRO_HOME/hooks/ai-memory.json (~/.kiro/hooks/ai-memory.json when unset),");
+    println!("// or re-run with --apply for an atomic, idempotent merge.");
+    println!("// Hook scripts: {}", hooks_dir.display());
+    println!("// AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("//       Treat the hook file as sensitive (chmod 600).");
+    }
+    println!();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("static hook payload serializes")
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::ProjectStrategyArg;
+    use crate::commands::render_shared::KIRO_CLI_V2_SESSION_START_MAX_OUTPUT;
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(any(unix, windows))]
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn capture_assistant_allowed_only_for_claude_native() {
+        use crate::cli::AgentChoice::*;
+        // Every non-Claude agent is rejected regardless of platform (#196): the
+        // opt-in cannot take effect for them, so the installer must bail.
+        for agent in [
+            Codex,
+            CommandCode,
+            Cursor,
+            GeminiCli,
+            OpenCode,
+            Pi,
+            Omp,
+            Openclaw,
+            AntigravityCli,
+            Grok,
+            Zero,
+            Devin,
+            KimiCode,
+            KiroCli,
+            KiroCliV3,
+        ] {
+            assert!(
+                !capture_assistant_allowed(agent),
+                "{agent:?} must not allow --capture-assistant"
+            );
+        }
+        // Claude Code tracks the native-platform gate exactly.
+        assert_eq!(
+            capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+    }
+
+    #[test]
+    fn prompt_capture_options_are_claude_code_only() {
+        use crate::cli::AgentChoice::*;
+        assert!(prompt_capture_options_allowed(ClaudeCode));
+        for agent in [
+            Codex,
+            CommandCode,
+            Cursor,
+            GeminiCli,
+            OpenCode,
+            Pi,
+            Omp,
+            Openclaw,
+            AntigravityCli,
+            Grok,
+            Zero,
+            Devin,
+            KimiCode,
+            KiroCli,
+            KiroCliV3,
+        ] {
+            assert!(!prompt_capture_options_allowed(agent), "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn baked_prompt_capture_reads_only_owned_claude_hooks() {
+        let enabled = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "command": "ai-memory hook --event user-prompt" }] }]
+            }
+        });
+        assert_eq!(
+            baked_claude_prompt_capture(&enabled.to_string()),
+            Some(true)
+        );
+
+        let disabled = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "command": "third-party prompt guard" }] }]
+            }
+        });
+        assert_eq!(
+            baked_claude_prompt_capture(&disabled.to_string()),
+            Some(false)
+        );
+
+        let unrelated = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [{ "command": "third-party prompt guard" }] }]
+            }
+        });
+        assert_eq!(baked_claude_prompt_capture(&unrelated.to_string()), None);
+    }
 
     #[cfg(unix)]
     fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
@@ -2684,6 +4755,88 @@ mod tests {
     }
 
     #[test]
+    fn command_code_apply_uses_only_stable_events_and_preserves_user_settings() {
+        let source = TempDir::new().unwrap();
+        stub_scripts(
+            source.path(),
+            &[
+                "session-start.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "stop.sh",
+            ],
+        );
+        let staging = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("settings.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "theme": "dark",
+                "hooks": {
+                    "SessionStart": [{
+                        "hooks": [{"type": "command", "command": "third-party"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::CommandCode,
+            config_file: Some(config_path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_command_code_settings_in(
+            source.path(),
+            "http://memory:49374",
+            Some("token"),
+            config_dir.path(),
+            staging.path(),
+            &args,
+        )
+        .unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_command_code_settings_in(
+            source.path(),
+            "http://memory:49374",
+            Some("token"),
+            config_dir.path(),
+            staging.path(),
+            &args,
+        )
+        .unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(first, second, "re-apply must be idempotent");
+
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["theme"], "dark");
+        let hooks = value["hooks"].as_object().unwrap();
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            let entries = hooks[event].as_array().unwrap();
+            let ours = entries
+                .iter()
+                .find(|entry| serde_json::to_string(entry).unwrap().contains("ai-memory"))
+                .unwrap_or_else(|| panic!("missing ai-memory entry for {event}"));
+            assert!(ours.get("matcher").is_none(), "event: {event}");
+        }
+        assert_eq!(
+            hooks["SessionStart"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| serde_json::to_string(entry)
+                    .unwrap()
+                    .contains("third-party"))
+                .count(),
+            1,
+            "third-party hook must survive"
+        );
+        assert_eq!(hooks.len(), COMMAND_CODE_PROFILE.events.len());
+    }
+
+    #[test]
     fn overlay_event_hooks_inserts_when_event_absent() {
         let mut hooks = serde_json::Map::new();
         let ours = serde_json::json!([
@@ -2751,15 +4904,233 @@ mod tests {
 
     fn default_hook_args() -> InstallHooksArgs {
         InstallHooksArgs {
+            profile: None,
             agent: AgentChoice::OpenCode,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_prompts: false,
             hooks_dir: None,
-            server_url: DEFAULT_SERVER_URL.into(),
+            server_url: None,
             auth_token: None,
             as_user: None,
             apply: true,
             config_file: None,
-            project_strategy: ProjectStrategyArg::Basename,
+            project_strategy: Some(ProjectStrategyArg::Basename),
         }
+    }
+
+    // ── #issue project-strategy preservation on re-apply ─────────────
+
+    #[test]
+    fn project_strategy_from_text_reads_every_form() {
+        // Shell env prefix (Claude Code / POSIX script hooks).
+        assert_eq!(
+            project_strategy_from_text(
+                "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/s.sh"
+            ),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        // PowerShell form.
+        assert_eq!(
+            project_strategy_from_text("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'; & /x/s.ps1"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        // Native flag, both spellings.
+        assert_eq!(
+            project_strategy_from_text("ai-memory hook --project-strategy repo-root run"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        assert_eq!(
+            project_strategy_from_text("ai-memory hook --project-strategy=repo_root"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        assert_eq!(
+            project_strategy_from_text("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+    }
+
+    #[test]
+    fn baked_project_strategy_reads_owned_json_for_every_json_agent() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{
+                        "command": "third-party",
+                        "args": ["--project-strategy", "repo-root"]
+                    }]},
+                    { "hooks": [{
+                        "command": "/bin/ai-memory",
+                        "args": [
+                            "hook", "--event", "session-start", "--agent", "claude-code",
+                            "--server-url", "http://h", "--project-strategy", "repo-root"
+                        ]
+                    }]}
+                ]
+            }
+        })
+        .to_string();
+        for agent in [
+            AgentChoice::ClaudeCode,
+            AgentChoice::Codex,
+            AgentChoice::Cursor,
+            AgentChoice::GeminiCli,
+            AgentChoice::AntigravityCli,
+            AgentChoice::Grok,
+            AgentChoice::Zero,
+            AgentChoice::Devin,
+        ] {
+            assert_eq!(
+                baked_project_strategy(agent, &existing),
+                Some(ProjectStrategyArg::RepoRoot),
+                "{agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn baked_project_strategy_ignores_unowned_json_entry() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{
+                    "command": "third-party",
+                    "args": ["--project-strategy", "repo-root"]
+                }]}]
+            }
+        })
+        .to_string();
+        assert_eq!(
+            baked_project_strategy(AgentChoice::ClaudeCode, &existing),
+            None
+        );
+    }
+
+    #[test]
+    fn baked_project_strategy_reads_owned_kimi_toml_only() {
+        let existing = r#"
+[[hooks]]
+event = "UserPromptSubmit"
+command = "third-party --project-strategy repo-root"
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/ai-memory/session-start.sh"
+"#;
+        assert_eq!(
+            baked_project_strategy(AgentChoice::KimiCode, existing),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+    }
+
+    #[test]
+    fn baked_project_strategy_reads_every_owned_generated_integration() {
+        for (agent, name) in [
+            (AgentChoice::OpenCode, "opencode"),
+            (AgentChoice::Pi, "pi"),
+            (AgentChoice::Omp, "omp"),
+            (AgentChoice::Openclaw, "openclaw"),
+        ] {
+            let existing = format!(
+                "// Auto-generated by `ai-memory install-hooks --agent {name} --apply`.\n\
+                 const DEFAULT_PROJECT_STRATEGY = \"repo-root\";\n"
+            );
+            assert_eq!(
+                baked_project_strategy(agent, &existing),
+                Some(ProjectStrategyArg::RepoRoot),
+                "{agent:?}"
+            );
+        }
+
+        let unowned = "// user extension\nconst DEFAULT_PROJECT_STRATEGY = \"repo-root\";\n";
+        assert_eq!(baked_project_strategy(AgentChoice::OpenCode, unowned), None);
+    }
+
+    #[test]
+    fn install_project_strategy_preserves_baked_when_flag_absent() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            serde_json::json!({
+                "hooks": { "SessionStart": [{ "hooks": [{
+                    "command": "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/ai-memory/session-start.sh"
+                }]}] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(cfg),
+            project_strategy: None,
+            ..default_hook_args()
+        };
+        // A bare re-apply (e.g. `ai-memory upgrade`) must keep repo-root.
+        assert_eq!(
+            install_project_strategy(&args),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+    }
+
+    #[test]
+    fn install_project_strategy_explicit_basename_overrides_existing() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            serde_json::json!({
+                "hooks": { "SessionStart": [{ "hooks": [{
+                    "command": "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/ai-memory/session-start.sh"
+                }]}] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(cfg),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            ..default_hook_args()
+        };
+        // Explicit basename is honored, not overridden by the baked repo-root.
+        assert_eq!(
+            install_project_strategy(&args),
+            Some(ProjectStrategyArg::Basename)
+        );
+    }
+
+    #[test]
+    fn install_project_strategy_none_when_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(tmp.path().join("nope.json")),
+            project_strategy: None,
+            ..default_hook_args()
+        };
+        assert_eq!(install_project_strategy(&args), None);
+    }
+
+    #[test]
+    fn install_project_strategy_reads_openclaw_entrypoint_below_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let entrypoint = tmp.path().join(openclaw_plugin::ENTRYPOINT_TS);
+        std::fs::write(
+            entrypoint,
+            "// Auto-generated by `ai-memory install-hooks --agent openclaw --apply`.\n\
+             const DEFAULT_PROJECT_STRATEGY = \"repo-root\";\n",
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Openclaw,
+            config_file: Some(tmp.path().to_path_buf()),
+            project_strategy: None,
+            ..default_hook_args()
+        };
+        assert_eq!(
+            install_project_strategy(&args),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
     }
 
     // ── P1.8 validate_as_user ────────────────────────────────────────
@@ -2839,6 +5210,26 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_manual_render_explains_explicit_finalization() {
+        let temp = TempDir::new().unwrap();
+        stub_scripts(temp.path(), &["session-start.sh", "stop.sh"]);
+        let output = render_agent_output(
+            "antigravity-cli",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[&ANTIGRAVITY_LIFECYCLE_EVENTS],
+        );
+
+        assert!(output.contains("`Stop` ends one execution loop, not the conversation"));
+        assert!(
+            output.contains("ai-memory finalize-session --agent antigravity-cli"),
+            "Antigravity install output must expose the supported finalizer: {output}"
+        );
+    }
+
+    #[test]
     fn manual_agent_render_uses_agent_profile_not_physical_bundle_listing() {
         let temp = TempDir::new().unwrap();
         stub_scripts(
@@ -2906,11 +5297,38 @@ mod tests {
             ..Config::default()
         };
         let mut args = default_hook_args();
-        args.server_url = "http://explicit:49374/".into();
+        args.server_url = Some("http://explicit:49374/".into());
 
         assert_eq!(
             effective_hook_server_url(&config, &args, None),
             "http://explicit:49374"
+        );
+    }
+
+    /// Regression (found 2026-07-12 during Devin real-acceptance A/B
+    /// testing): an explicit `--server-url` that happens to equal the
+    /// compiled-in `DEFAULT_SERVER_URL` must still win over a configured
+    /// (env/config.toml) server_url pointing somewhere else. Before the
+    /// `Option<String>` fix, `args.server_url` was a plain `String` with
+    /// `default_value_t = DEFAULT_SERVER_URL`, so clap couldn't
+    /// distinguish "operator explicitly typed the default value" from
+    /// "operator passed nothing at all" — both produced the same string,
+    /// so this exact case silently fell through to `AI_MEMORY_SERVER_URL`
+    /// / config.toml instead of honouring the explicit flag.
+    #[test]
+    fn hook_server_url_explicit_flag_matching_compiled_default_still_wins() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49375".into(),
+            ..Config::default()
+        };
+        let mut args = default_hook_args();
+        args.server_url = Some(DEFAULT_SERVER_URL.to_string());
+
+        assert_eq!(
+            effective_hook_server_url(&config, &args, None),
+            DEFAULT_SERVER_URL,
+            "an explicit --server-url matching the compiled default must not be \
+             silently overridden by a differently-configured server_url"
         );
     }
 
@@ -3044,6 +5462,7 @@ mod tests {
         .unwrap();
         let args = InstallHooksArgs {
             agent: AgentChoice::Zero,
+            capture_assistant: false,
             config_file: Some(path.clone()),
             ..default_hook_args()
         };
@@ -3085,6 +5504,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_hooks_dir_uses_devin_bundle_for_devin() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("devin")).unwrap();
+        fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
+
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Devin).unwrap();
+        assert_eq!(resolved, tmp.path().join("devin"));
+    }
+
+    #[test]
     fn opencode_mcp_inference_supplies_hook_origin_and_token() {
         let inferred = infer_json_mcp_config(
             r#"{
@@ -3108,13 +5537,92 @@ mod tests {
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
     }
 
+    /// Inferring the hook URL from Kimi Code's flavored mcp.json entry
+    /// must yield the bare origin — hooks POST to `<origin>/hook`.
+    #[test]
+    fn kimi_code_mcp_inference_strips_flavor_query_and_mcp_path() {
+        let inferred = infer_json_mcp_config(
+            r#"{
+              "mcpServers": {
+                "ai-memory": {
+                  "url": "http://homelab:49374/mcp?flavor=moonshot",
+                  "headers": { "Authorization": "Bearer secret-token" }
+                }
+              }
+            }"#,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn hook_server_url_from_mcp_url_strips_query_and_suffix() {
+        for (input, expected) in [
+            ("http://homelab:49374/mcp", Some("http://homelab:49374")),
+            ("http://homelab:49374", Some("http://homelab:49374")),
+            ("http://homelab:49374/", Some("http://homelab:49374")),
+            (
+                "http://homelab:49374/mcp?flavor=moonshot",
+                Some("http://homelab:49374"),
+            ),
+            (
+                "http://homelab:49374/mcp/?flavor=moonshot",
+                Some("http://homelab:49374"),
+            ),
+            // Reverse-proxy prefix survives; hooks POST under it.
+            (
+                "http://homelab:49374/wiki/mcp",
+                Some("http://homelab:49374/wiki"),
+            ),
+            (
+                "http://homelab:49374/wiki/mcp?flavor=moonshot",
+                Some("http://homelab:49374/wiki"),
+            ),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(
+                hook_server_url_from_mcp_url(input).as_deref(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn codex_mcp_inference_accepts_block_form_config() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.ai-memory]
 url = "http://homelab:49374/mcp"
 
 [mcp_servers.ai-memory.http_headers]
+Authorization = "Bearer secret-token"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn grok_mcp_inference_accepts_headers_key() {
+        let inferred = infer_toml_mcp_config(
+            r#"[mcp_servers.ai-memory]
+url = "http://homelab:49374/mcp"
+enabled = true
+
+[mcp_servers.ai-memory.headers]
 Authorization = "Bearer secret-token"
 "#,
         )
@@ -3135,7 +5643,7 @@ Authorization = "Bearer secret-token"
     /// server — must return None, not abort the whole install.
     #[test]
     fn codex_mcp_inference_returns_none_when_ai_memory_entry_missing() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.context7]
 url = "http://localhost:9000/mcp"
 
@@ -3155,7 +5663,7 @@ args = ["node-repl"]
     /// None rather than panic on the first index.
     #[test]
     fn codex_mcp_inference_returns_none_when_no_mcp_servers_table() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"# fresh codex config
 model = "gpt-5"
 "#,
@@ -3166,7 +5674,7 @@ model = "gpt-5"
     /// And the empty-file edge case the parser still accepts.
     #[test]
     fn codex_mcp_inference_returns_none_for_empty_doc() {
-        assert!(infer_codex_mcp_config("").is_none());
+        assert!(infer_toml_mcp_config("").is_none());
     }
 
     /// An ai-memory entry that exists but ships neither a `url` nor an
@@ -3175,7 +5683,7 @@ model = "gpt-5"
     /// present but unhelpful" — both yield None, neither panics.
     #[test]
     fn codex_mcp_inference_returns_none_for_bare_ai_memory_entry() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.ai-memory]
 # intentionally empty — no url, no headers.
 "#,
@@ -3200,8 +5708,10 @@ model = "gpt-5"
             "cursor",
             "gemini-cli",
             "grok",
+            "devin",
             "opencode",
             "antigravity-cli",
+            "kimi-code",
         ] {
             let dir = hooks_root.join(agent_dir);
             let mut sh = BTreeMap::new();
@@ -3265,6 +5775,57 @@ model = "gpt-5"
             .unwrap_or_else(|| panic!("{} missing agent value", path.display()))
             .to_string();
         (event, agent)
+    }
+
+    #[test]
+    fn devin_bundle_has_no_subagent_scripts() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_dir = hooks_root.join("devin");
+
+        for entry in fs::read_dir(&devin_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            assert!(
+                !stem.contains("subagent"),
+                "Devin bundle should not contain subagent scripts, found: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn devin_bundle_has_post_compaction_not_pre_compact() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_dir = hooks_root.join("devin");
+
+        assert!(
+            devin_dir.join("post-compaction.sh").is_file(),
+            "Devin bundle must have post-compaction.sh"
+        );
+        assert!(
+            devin_dir.join("post-compaction.ps1").is_file(),
+            "Devin bundle must have post-compaction.ps1"
+        );
+        assert!(
+            !devin_dir.join("pre-compact.sh").exists(),
+            "Devin bundle should not have pre-compact.sh"
+        );
+        assert!(
+            !devin_dir.join("pre-compact.ps1").exists(),
+            "Devin bundle should not have pre-compact.ps1"
+        );
     }
 
     fn extract_ps1_hook_metadata(path: &Path) -> (String, String) {
@@ -3500,8 +6061,13 @@ model = "gpt-5"
         assert!(generated.contains("async function drainHookQueue(): Promise<void>"));
         assert!(generated.contains("signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS)"));
         assert!(generated.contains("await sleep(HOOK_INTER_REQUEST_DELAY_MS)"));
-        assert!(generated.contains("enqueueHook(event, url, payload);"));
+        assert!(generated.contains("const policy = capturePolicy(payload"));
+        assert!(generated.contains("if (policy.disposition === \"drop\") return;"));
+        assert!(generated.contains("enqueueHook(event, url, policy.payload);"));
+        assert!(generated.contains("const CAPTURE_POLICY_V1 = 1;"));
+        assert!(generated.contains("const CAPTURE_MARKER_MAX_BYTES = 64 * 1024;"));
         assert!(generated.contains("async function fetchHandoff"));
+        assert!(generated.contains("if (!process.env.AI_MEMORY_RUN_ID) {"));
         assert!(generated.contains("const response = await fetch(url, {"));
         assert!(generated.contains("signal: timeoutSignal(1000)"));
         assert!(!generated.contains("signal: timeoutSignal(500)"));
@@ -3519,6 +6085,11 @@ model = "gpt-5"
         assert!(plugin.contains(r#""experimental.chat.system.transform": async"#));
         assert!(plugin.contains("export default AiMemoryHooks"));
         assert!(plugin.contains("const startedSessions = new Set<string>();"));
+        assert!(
+            plugin
+                .contains("const handoffFetches = new Map<string, Promise<string | undefined>>();")
+        );
+        assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
         assert!(plugin.contains("fetchHandoff"));
@@ -3556,7 +6127,7 @@ model = "gpt-5"
         );
         assert!(plugin.contains("!startedSessions.delete(id)"));
         assert!(plugin.contains("sessionCwds.delete(id);"));
-        assert!(plugin.contains("handoffChecked.delete(id);"));
+        assert!(plugin.contains("handoffFetches.delete(id);"));
         assert!(plugin.contains("preCompactLast.delete(id);"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
         assert!(plugin.contains("Bearer ${TOKEN}"));
@@ -3566,7 +6137,11 @@ model = "gpt-5"
             "OpenCode bus events must be handled through the `event` hook"
         );
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
-        assert!(plugin.contains("import { basename, dirname, join, resolve } from \"node:path\";"));
+        assert!(
+            plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
+        );
+        assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
+        assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("--git-common-dir"));
         assert!(
@@ -3645,6 +6220,7 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-start\""));
         assert!(extension.contains("postHook(\"user-prompt\""));
         assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("if (!process.env.AI_MEMORY_RUN_ID) {"));
         assert!(extension.contains("function applyMarkerParams"));
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));
         assert!(extension.contains("text.split(/\\r?\\n/)"));
@@ -3663,8 +6239,11 @@ model = "gpt-5"
         assert!(extension.contains("Bearer ${TOKEN}"));
         assert!(extension.contains("tok"));
         assert!(
-            extension.contains("import { basename, dirname, join, resolve } from \"node:path\";")
+            extension
+                .contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
         );
+        assert!(extension.contains("if (existsSync(join(probe, \".git\")))"));
+        assert!(extension.contains("boundary ??= dir;"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
         assert!(extension.contains("--git-common-dir"));
@@ -3705,24 +6284,272 @@ model = "gpt-5"
         assert_generated_ts_uses_bounded_hook_queue(&extension);
     }
 
+    /// The manual (non-`--apply`) instructions must name the same path
+    /// `--apply` would write to. Printing the `~/.pi/agent` default to an
+    /// operator who set `PI_CODING_AGENT_DIR` would tell them to hand-copy the
+    /// extension exactly where the agent never loads it — reintroducing, in
+    /// the manual path, the silent no-capture this change fixes.
+    #[test]
+    fn extension_hints_follow_pi_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\pi-agent"
+        } else {
+            "/custom/pi-agent"
+        };
+        let env = || Some(std::ffi::OsString::from(custom));
+
+        for hint in [
+            omp_extension_hint_in(env(), None),
+            pi_extension_hint_in(env()),
+        ] {
+            assert!(
+                hint.contains("custom")
+                    && (hint.ends_with("ai-memory-omp.ts") || hint.ends_with("ai-memory-pi.ts")),
+                "hint must point at the relocated agent home, got: {hint}"
+            );
+            assert!(
+                !hint.contains(".pi/agent") && !hint.contains(".omp/agent"),
+                "hint must not advertise the default home when the var is set: {hint}"
+            );
+        }
+
+        // Unset: the hints keep naming the documented defaults. Build the
+        // expected tail from path components rather than hardcoding `/` —
+        // `Path::display` renders `\` on Windows, so a slash-literal suffix
+        // asserts a path shape that platform never produces.
+        for (agent_home, filename, hint) in [
+            (
+                ".omp",
+                "ai-memory-omp.ts",
+                omp_extension_hint_in(None, None),
+            ),
+            (".pi", "ai-memory-pi.ts", pi_extension_hint_in(None)),
+        ] {
+            let tail: PathBuf = [agent_home, "agent", "extensions", filename]
+                .iter()
+                .collect();
+            assert!(
+                hint.ends_with(&tail.display().to_string()),
+                "unset must keep the documented default, got: {hint}"
+            );
+        }
+    }
+
+    /// Precedence must not depend on what the override directory is *named*.
+    /// An earlier revision re-rooted only when the last component happened to
+    /// be "agent", so `/custom/agent` and `/custom/pi-agent` behaved
+    /// differently for the same inputs.
+    #[test]
+    fn omp_profile_precedence_is_independent_of_the_override_dir_name() {
+        let a = omp_extension_path_in(
+            Some(std::ffi::OsString::from("/custom/agent")),
+            Some("work"),
+        )
+        .unwrap();
+        let b = omp_extension_path_in(
+            Some(std::ffi::OsString::from("/custom/pi-agent")),
+            Some("work"),
+        )
+        .unwrap();
+
+        // The override names the agent dir in both cases; the profile does
+        // not re-root it, and neither result invents a `profiles/` segment.
+        assert!(
+            a.ends_with("agent/extensions/ai-memory-omp.ts"),
+            "got {a:?}"
+        );
+        assert!(
+            b.ends_with("pi-agent/extensions/ai-memory-omp.ts"),
+            "got {b:?}"
+        );
+        for p in [&a, &b] {
+            assert!(
+                !p.to_string_lossy().contains("profiles"),
+                "PI_CODING_AGENT_DIR names the agent dir outright: {p:?}"
+            );
+        }
+    }
+
+    /// With no override, `--profile` relocates to the documented
+    /// `~/.omp/profiles/<name>/agent/extensions`.
+    #[test]
+    fn omp_profile_relocates_when_no_override_is_set() {
+        let path = omp_extension_path_in(None, Some("work")).unwrap();
+        assert!(
+            path.ends_with(".omp/profiles/work/agent/extensions/ai-memory-omp.ts"),
+            "got {path:?}"
+        );
+
+        let plain = omp_extension_path_in(None, None).unwrap();
+        assert!(
+            plain.ends_with(".omp/agent/extensions/ai-memory-omp.ts"),
+            "got {plain:?}"
+        );
+    }
+
+    /// `remove_legacy_extension` must delete only what this tool generated.
+    /// `uninstall` gates every delete on the same marker
+    /// (`uninstall_omp_extension_deletes_only_generated_file`), so an
+    /// unconditional delete on the install path would destroy exactly what
+    /// uninstall refuses to touch.
+    #[test]
+    fn legacy_cleanup_spares_a_user_owned_file_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("ai-memory.ts");
+        let user_content = "// user-owned extension that happens to use this filename\n";
+        std::fs::write(&legacy, user_content).unwrap();
+
+        remove_legacy_extension(&dir.path().join("ai-memory-omp.ts"), "omp");
+
+        assert!(legacy.exists(), "user-owned file must survive");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), user_content);
+    }
+
+    /// The generated marker (banner + agent constant) is what authorises
+    /// removal.
+    #[test]
+    fn legacy_cleanup_removes_our_own_superseded_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("ai-memory.ts");
+        std::fs::write(
+            &legacy,
+            "// Auto-generated by `ai-memory install-hooks --agent omp --apply`\nconst AGENT = \"omp\";\n",
+        )
+        .unwrap();
+
+        remove_legacy_extension(&dir.path().join("ai-memory-omp.ts"), "omp");
+
+        assert!(
+            !legacy.exists(),
+            "our own superseded file should be removed"
+        );
+    }
+
+    /// Pi and OMP can share one extensions directory, so a Pi install must
+    /// not delete an OMP-generated legacy file — that would silently stop
+    /// OMP capturing until someone reinstalled it.
+    #[test]
+    fn legacy_cleanup_does_not_touch_the_other_agents_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("ai-memory.ts");
+        let omp_content = "// Auto-generated by `ai-memory install-hooks --agent omp --apply`\nconst AGENT = \"omp\";\n";
+        std::fs::write(&legacy, omp_content).unwrap();
+
+        // A *Pi* install runs its cleanup over the shared directory.
+        remove_legacy_extension(&dir.path().join("ai-memory-pi.ts"), "pi");
+
+        assert!(legacy.exists(), "OMP's file must survive a Pi install");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), omp_content);
+    }
+
+    /// `PI_CODING_AGENT_DIR` relocates Pi's whole agent config home
+    /// (`~/.pi/agent`), not just session storage, so the extension must follow
+    /// the variable or Pi never loads it — the install reports success and
+    /// capture silently does nothing.
+    #[test]
+    fn pi_extension_path_honours_pi_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\pi-agent"
+        } else {
+            "/custom/pi-agent"
+        };
+        let path = pi_extension_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(
+            path,
+            Path::new(custom).join("extensions").join("ai-memory-pi.ts")
+        );
+
+        // Unset and blank both fall back to ~/.pi/agent/extensions/ai-memory-pi.ts.
+        // Blank counts as unset because an exported-but-empty variable is nearly
+        // always a failed shell expansion, not a request to install into the
+        // filesystem root.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = pi_extension_path_in(env).unwrap();
+            assert!(
+                path.ends_with(
+                    Path::new(".pi")
+                        .join("agent")
+                        .join("extensions")
+                        .join("ai-memory-pi.ts")
+                ),
+                "default must be ~/.pi/agent/extensions/ai-memory-pi.ts, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Same relocation contract as Pi: OMP honors `PI_CODING_AGENT_DIR` for
+    /// the default profile and moves `~/.omp/agent` wholesale, extensions
+    /// included.
+    #[test]
+    fn omp_extension_path_honours_pi_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\omp-agent"
+        } else {
+            "/custom/omp-agent"
+        };
+        let path = omp_extension_path_in(Some(std::ffi::OsString::from(custom)), None).unwrap();
+        assert_eq!(
+            path,
+            Path::new(custom)
+                .join("extensions")
+                .join("ai-memory-omp.ts")
+        );
+
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = omp_extension_path_in(env, None).unwrap();
+            assert!(
+                path.ends_with(
+                    Path::new(".omp")
+                        .join("agent")
+                        .join("extensions")
+                        .join("ai-memory-omp.ts")
+                ),
+                "default must be ~/.omp/agent/extensions/ai-memory-omp.ts, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn omp_extension_path_honours_profile() {
+        let path = omp_extension_path_in(None, Some("my-profile")).unwrap();
+        assert!(
+            path.ends_with(
+                Path::new(".omp")
+                    .join("profiles")
+                    .join("my-profile")
+                    .join("agent")
+                    .join("extensions")
+                    .join("ai-memory-omp.ts")
+            ),
+            "profile path must be correct, got {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn omp_extension_is_directly_discoverable_by_omp() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
             agent: AgentChoice::Omp,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_prompts: false,
             hooks_dir: None,
-            server_url: "http://127.0.0.1:49374".into(),
+            server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
             as_user: None,
             apply: true,
-            config_file: Some(tmp.path().join("extensions").join("ai-memory.ts")),
-            project_strategy: ProjectStrategyArg::Basename,
+            config_file: Some(tmp.path().join("extensions").join("ai-memory-omp.ts")),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            profile: None,
         };
 
         let path = resolve_omp_extension_path(&args).unwrap();
         assert_eq!(
             path.file_name().and_then(|s| s.to_str()),
-            Some("ai-memory.ts")
+            Some("ai-memory-omp.ts")
         );
         assert_eq!(
             path.parent()
@@ -3735,16 +6562,20 @@ model = "gpt-5"
     #[test]
     fn pi_extension_is_directly_discoverable_by_pi() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("extensions").join("ai-memory.ts");
+        let path = tmp.path().join("extensions").join("ai-memory-pi.ts");
         let args = InstallHooksArgs {
             agent: AgentChoice::Pi,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_prompts: false,
             hooks_dir: None,
-            server_url: "http://127.0.0.1:49374".into(),
+            server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
             as_user: None,
             apply: true,
             config_file: Some(path.clone()),
-            project_strategy: ProjectStrategyArg::Basename,
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            profile: None,
         };
 
         let resolved = resolve_pi_extension_path(&args).unwrap();
@@ -3752,7 +6583,7 @@ model = "gpt-5"
         assert_eq!(resolved, path);
         assert_eq!(
             resolved.file_name().and_then(|s| s.to_str()),
-            Some("ai-memory.ts")
+            Some("ai-memory-pi.ts")
         );
         assert_eq!(
             resolved
@@ -4070,6 +6901,75 @@ model = "gpt-5"
         assert!(parsed["hooks"]["SessionStart"].is_array());
     }
 
+    /// The test-only Codex wrapper must stage scripts under its injected
+    /// data-local root and wire that stable path into the generated config.
+    #[test]
+    fn codex_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_codex_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &InstallHooksArgs {
+                profile: None,
+                agent: AgentChoice::Codex,
+                capture_assistant: false,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: Some(ProjectStrategyArg::Basename),
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("codex")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let command = parsed
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("SessionStart command should be present");
+        assert!(
+            command.contains(&staged_script.to_string_lossy().into_owned()),
+            "generated command must reference staged script {}: {command}",
+            staged_script.display()
+        );
+    }
+
     // ----------------------------------------------------------------
     // Gemini tests
     // ----------------------------------------------------------------
@@ -4229,5 +7129,1247 @@ model = "gpt-5"
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // ----------------------------------------------------------------
+    // Kimi Code tests
+    // ----------------------------------------------------------------
+
+    const KIMI_CODE_STUB_SCRIPTS: [&str; 9] = [
+        "session-start.sh",
+        "user-prompt-submit.sh",
+        "pre-tool-use.sh",
+        "post-tool-use.sh",
+        "pre-compact.sh",
+        "stop.sh",
+        "session-end.sh",
+        "subagent-start.sh",
+        "subagent-stop.sh",
+    ];
+
+    fn kimi_code_hooks_in(config_path: &Path) -> Vec<(String, String)> {
+        let doc: toml_edit::DocumentMut = fs::read_to_string(config_path)
+            .unwrap()
+            .parse()
+            .expect("config.toml must stay valid TOML");
+        doc.get("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .expect("`hooks` must be an array of tables")
+            .iter()
+            .map(|entry| {
+                let event = entry
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let command = entry
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (event, command)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kimi_code_apply_writes_all_events_into_fresh_config() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+
+        let outcome = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Created);
+
+        let entries = kimi_code_hooks_in(&config_path);
+        assert_eq!(entries.len(), KIMI_CODE_EVENTS.len());
+        for (i, (event, script)) in KIMI_CODE_EVENTS.iter().enumerate() {
+            assert_eq!(entries[i].0, *event, "entry order follows KIMI_CODE_EVENTS");
+            let stem = script.strip_suffix(".sh").unwrap();
+            assert!(
+                entries[i].1.contains(stem),
+                "{event}: command must reference the staged script: {}",
+                entries[i].1
+            );
+        }
+        // Only the allowed keys are written — Kimi Code rejects unknown
+        // fields by failing the whole config load.
+        let doc: toml_edit::DocumentMut =
+            fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        for entry in doc
+            .get("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .unwrap()
+        {
+            let keys: Vec<&str> = entry.iter().map(|(k, _)| k).collect();
+            assert_eq!(keys, ["event", "command"], "only event + command allowed");
+        }
+    }
+
+    #[test]
+    fn kimi_code_apply_preserves_providers_and_third_party_hooks() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"# Kimi Code user config
+model = "kimi-k2"
+
+[providers.moonshot]
+api_key = "sk-secret"
+base_url = "https://api.moonshot.cn/v1"
+
+[[hooks]]
+event = "SessionStart"
+command = "echo third-party"
+
+[[hooks]]
+event = "SessionStart"
+command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/session-start.sh"
+"#,
+        )
+        .unwrap();
+
+        merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("# Kimi Code user config"),
+            "comments survive"
+        );
+        assert!(
+            content.contains(r#"api_key = "sk-secret""#),
+            "providers table survives"
+        );
+
+        let doc: toml_edit::DocumentMut = content.parse().unwrap();
+        assert_eq!(
+            doc.get("model").and_then(|v| v.as_str()),
+            Some("kimi-k2"),
+            "model setting survives"
+        );
+        assert_eq!(
+            doc.get("providers")
+                .and_then(|p| p.get("moonshot"))
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://api.moonshot.cn/v1"),
+            "providers.moonshot survives"
+        );
+
+        let entries = kimi_code_hooks_in(&config_path);
+        // Third-party entry + our 9: the stale ai-memory entry must be
+        // replaced, not duplicated.
+        assert_eq!(entries.len(), 1 + KIMI_CODE_EVENTS.len());
+        let ours: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(_, command)| {
+                let lower = command.to_ascii_lowercase();
+                lower.contains("ai-memory") || lower.contains("ai_memory")
+            })
+            .collect();
+        assert_eq!(ours.len(), KIMI_CODE_EVENTS.len(), "no duplicated entries");
+        assert!(
+            entries
+                .iter()
+                .any(|(_, command)| command == "echo third-party"),
+            "third-party hook survives: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(_, command)| command.contains("/old/")),
+            "stale ai-memory entry must be replaced: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn kimi_code_apply_is_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+
+        let first = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_ne!(
+            first,
+            ApplyOutcome::NoOp,
+            "first apply should not be a no-op"
+        );
+
+        let second = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    #[test]
+    fn claude_settings_path_honours_claude_config_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\claude"
+        } else {
+            "/custom/claude"
+        };
+        let path = claude_settings_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("settings.json"));
+
+        // Empty override and unset var both fall back to ~/.claude/settings.json.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = claude_settings_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".claude").join("settings.json")),
+                "default must be ~/.claude/settings.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// `CODEX_HOME` relocates Codex's entire config home, so hooks written to
+    /// `~/.codex` are never loaded by a Codex configured that way — the install
+    /// reports success and capture silently does nothing. ai-memory already
+    /// honors the variable when resolving Codex transcripts, so the two halves
+    /// of one install have to agree on where that home is.
+    #[test]
+    fn codex_hooks_path_honours_codex_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\codex"
+        } else {
+            "/custom/codex"
+        };
+        let path = codex_hooks_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("hooks.json"));
+
+        // Unset and blank both fall back to ~/.codex/hooks.json. Blank counts as
+        // unset because an exported-but-empty variable is nearly always a failed
+        // shell expansion, not a request to install into the filesystem root.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = codex_hooks_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".codex").join("hooks.json")),
+                "default must be ~/.codex/hooks.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// The test-only Claude Code wrapper must stage scripts under its injected
+    /// data-local root and wire that stable path into the generated config.
+    #[test]
+    fn claude_code_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("settings.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &InstallHooksArgs {
+                profile: None,
+                agent: AgentChoice::ClaudeCode,
+                capture_assistant: false,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: Some(ProjectStrategyArg::Basename),
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("claude-code")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let command = parsed
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("SessionStart command should be present");
+        assert!(
+            command.contains(&staged_script.to_string_lossy().into_owned()),
+            "generated command must reference staged script {}: {command}",
+            staged_script.display()
+        );
+    }
+
+    #[test]
+    fn claude_prompt_opt_out_survives_reapply_and_preserves_third_party_hook() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("settings.json");
+        let staging_tmp = TempDir::new().unwrap();
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "hooks": [{ "command": "third-party prompt guard" }] },
+                        { "hooks": [{ "command": "/old/ai-memory hook --event user-prompt" }] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let disabled = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            no_capture_prompts: true,
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &disabled,
+        )
+        .unwrap();
+
+        let assert_disabled = || {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let prompts = parsed["hooks"][CLAUDE_PROMPT_EVENT]
+                .as_array()
+                .expect("third-party prompt hook keeps the event present");
+            assert_eq!(prompts.len(), 1);
+            assert!(
+                serde_json::to_string(prompts)
+                    .unwrap()
+                    .contains("third-party prompt guard")
+            );
+            assert!(!prompts.iter().any(is_ai_memory_hook_entry));
+        };
+        assert_disabled();
+
+        let bare_reapply = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &bare_reapply,
+        )
+        .unwrap();
+        assert_disabled();
+
+        let enabled = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(config_path.clone()),
+            capture_prompts: true,
+            ..default_hook_args()
+        };
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &enabled,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let prompts = parsed["hooks"][CLAUDE_PROMPT_EVENT].as_array().unwrap();
+        assert_eq!(prompts.len(), 2, "third-party + one ai-memory hook");
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn kimi_code_config_path_honours_kimi_code_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\kimi"
+        } else {
+            "/custom/kimi"
+        };
+        let path = kimi_code_config_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("config.toml"));
+
+        // Empty override and unset var both fall back to ~/.kimi-code.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = kimi_code_config_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".kimi-code").join("config.toml")),
+                "default must be ~/.kimi-code/config.toml, got {}",
+                path.display()
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Kiro CLI v2 agent-config hook tests.
+    // ----------------------------------------------------------------
+
+    const KIRO_CLI_STUB_SCRIPTS: [&str; 5] = [
+        "session-start.sh",
+        "user-prompt-submit.sh",
+        "pre-tool-use.sh",
+        "post-tool-use.sh",
+        "stop.sh",
+    ];
+
+    #[test]
+    fn kiro_cli_apply_writes_all_v2_events_into_agent_config() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_CLI_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("dev.json");
+        fs::write(
+            &config_path,
+            r#"{"name": "dev", "description": "my agent", "tools": ["*"]}"#,
+        )
+        .unwrap();
+
+        let outcome = merge_kiro_cli_agent_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Updated);
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // Non-hook agent fields survive the merge.
+        assert_eq!(root["name"], "dev");
+        assert_eq!(root["tools"][0], "*");
+        let hooks = root["hooks"].as_object().expect("hooks object");
+        assert_eq!(hooks.len(), KIRO_CLI_V2_EVENTS.len());
+        for (event, script) in KIRO_CLI_V2_EVENTS {
+            let entries = hooks[event].as_array().expect("event array");
+            assert_eq!(entries.len(), 1, "{event}");
+            let entry = entries[0].as_object().expect("entry object");
+            let command = entry["command"].as_str().unwrap();
+            let stem = script.strip_suffix(".sh").unwrap();
+            assert!(
+                command.contains(stem),
+                "{event}: command must reference the staged script: {command}"
+            );
+            // The v2 Hook schema has no `type` field, and an empty-string
+            // matcher would match no tool at all (absent = every tool), so
+            // neither key may be written.
+            assert!(!entry.contains_key("type"), "{event}: no type key");
+            assert!(!entry.contains_key("matcher"), "{event}: no matcher key");
+            if event == "agentSpawn" {
+                // The handoff + brief must not be truncated mid-injection.
+                assert_eq!(
+                    entry["max_output_size"],
+                    serde_json::json!(KIRO_CLI_V2_SESSION_START_MAX_OUTPUT)
+                );
+            } else {
+                assert!(!entry.contains_key("max_output_size"), "{event}");
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_cli_apply_preserves_third_party_hooks_and_is_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_CLI_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("dev.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "name": "dev",
+  "hooks": {
+    "agentSpawn": [
+      {"command": "git status"},
+      {"command": "echo ai-memory status"},
+      {"command": "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kiro-cli/session-start.sh"}
+    ],
+    "preToolUse": [
+      {"matcher": "execute_bash", "command": "echo audit >> /tmp/audit.log"}
+    ]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let apply = || {
+            merge_kiro_cli_agent_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                config_tmp.path(),
+                None,
+                &config_path,
+            )
+        };
+        assert_eq!(apply().unwrap(), ApplyOutcome::Updated);
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let spawn = root["hooks"]["agentSpawn"].as_array().unwrap();
+        // Third-party entry first (preserved), our refreshed entry after;
+        // the stale ai-memory entry is gone.
+        assert_eq!(spawn.len(), 3);
+        assert_eq!(spawn[0]["command"], "git status");
+        assert_eq!(spawn[1]["command"], "echo ai-memory status");
+        let ours = spawn[2]["command"].as_str().unwrap();
+        assert!(ours.contains("session-start"), "{ours}");
+        assert!(
+            !ours.contains("http://old:1"),
+            "stale entry replaced: {ours}"
+        );
+        // A third-party hook under a trigger we also write survives with
+        // its matcher intact.
+        let pre = root["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["matcher"], "execute_bash");
+
+        // Second apply with identical inputs must be a no-op.
+        assert_eq!(apply().unwrap(), ApplyOutcome::NoOp);
+    }
+
+    #[test]
+    fn kiro_cli_paths_honour_kiro_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\kiro"
+        } else {
+            "/custom/kiro"
+        };
+        let agents = kiro_cli_home_join(Some(std::ffi::OsString::from(custom)), "agents").unwrap();
+        assert_eq!(agents, Path::new(custom).join("agents"));
+        let hooks = kiro_cli_home_join(Some(std::ffi::OsString::from(custom)), "hooks")
+            .unwrap()
+            .join("ai-memory.json");
+        assert_eq!(hooks, Path::new(custom).join("hooks/ai-memory.json"));
+
+        // Empty override and unset var both fall back to ~/.kiro.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let agents = kiro_cli_home_join(env.clone(), "agents").unwrap();
+            assert!(
+                agents.ends_with(Path::new(".kiro").join("agents")),
+                "default must be ~/.kiro/agents, got {}",
+                agents.display()
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_hooks_infer_the_managed_mcp_client() {
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::KiroCli),
+            Some(McpClient::KiroCli)
+        );
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::KiroCliV3),
+            Some(McpClient::KiroCli)
+        );
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_writes_documented_schema_and_is_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_CLI_STUB_SCRIPTS);
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks/ai-memory.json");
+
+        let apply = || {
+            merge_kiro_cli_v3_hooks(
+                hooks_tmp.path(),
+                "https://memory.example",
+                Some("test-token"),
+                config_tmp.path(),
+                Some("repo-root"),
+                &config_path,
+            )
+        };
+        assert_eq!(apply().unwrap(), ApplyOutcome::Created);
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(root["version"], "v1");
+        let hooks = root["hooks"].as_array().expect("hooks array");
+        assert_eq!(hooks.len(), KIRO_CLI_V3_EVENTS.len());
+        for ((trigger, script), entry) in KIRO_CLI_V3_EVENTS.iter().zip(hooks) {
+            assert_eq!(entry["trigger"], *trigger);
+            assert_eq!(entry["action"]["type"], "command");
+            assert_eq!(
+                entry["timeout"],
+                if *trigger == "SessionStart" { 5 } else { 1 }
+            );
+            assert_eq!(entry["enabled"], true);
+            assert_eq!(
+                entry["name"],
+                format!("ai-memory-{}", script.trim_end_matches(".sh"))
+            );
+            let command = entry["action"]["command"].as_str().unwrap();
+            assert!(is_ai_memory_kiro_hook_command(command), "{command}");
+            assert!(command.contains("test-token"), "{command}");
+            assert!(command.contains("repo-root"), "{command}");
+            assert!(entry.get("matcher").is_none());
+        }
+        assert_eq!(apply().unwrap(), ApplyOutcome::NoOp);
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_preserves_third_party_hooks_and_replaces_only_ours() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("ai-memory.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "version": "v1",
+  "owner": "user",
+  "hooks": [
+    {"name":"audit","trigger":"PreToolUse","action":{"type":"command","command":"audit-tool"}},
+    {"name":"ai-memory-session-start","trigger":"SessionStart","action":{"type":"command","command":"AI_MEMORY_HOOK_URL=http://old /old/hooks/kiro-cli/session-start.sh"}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            merge_kiro_cli_v3_hooks(
+                tmp.path(),
+                "https://memory.example",
+                None,
+                tmp.path(),
+                None,
+                &config_path,
+            )
+            .unwrap(),
+            ApplyOutcome::Updated
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(root["owner"], "user");
+        let hooks = root["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1 + KIRO_CLI_V3_EVENTS.len());
+        assert_eq!(hooks[0]["name"], "audit");
+        assert!(hooks[1..].iter().all(is_ai_memory_kiro_v3_hook_entry));
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_rejects_incompatible_schema_and_reserved_collision() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("ai-memory.json");
+        fs::write(&config_path, r#"{"version":"v2","hooks":[]}"#).unwrap();
+        let error = merge_kiro_cli_v3_hooks(
+            tmp.path(),
+            "https://memory.example",
+            None,
+            tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported Kiro hook schema version"));
+
+        fs::write(
+            &config_path,
+            r#"{"version":"v1","hooks":[{"name":"ai-memory-stop","trigger":"Stop","action":{"type":"command","command":"third-party"}}]}"#,
+        )
+        .unwrap();
+        let error = merge_kiro_cli_v3_hooks(
+            tmp.path(),
+            "https://memory.example",
+            None,
+            tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("reserved name"));
+    }
+
+    #[test]
+    fn kiro_cli_agent_config_listing_is_sorted_json_only() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("b.json"), "{}").unwrap();
+        fs::write(tmp.path().join("a.json"), "{}").unwrap();
+        fs::write(tmp.path().join("notes.md"), "not an agent").unwrap();
+        fs::create_dir(tmp.path().join("sub.json")).unwrap();
+
+        let listed = list_kiro_cli_agent_configs(tmp.path()).unwrap();
+        assert_eq!(
+            listed,
+            vec![tmp.path().join("a.json"), tmp.path().join("b.json")]
+        );
+
+        // A missing directory is an empty list, not an error.
+        assert!(
+            list_kiro_cli_agent_configs(&tmp.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let not_a_directory = tmp.path().join("agents.json");
+        fs::write(&not_a_directory, "{}").unwrap();
+        let error = list_kiro_cli_agent_configs(&not_a_directory).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading"),
+            "filesystem failures must not look like an empty agent directory: {error:#}"
+        );
+    }
+
+    #[test]
+    fn kiro_cli_v2_preflight_is_all_or_nothing_and_preserves_per_agent_strategy() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("a.json");
+        let basename = tmp.path().join("b.json");
+        fs::write(
+            &repo_root,
+            r#"{"name":"a","hooks":{"agentSpawn":[{"command":"AI_MEMORY_PROJECT_STRATEGY=repo-root /old/hooks/kiro-cli/session-start.sh"}]}}"#,
+        )
+        .unwrap();
+        fs::write(&basename, r#"{"name":"b"}"#).unwrap();
+
+        let prepared = preflight_kiro_cli_agent_configs(
+            vec![repo_root.clone(), basename.clone()],
+            tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            tmp.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(prepared[0].1, Some(ProjectStrategyArg::RepoRoot));
+        assert_eq!(prepared[1].1, None);
+
+        let before = fs::read_to_string(&repo_root).unwrap();
+        fs::write(&basename, "{not-json").unwrap();
+        let error = preflight_kiro_cli_agent_configs(
+            vec![repo_root.clone(), basename],
+            tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            tmp.path(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("valid JSON"));
+        assert_eq!(
+            fs::read_to_string(repo_root).unwrap(),
+            before,
+            "a malformed later config must not mutate an earlier agent"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Devin tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn devin_apply_writes_hooks_v1_json_by_default() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.v1.json");
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &InstallHooksArgs {
+                profile: None,
+                agent: AgentChoice::Devin,
+                capture_assistant: false,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // hooks.v1.json: the entire file IS the hooks object (no wrapper)
+        assert!(
+            parsed["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        assert!(
+            parsed.get("hooks").is_none(),
+            "hooks.v1.json should not have a 'hooks' wrapper"
+        );
+    }
+
+    #[test]
+    fn devin_apply_config_json_hooks_key_via_flag() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.json");
+
+        // Pre-existing config.json with mcpServers
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other-server":{"url":"http://example.com"}}}"#,
+        )
+        .unwrap();
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &InstallHooksArgs {
+                profile: None,
+                agent: AgentChoice::Devin,
+                capture_assistant: false,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // config.json: hooks are nested under the "hooks" key
+        assert!(
+            parsed["hooks"]["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["hooks"]["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        // mcpServers should be preserved
+        assert!(
+            parsed["mcpServers"]["other-server"].is_object(),
+            "mcpServers should be preserved"
+        );
+    }
+
+    #[test]
+    fn devin_apply_both_targets_are_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        // Test hooks.v1.json idempotency
+        let config_tmp = TempDir::new().unwrap();
+        let hooks_v1_path = config_tmp.path().join("hooks.v1.json");
+
+        let args_v1 = InstallHooksArgs {
+            profile: None,
+            agent: AgentChoice::Devin,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_prompts: false,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(hooks_v1_path.clone()),
+            project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
+            as_user: None,
+            apply: false,
+        };
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &args_v1,
+        )
+        .unwrap();
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &args_v1,
+        )
+        .unwrap();
+
+        // Idempotency check: second apply should be a no-op
+        let v1_first_content = fs::read_to_string(&hooks_v1_path).unwrap();
+        let v1_second_content = fs::read_to_string(&hooks_v1_path).unwrap();
+        assert_eq!(
+            v1_first_content, v1_second_content,
+            "hooks.v1.json should be unchanged after second apply"
+        );
+
+        // Test config.json hooks key idempotency
+        let config_tmp2 = TempDir::new().unwrap();
+        let config_path = config_tmp2.path().join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+
+        let args_config = InstallHooksArgs {
+            profile: None,
+            agent: AgentChoice::Devin,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_prompts: false,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(config_path.clone()),
+            project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
+            as_user: None,
+            apply: false,
+        };
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp2.path(),
+            config_tmp2.path(),
+            &args_config,
+        )
+        .unwrap();
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp2.path(),
+            config_tmp2.path(),
+            &args_config,
+        )
+        .unwrap();
+
+        // Idempotency check: second apply should be a no-op
+        let config_first_content = fs::read_to_string(&config_path).unwrap();
+        let config_second_content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            config_first_content, config_second_content,
+            "config.json should be unchanged after second apply"
+        );
+    }
+
+    #[test]
+    fn devin_preserves_existing_hooks_and_adds_ours() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.v1.json");
+        // Pre-existing settings with another named hook group.
+        fs::write(
+            &config_path,
+            r#"{"my-linter":{"PostToolUse":[{"matcher":"run_command","hooks":[{"type":"command","command":"lint.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        apply_to_devin_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &InstallHooksArgs {
+                profile: None,
+                agent: AgentChoice::Devin,
+                capture_assistant: false,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // The pre-existing my-linter group survives.
+        assert!(
+            parsed["my-linter"]["PostToolUse"].is_array(),
+            "my-linter.PostToolUse must survive"
+        );
+        // Our hooks are present at the top level (hooks.v1.json format).
+        assert!(
+            parsed["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        assert!(
+            parsed["PostToolUse"].is_array(),
+            "PostToolUse hook should be present"
+        );
+    }
+
+    #[test]
+    fn devin_session_start_injects_handoff_additional_context() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_session_start = hooks_root.join("devin").join("session-start.sh");
+
+        // Normalized because this is the only assertion below that spans a
+        // line break: on a Windows checkout with core.autocrlf=true the
+        // working-tree copy has CRLF even though the committed blob is
+        // LF-only, which breaks an exact multi-line substring match.
+        let script_content = fs::read_to_string(&devin_session_start)
+            .unwrap()
+            .replace("\r\n", "\n");
+        // Verify the script injects handoff via hookSpecificOutput.additionalContext
+        assert!(
+            script_content.contains("hookSpecificOutput"),
+            "Devin session-start.sh must inject handoff via hookSpecificOutput"
+        );
+        assert!(
+            script_content.contains("additionalContext"),
+            "Devin session-start.sh must use additionalContext field"
+        );
+        assert!(
+            script_content.contains("ai_memory_get_handoff"),
+            "Devin session-start.sh must fetch handoff"
+        );
+        assert!(
+            script_content.contains("$SERVER/handoff?agent=devin${QS}${SID_QS}"),
+            "Devin session-start.sh must bind the handoff claim to its generated session id"
+        );
+        assert!(
+            !script_content.contains("/handoff/latest"),
+            "Devin session-start.sh must not call the removed /handoff/latest route"
+        );
+        assert!(
+            script_content.contains("ai_memory_json_string"),
+            "Devin session-start.sh must JSON-escape handoff text before embedding it"
+        );
+        assert!(
+            script_content.contains("else\n    printf '{}\\n'\nfi"),
+            "Devin session-start.sh must print {{}} only when no handoff is available"
+        );
+    }
+
+    #[test]
+    fn startup_handoff_scripts_forward_native_session_ids() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        for agent in ["claude-code", "codex", "opencode", "cursor", "gemini-cli"] {
+            let script = fs::read_to_string(hooks_root.join(agent).join("session-start.sh"))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert!(
+                script.contains("SESSION_ID=$(ai_memory_extract_session_id \"$PAYLOAD\")"),
+                "{agent} must extract the native receiver session id"
+            );
+            assert!(
+                script.contains("${SESSION_QS}"),
+                "{agent} must forward the native receiver session id to /handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_placeholder_expansion_resolves_values_and_defaults() {
+        let expanded = expand_grok_placeholders_with("${HOST}/mcp ${TOKEN:-fallback}", |name| {
+            (name == "HOST").then(|| "https://memory.example".to_string())
+        })
+        .unwrap();
+        assert_eq!(expanded, "https://memory.example/mcp fallback");
+    }
+
+    #[test]
+    fn grok_placeholder_expansion_rejects_missing_variable() {
+        let err = expand_grok_placeholders_with("${MISSING}", |_| None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pass explicit --server-url and --auth-token")
+        );
+    }
+
+    #[test]
+    fn grok_project_overlays_cover_repo_root_through_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let parent = root.join("nested");
+        let cwd = parent.join("leaf");
+        fs::create_dir_all(&cwd).unwrap();
+
+        for directory in [&root, &parent, &cwd] {
+            let overlay = directory.join(".grok/config.toml");
+            fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+            fs::write(&overlay, "# override").unwrap();
+            assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), Some(overlay));
+            fs::remove_file(directory.join(".grok/config.toml")).unwrap();
+        }
+        assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), None);
+    }
+
+    #[test]
+    fn grok_project_overlay_outside_repo_checks_only_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("outside").join("leaf");
+        fs::create_dir_all(&cwd).unwrap();
+        let parent_overlay = cwd.parent().unwrap().join(".grok/config.toml");
+        fs::create_dir_all(parent_overlay.parent().unwrap()).unwrap();
+        fs::write(&parent_overlay, "# ignored").unwrap();
+        assert_eq!(find_grok_project_overlay(&cwd, None), None);
+
+        let cwd_overlay = cwd.join(".grok/config.toml");
+        fs::create_dir_all(cwd_overlay.parent().unwrap()).unwrap();
+        fs::write(&cwd_overlay, "# active").unwrap();
+        assert_eq!(find_grok_project_overlay(&cwd, None), Some(cwd_overlay));
     }
 }

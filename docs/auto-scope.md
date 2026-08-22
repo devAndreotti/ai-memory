@@ -2,10 +2,13 @@
 
 `ai-memory serve` publishes a process-shared "currently active project"
 pointer that MCP read tools consult when the caller omits `workspace` /
-`project`. The pointer is fed by the lifecycle hooks: every `/hook`
-event that resolves a `cwd` to a real project updates the pointer so
-read tools answer for the project the agent is actually in, not the
-server's static `--project` default.
+`project`. The pointer is fed by foreground lifecycle hooks: session start,
+user prompt, and pre-tool events that resolve a `cwd` to a real project update
+the pointer so read tools answer for the project the agent is actually in, not
+the server's static `--project` default. Completion and shutdown events still
+land in their resolved project, but do not advance shared fallback slots: a
+delayed post-tool, stop, or session-end tail from an older process must not
+redirect a newer session's unscoped reads.
 
 By default that pointer is a single process-wide slot — right for one
 operator running one project at a time, but it collapses parallel
@@ -23,14 +26,15 @@ separated.
 |---------------|------------------------|----------------------------------------------------------------------------------------------------------|
 | `single`      | (none — global slot)   | **Default.** Single operator, one project at a time. Backward-compatible with every existing install.    |
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
-| `per_actor`   | `(user, session_id)`, with a user-only no-session slot | Shared engine fielding multiple authenticated users (multi-user mode, rung 2). Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
+| `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | Shared engine fielding multiple authenticated users or trusted-proxy identities. Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
 
-Both opt-in modes still publish to the single slot in parallel, so a
-caller with no actor identity (anonymous probe, legacy code path) sees
-the most recent project rather than an empty pointer. That preserves
-legacy behavior, but it is not per-session isolation; use explicit
-`workspace` + `project` arguments when a client cannot send actor
-identity and concurrent runs matter.
+Both opt-in modes still publish foreground activity to the single slot in
+parallel, so a caller with no actor identity (anonymous probe, legacy code
+path) sees the most recently active project rather than an empty pointer.
+Non-foreground events refresh only their exact keyed entry when one exists.
+That preserves legacy behavior without letting a delayed tail take over, but
+it is not per-session isolation; use explicit `workspace` + `project`
+arguments when a client cannot send actor identity and concurrent runs matter.
 
 Explicit scope arguments fail closed. A `project` argument is resolved
 inside the active workspace first, then inside the server's default
@@ -82,6 +86,7 @@ AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES=8192
 |----------------------------------------------------|----------------------------|
 | Hook payload (`/hook?event=…&agent=…`)             | `session_id`, `agent`      |
 | Auth middleware (rung 1 root with `root_username`) | `user` ← root_username     |
+| Auth middleware (rung 1b trusted proxy)           | username or OIDC `(issuer, subject)` pair |
 | Auth middleware (rung 2 DB user)                   | `user` ← `users.username`  |
 | MCP request header `X-Memory-Actor-Session-Id`     | `session_id` for tool calls |
 | MCP request header `Mcp-Session-Id`                | fallback `session_id` for tool calls |
@@ -92,13 +97,26 @@ lifecycle-hook payload. It is not an OIDC/Keycloak login session: the
 provider's JWT `sid` claim identifies an IdP browser/device session and
 must not be used as ai-memory's actor session key.
 
-`per_session` reads from `session_id`; `per_actor` reads from both
-`user` and `session_id`. In `per_actor`, a request that has `user` but
+`per_session` reads from `session_id`; `per_actor` reads from both the
+qualified identity and `session_id`. In `per_actor`, a request that has identity but
 no session id can use that user's latest no-session slot instead of the
 process-wide single slot. A request that does carry a session id must
 match a hook-published keyed entry; if it does not, ai-memory falls back
 to the server's baked default rather than another session's latest
 project.
+
+The composite `(identity, session_id)` key namespaces only these active-project
+pointers. The durable `SessionId` stored for hook observations remains global:
+if another owner reuses an already-owned id, ai-memory drops that hook before it
+can append observations or publish a pointer for the foreign actor.
+
+Owner and agent are what identify a session; scope is not. The same operator's
+session legitimately produces events in another project when its cwd moves, so
+a differing `(workspace, project)` is recorded rather than rejected — see
+[`[routing] mid_session`](marker-file.md#mid-session-navigation-routing-mid_session)
+for how those events are attributed. The one exception is a terminal event: a
+`SessionEnd` naming a different scope than its session is not that session's
+end, so it is dropped rather than ending someone else's session.
 
 ## Client requirements
 
@@ -107,6 +125,26 @@ payloads. MCP tool calls are separate HTTP requests, and most built-in
 MCP client config files can only declare static URL/auth headers. Static
 configs cannot inject the current agent-run session id into every tool
 call.
+
+Claude Code can opt into ai-memory's session-aware stdio bridge:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The bridge reads the `CLAUDE_CODE_SESSION_ID` that Claude supplies to its stdio
+MCP subprocess and forwards it as `X-Memory-Actor-Session-Id` while preserving
+the configured remote endpoint and bearer token. Existing Claude Code installs
+stay on the static HTTP transport unless this flag is used.
+
+Claude Code's stdio MCP subprocess keeps the id it received at startup across
+`/clear`, even though subsequent hooks receive the new id. On
+`--continue`/`--resume` without an explicit id, Claude may also give the MCP
+subprocess the startup id rather than the resumed id. Restart Claude Code after
+`/clear` when exact session-key continuity matters, and prefer
+`--resume <session-id>` for explicit resumes. The bridge deliberately fails
+when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
+the shared single slot.
 
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
@@ -118,7 +156,8 @@ the legacy single slot.
 OIDC/Keycloak authentication can identify the human user, client, and
 agent, but it does not automatically identify the current coding-agent
 session. If a gateway validates a Keycloak JWT, it should propagate
-`X-Memory-Actor-User` / `Sub` / `Client` / `Agent`; it should only emit
+`X-Memory-Actor-User` or the `Issuer` + `Sub` pair, plus optional `Client` /
+`Agent`; it should only emit
 `X-Memory-Actor-Session-Id` when a real agent session id has been
 forwarded by a session-aware bridge.
 
@@ -130,6 +169,8 @@ For built-in installs that use static MCP config, prefer:
   concurrent sessions still need explicit `workspace` + `project` args
   or a session-aware bridge when the MCP client cannot forward the hook
   session id.
+- `per_session` plus Claude Code's `install-mcp --session-aware` bridge when
+  one operator runs concurrent Claude Code sessions in different projects.
 
 ## Pairing with multi-user mode
 
@@ -144,8 +185,8 @@ sessions by the same user are isolated too.
 
 Single-user installs can use `per_session` alone (no `token_pepper`,
 no `users` row) only when the client/bridge forwards the session id on
-MCP calls. With the stock static MCP configs, use explicit
-`workspace` + `project` arguments for concurrent windows.
+MCP calls. Claude Code has the opt-in bridge above; with other stock static MCP
+configs, use explicit `workspace` + `project` arguments for concurrent windows.
 
 ## Memory footprint
 

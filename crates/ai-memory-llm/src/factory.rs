@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
 use crate::CopilotProvider;
@@ -15,7 +15,7 @@ use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
 use crate::auth::{AuthRequirement, ProviderAuth};
-use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
+use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
 use crate::provider::LlmProvider;
@@ -94,11 +94,15 @@ pub struct ProviderConfig {
     pub auth: ProviderAuth,
     /// Base URL override (required for OpenAI-compat).
     pub base_url: Option<String>,
-    /// Opt-in strict mode for the `openai-compat` provider: send
+    /// Strict mode for the `openai-compat` provider: send
     /// `response_format=json_schema` instead of the tolerant prose-JSON
-    /// parser. Ignored by every other provider. Sourced once from
-    /// `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
+    /// parser. Enabled by default and ignored by every other provider.
+    /// Sourced once from `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
     pub compat_strict: bool,
+    /// Per-request timeout for every chat provider, in seconds.
+    /// Sourced once from `AI_MEMORY_LLM_TIMEOUT_SECS` by `Config::load`;
+    /// defaults to [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`].
+    pub request_timeout_secs: u64,
 }
 
 /// Embedding providers available to ai-memory.
@@ -110,6 +114,9 @@ pub enum EmbedderChoice {
     Voyage,
     /// Google Gemini Embeddings API (`embedContent`).
     Google,
+    /// OpenAI-compatible embeddings endpoint (Ollama / LM Studio /
+    /// vLLM). Keyless-capable; base URL, model, and dim are required.
+    OpenAiCompat,
 }
 
 impl EmbedderChoice {
@@ -121,6 +128,7 @@ impl EmbedderChoice {
             Self::OpenAi => "openai",
             Self::Voyage => "voyage",
             Self::Google => "google",
+            Self::OpenAiCompat => "openai-compat",
         }
     }
 }
@@ -135,17 +143,24 @@ pub struct EmbedderConfig {
     /// Vector dimensionality. Refused on mismatch with the stored
     /// pages' dim.
     pub dim: u32,
-    /// API key.
+    /// API key. An empty value selects keyless `openai-compat`; hosted
+    /// providers require a non-empty key from the CLI configuration boundary.
     pub api_key: SecretString,
-    /// Optional base URL override.
+    /// Optional base URL override. Required for openai-compat.
     pub base_url: Option<String>,
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.
 ///
 /// # Errors
-/// Propagates HTTP-client construction errors.
+/// Returns [`LlmError::NotConfigured`] for a zero dimension or missing required
+/// base URL; propagates HTTP-client construction errors.
 pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
+    if config.dim == 0 {
+        return Err(LlmError::NotConfigured(
+            "AI_MEMORY_EMBEDDING_DIM must be greater than zero".into(),
+        ));
+    }
     let arc: Arc<dyn Embedder> = match config.provider {
         EmbedderChoice::OpenAi => {
             let mut e = OpenAiEmbedder::new(config.api_key, config.model, config.dim)?;
@@ -168,24 +183,45 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             }
             Arc::new(e)
         }
+        EmbedderChoice::OpenAiCompat => {
+            let base = config
+                .base_url
+                .ok_or_else(|| LlmError::NotConfigured("AI_MEMORY_EMBEDDING_BASE_URL".into()))?;
+            let api_key = (!config.api_key.expose_secret().is_empty()).then_some(config.api_key);
+            Arc::new(OpenAiCompatEmbedder::new(
+                base,
+                api_key,
+                config.model,
+                config.dim,
+            )?)
+        }
     };
     Ok(arc)
 }
 
-/// Default dim for known embedding models. Used when the operator
-/// omits `AI_MEMORY_EMBEDDING_DIM`. Falls back to a model-family
-/// default; unknown models still require an explicit dim.
+/// Default dim for known embedding models. Used when the operator omits
+/// `AI_MEMORY_EMBEDDING_DIM`. `openai-compat` has no safe default and returns
+/// zero; new callers should use [`try_default_embedding_dim`] when accepting
+/// that provider.
 #[must_use]
 pub fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> u32 {
+    try_default_embedding_dim(provider, model).unwrap_or(0)
+}
+
+/// Return the model-family embedding dimension when ai-memory has a safe
+/// default. Self-hosted OpenAI-compatible models require an explicit value.
+#[must_use]
+pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Option<u32> {
     match (provider, model) {
-        (EmbedderChoice::OpenAi, "text-embedding-3-small") => 1536,
-        (EmbedderChoice::OpenAi, "text-embedding-3-large") => 3072,
-        (EmbedderChoice::OpenAi, _) => 1536,
-        (EmbedderChoice::Voyage, "voyage-3-large") => 1024,
-        (EmbedderChoice::Voyage, _) => 1024,
-        (EmbedderChoice::Google, "gemini-embedding-2") => 768,
-        (EmbedderChoice::Google, "gemini-embedding-001") => 768,
-        (EmbedderChoice::Google, _) => 768,
+        (EmbedderChoice::OpenAi, "text-embedding-3-small") => Some(1536),
+        (EmbedderChoice::OpenAi, "text-embedding-3-large") => Some(3072),
+        (EmbedderChoice::OpenAi, _) => Some(1536),
+        (EmbedderChoice::Voyage, "voyage-3-large") => Some(1024),
+        (EmbedderChoice::Voyage, _) => Some(1024),
+        (EmbedderChoice::Google, "gemini-embedding-2") => Some(768),
+        (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
+        (EmbedderChoice::Google, _) => Some(768),
+        (EmbedderChoice::OpenAiCompat, _) => None,
     }
 }
 
@@ -195,18 +231,25 @@ pub fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> u32 {
 /// Returns [`LlmError::NotConfigured`] if a required env value (API
 /// key, base URL) is missing.
 pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>> {
+    let timeout = config.request_timeout_secs;
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(AnthropicProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                AnthropicProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                OpenAiProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::Gemini => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(GeminiProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                GeminiProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config
@@ -214,16 +257,21 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
-                    .with_strict(config.compat_strict),
+                    .with_strict(config.compat_strict)
+                    .with_timeout_secs(timeout),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
             let path = config.auth.require_openai_oauth_token_file()?.to_path_buf();
-            Ok(Arc::new(OpenAiOAuthProvider::new(path, config.model)?))
+            Ok(Arc::new(
+                OpenAiOAuthProvider::new(path, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
-            Ok(Arc::new(CopilotProvider::new(auth, config.model)?))
+            Ok(Arc::new(
+                CopilotProvider::new(auth, config.model)?.with_timeout_secs(timeout),
+            ))
         }
         ProviderChoice::AnthropicOAuth => {
             let token = config.auth.require_anthropic_oauth_token()?;
@@ -231,11 +279,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_timeout_secs(timeout)))
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenCodeProvider::new(key, config.model)?))
+            Ok(Arc::new(
+                OpenCodeProvider::new(key, config.model)?.with_timeout_secs(timeout),
+            ))
         }
     }
 }
@@ -292,6 +342,7 @@ mod tests {
             auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
             base_url: None,
             compat_strict: false,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
         };
 
         let err = match build_provider(cfg) {

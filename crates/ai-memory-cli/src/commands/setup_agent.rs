@@ -35,9 +35,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
+use crate::commands::install_mcp;
 use crate::commands::render_shared::{
-    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, build_claude_code_payload, build_grok_payload,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
+    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
+    build_claude_code_payload, build_devin_payload, build_grok_payload,
     hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -75,6 +77,9 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
+    eprintln!(
+        "[ai-memory] setup-agent emits shell/PowerShell hook bundles for {agent_sub}; these remote/compatibility bundles do not enforce capture-policy capability v1. Install local native hooks instead when policy enforcement is required."
+    );
 
     let source = resolve_source(args.source.as_deref(), agent_sub)?;
     let dest_dir = args.to.join(agent_sub);
@@ -129,7 +134,11 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     match args.agent {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
+        AgentChoice::Devin => emit_devin(&emit_root, &args)?,
         AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
+        AgentChoice::CommandCode => {
+            emit_other(&emit_root, agent_sub, &args, &[COMMAND_CODE_PROFILE.events])
+        }
         AgentChoice::Cursor => emit_other(&emit_root, agent_sub, &args, &[CURSOR_PROFILE.events]),
         AgentChoice::GeminiCli => {
             emit_other(&emit_root, agent_sub, &args, &[GEMINI_PROFILE.events]);
@@ -140,6 +149,16 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             &args,
             &[&ANTIGRAVITY_TOOL_EVENTS, &ANTIGRAVITY_LIFECYCLE_EVENTS],
         ),
+        // Kimi's success and failure post-tool events share one script. The
+        // script listing is deduplicated below; apply-mode owns the exact
+        // `[[hooks]]` TOML merge into the user's config.toml.
+        AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
+        AgentChoice::KiroCli => {
+            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
+        }
+        AgentChoice::KiroCliV3 => {
+            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
+        }
         AgentChoice::OpenCode
         | AgentChoice::Pi
         | AgentChoice::Omp
@@ -215,6 +234,12 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
         other => bail!("internal: {other:?} is not a generated-integration agent"),
     };
     println!("# {label} uses a TypeScript extension/plugin, not extracted shell scripts.");
+    println!(
+        "# Capture-policy capability v1 requires a freshly generated integration; re-run --apply after upgrades."
+    );
+    println!(
+        "# Legacy shell/PowerShell and remote-only paths are unsupported compatibility modes."
+    );
     println!("# Install it directly instead:");
     println!("ai-memory install-hooks --agent {agent} --apply \\");
     if args.auth_token.is_some() {
@@ -241,13 +266,17 @@ fn emit_claude_code(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
         build_claude_code_payload(emit_root, &args.server_url, args.auth_token.as_deref());
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing Claude Code hook config")?;
-    println!("# Claude Code — merge into ~/.claude/settings.json");
+    let settings_path = crate::commands::install_hooks::claude_settings_path()?;
+    println!("# Claude Code — merge into {}", settings_path.display());
     println!("# Hook scripts (must be reachable from the host that runs Claude Code):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);
     if args.auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook's env block.");
-        println!("#       Treat ~/.claude/settings.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            settings_path.display()
+        );
     }
     println!("# Tip: also run `ai-memory install-mcp --client claude-code --auth-token <…>`");
     println!("#      to register the MCP endpoint (separate from hooks).");
@@ -260,20 +289,61 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     let payload = build_grok_payload(emit_root, &args.server_url, args.auth_token.as_deref());
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing Grok hook config")?;
-    println!("# Grok Build CLI — write to ~/.grok/hooks/ai-memory.json");
+    let grok_home = install_mcp::grok_home()?;
+    let hooks_path = grok_home.join("hooks/ai-memory.json");
+    println!("# Grok Build CLI — write to {}", hooks_path.display());
     println!("# Hook scripts (must be reachable from the host that runs Grok):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);
     if args.auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.grok/hooks/ai-memory.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            hooks_path.display()
+        );
     }
     println!("# NOTE: Grok ignores SessionStart stdout, so this config captures");
     println!("#       lifecycle events but does not inject handoffs automatically.");
     println!("#       Recover handoffs via the MCP memory_handoff_accept tool.");
+    println!("# Tip: also run `ai-memory install-mcp --client grok --auth-token <…>`");
+    println!(
+        "#      to register the MCP endpoint in {}.",
+        grok_home.join("config.toml").display()
+    );
     println!();
     println!("{serialized}");
     Ok(())
+}
+
+fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
+    print!("{}", render_devin_setup_output(emit_root, args)?);
+    Ok(())
+}
+
+fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<String> {
+    let payload = build_devin_payload(emit_root, &args.server_url, args.auth_token.as_deref());
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Devin hook config")?;
+    let mut out = String::new();
+    out.push_str(
+        "# Devin CLI — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key\n",
+    );
+    out.push_str("# Hook scripts (must be reachable from the host that runs Devin):\n");
+    out.push_str(&format!("#   {}\n", emit_root.display()));
+    out.push_str(&format!("# AI-memory server: {}\n", args.server_url));
+    if args.auth_token.is_some() {
+        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
+        out.push_str(
+            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600).\n",
+        );
+    }
+    out.push_str(
+        "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart.\n",
+    );
+    out.push('\n');
+    out.push_str(&serialized);
+    out.push('\n');
+    Ok(out)
 }
 
 fn emit_other(
@@ -306,7 +376,12 @@ fn event_script_paths(emit_root: &Path, event_lists: &[&[(&str, &str)]]) -> Vec<
     for events in event_lists {
         for (_, script) in *events {
             let script = hook_script_for_current_platform(script);
-            paths.push(emit_root.join(script.as_ref()));
+            let path = emit_root.join(script.as_ref());
+            // Two events may share one script (Kimi Code's PostToolUseFailure
+            // reuses post-tool-use); list each file once.
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
         }
     }
     paths
@@ -323,13 +398,21 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
     let Some(source_hooks_root) = source_dir.parent() else {
         return Ok(());
     };
+    let Some(dest_hooks_root) = dest_dir.parent() else {
+        return Ok(());
+    };
+    let shared_lib = source_hooks_root.join("_lib.sh");
+    if shared_lib.is_file() {
+        let to = dest_hooks_root.join("_lib.sh");
+        fs::copy(&shared_lib, &to)
+            .with_context(|| format!("copying {} → {}", shared_lib.display(), to.display()))?;
+    }
+
     let source_lib = source_hooks_root.join("lib");
     if !source_lib.is_dir() {
         return Ok(());
     }
-    let Some(dest_hooks_root) = dest_dir.parent() else {
-        return Ok(());
-    };
+
     let dest_lib = dest_hooks_root.join("lib");
     fs::create_dir_all(&dest_lib)
         .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
@@ -463,6 +546,85 @@ mod tests {
     }
 
     #[test]
+    fn devin_setup_emits_script_hook_config() {
+        let args = SetupAgentArgs {
+            agent: AgentChoice::Devin,
+            to: PathBuf::from("/container/hooks"),
+            host_prefix: Some(PathBuf::from("/host/hooks")),
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: Some("token-for-test".into()),
+            source: None,
+        };
+        let emit_root = Path::new("/host/hooks/devin");
+
+        let rendered = render_devin_setup_output(emit_root, &args).unwrap();
+
+        assert!(rendered.contains("# Devin CLI"));
+        assert!(rendered.contains("~/.devin/hooks.v1.json"));
+        assert!(rendered.contains("hookSpecificOutput.additionalContext"));
+        assert!(rendered.contains("AI_MEMORY_AUTH_TOKEN"));
+
+        let json_start = rendered.find('{').expect("rendered Devin config JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered[json_start..]).unwrap();
+        let hooks = parsed["hooks"].as_object().expect("hooks object");
+        assert!(hooks["SessionStart"].is_array());
+        assert!(hooks["PostCompaction"].is_array());
+        assert!(hooks.get("PreCompact").is_none());
+        assert!(hooks.get("SubagentStart").is_none());
+        assert!(hooks.get("SubagentStop").is_none());
+
+        let session_start = hooks["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(session_start.contains("/host/hooks/devin/session-start.sh"));
+        // Script-mode handlers inline env vars into the command string
+        // itself (see `claude_code_payload_embeds_auth_token_when_provided`
+        // in render_shared.rs) rather than using a separate `env` field.
+        assert!(
+            session_start.contains("AI_MEMORY_AUTH_TOKEN=token-for-test"),
+            "command should inline the auth token; got: {session_start}"
+        );
+
+        let post_compaction = hooks["PostCompaction"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(post_compaction.contains("/host/hooks/devin/post-compaction.sh"));
+    }
+
+    #[test]
+    fn devin_setup_copies_event_scripts_and_shared_lib() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source_root = tmp.path().join("source");
+        let source_devin = source_root.join("devin");
+        fs::create_dir_all(&source_devin).unwrap();
+        fs::write(
+            source_devin.join("session-start.sh"),
+            "#!/bin/sh\n. \"$(dirname \"$0\")/../_lib.sh\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source_root.join("_lib.sh"),
+            "ai_memory_json_string() { cat; }\n",
+        )
+        .unwrap();
+
+        let dest = tmp.path().join("dest");
+        let args = SetupAgentArgs {
+            agent: AgentChoice::Devin,
+            to: dest.clone(),
+            host_prefix: None,
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: None,
+            source: Some(source_root),
+        };
+
+        run(&Config::default(), args).unwrap();
+
+        assert!(dest.join("devin/session-start.sh").exists());
+        assert!(dest.join("_lib.sh").exists());
+    }
+
+    #[test]
     fn manual_script_paths_use_agent_specific_events() {
         let root = Path::new("/hooks/gemini-cli");
         let paths = event_script_paths(root, &[GEMINI_PROFILE.events]);
@@ -484,6 +646,85 @@ mod tests {
         assert!(
             !rendered.contains("subagent-start") && !rendered.contains("subagent-stop"),
             "Gemini has no subagent hook events; setup-agent must not print nonexistent scripts"
+        );
+    }
+
+    #[test]
+    fn kimi_code_manual_script_paths_cover_kimi_event_set() {
+        // Kimi Code's hook vocabulary is Claude Code's nine events plus
+        // PostToolUseFailure; the failure entry reuses post-tool-use.sh,
+        // so the script list carries nine unique files for ten events.
+        let root = Path::new("/hooks/kimi-code");
+        let paths = event_script_paths(root, &[&KIMI_CODE_EVENTS]);
+        let rendered = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for script in [
+            "session-start",
+            "session-end",
+            "user-prompt-submit",
+            "pre-tool-use",
+            "post-tool-use",
+            "pre-compact",
+            "stop",
+            "subagent-start",
+            "subagent-stop",
+        ] {
+            assert!(
+                rendered.contains(script),
+                "Kimi Code setup-agent must list {script}; got:\n{rendered}"
+            );
+        }
+        assert!(
+            KIMI_CODE_EVENTS
+                .iter()
+                .any(|(event, _)| *event == "PostToolUseFailure")
+        );
+        assert_eq!(KIMI_CODE_EVENTS.len(), 10);
+        assert_eq!(paths.len(), 9);
+    }
+
+    #[test]
+    fn kiro_cli_manual_script_paths_cover_v2_event_set() {
+        let root = Path::new("/hooks/kiro-cli");
+        let v2_paths = event_script_paths(root, &[&KIRO_CLI_V2_EVENTS]);
+        let rendered = v2_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for script in [
+            "session-start",
+            "user-prompt-submit",
+            "pre-tool-use",
+            "post-tool-use",
+            "stop",
+        ] {
+            assert!(
+                rendered.contains(script),
+                "Kiro CLI setup-agent must list {script}; got:\n{rendered}"
+            );
+        }
+        // The documented v2 vocabulary has no PreCompact, SessionEnd, or
+        // subagent equivalents.
+        assert_eq!(KIRO_CLI_V2_EVENTS.len(), 5);
+        assert_eq!(v2_paths.len(), 5);
+    }
+
+    #[test]
+    fn kiro_cli_manual_script_paths_cover_v3_event_set() {
+        let root = Path::new("/hooks/kiro-cli");
+        let paths = event_script_paths(root, &[&KIRO_CLI_V3_EVENTS]);
+        assert_eq!(KIRO_CLI_V3_EVENTS.len(), 5);
+        assert_eq!(paths.len(), 5);
+        assert_eq!(
+            paths,
+            event_script_paths(root, &[&KIRO_CLI_V2_EVENTS]),
+            "v2 and v3 use different trigger names but the same bounded script bundle"
         );
     }
 }

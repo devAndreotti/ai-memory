@@ -8,11 +8,12 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. |
+| `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
-| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory, reports filesystem partial failures, and dispatches mirror notification after durable work. |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
+| `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
@@ -77,20 +78,40 @@ What happens, in order:
 
 1. Server looks up `(workspace_id, project_id)` by name. Returns 404
    if either is missing.
-2. Counts rows that will cascade (`pages`, `sessions`,
-   `observations`, `handoffs`, `page_embeddings`).
-3. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
+2. Refuses with 409 when a managed workstream under the project still
+   holds a **live** run lease (`managed_runs.state = 'active'` AND
+   `lease_expires_at` in the future). `workstreams` cascades out of
+   `projects` and `managed_runs` cascades out of `workstreams`, so
+   purging would delete a running agent's lease row: its heartbeat
+   would then fail with `409 managed run lease is not active` for the
+   rest of the session and the transcript would never reach the ledger.
+   A lapsed lease (crashed wrapper) does **not** block the purge.
+   `--force` purges anyway.
+3. Counts rows that will cascade (`pages`, `sessions`,
+   `observations`, `handoffs`, `page_embeddings`, plus `workstreams`
+   and `managed_runs`).
+4. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
    `ON DELETE CASCADE` foreign keys propagate to every dependent
    table in one transaction.
-4. `std::fs::remove_dir_all(<wiki_root>/<workspace_id>/<project_id>)`
-   wipes the on-disk project root.
-5. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
-   files_deleted: [<project_root>], files_failed: [...]}`.
+5. Best-effort filesystem cleanup removes both the UUID-namespaced wiki root
+   and every `<data_dir>/raw/workstreams/<workstream_id>/` segment directory.
+6. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
+   workstreams_deleted, managed_runs_deleted, workstream_ids,
+   files_deleted: [<project_root>, <raw_workstream_dir>, ...],
+   files_failed: [...]}`.
+
+`workstream_ids` remains in the report for auditability. Each corresponding
+raw segment directory is removed on the server and appears in
+`files_deleted`; a failed removal appears in `files_failed` alongside wiki
+cleanup failures.
 
 Failure modes:
 
 - **Workspace or project name not found** → 404, no mutation.
 - **Confirmation flag omitted** → 400, no mutation.
+- **Live managed run, no `--force`** → 409 naming the workstreams, no
+   mutation. Finish or cancel the session, or re-run with `--force`
+   (the running agent then stops being able to save its history).
 - **`remove_dir_all` partial failure** (e.g. permissions) → DB
    rows are already gone but `files_failed` is populated. Re-run
    the command with the same args is idempotent; the second call
@@ -125,6 +146,14 @@ What happens:
 Zero files move on disk because the disk path is keyed by
 `project_id`, not name. The web UI URL `/web/w/<ws>/<proj-name>/…`
 just resolves to the same `project_id` after the column update.
+This command also does not rename a source checkout or rewrite any native agent
+session locator. See [managed workstream rename
+behavior](managed-workstreams.md#project-and-directory-renames) before
+physically renaming a checkout that has native sessions.
+After a successful CLI rename, the client also rekeys its local `show` checkout
+link. A direct `/admin/rename-project` request cannot update other machines'
+client registries; the next successful managed `run` from a checkout refreshes
+its link.
 
 Failure modes:
 
@@ -155,17 +184,20 @@ Failure modes:
 
 ### `/admin/delete-workspace`
 
-Deletes a workspace row and all child projects/pages/sessions through the
-`workspace_id` cascade. The route is guarded by `force: true` for non-empty
-workspaces and follows the destructive-operation ordering used by project
-purges:
+Deletes a workspace row and all child projects/pages/sessions/managed
+workstreams through the `workspace_id` cascade. The route is guarded by
+`force: true` for non-empty workspaces and follows the destructive-operation
+ordering used by project purges:
 
 1. Look up the workspace without creating missing scopes.
 2. Run blocking `op=purge_workspace` admission. A reject-policy webhook aborts
    before DB rows or files are removed.
 3. Take a pre-delete checkpoint if the wiki tree is dirty.
 4. Delete the workspace in one writer-actor transaction.
-5. Remove `<wiki_root>/<workspace_id>` from disk.
+5. Remove `<wiki_root>/<workspace_id>` and every affected
+   `<data_dir>/raw/workstreams/<workstream_id>` directory from disk. The
+   response reports `workstreams_deleted`, `managed_runs_deleted`, and the
+   cleaned `workstream_ids` alongside the filesystem results.
 6. Dispatch non-blocking `purge_workspace` mirror notifications after durable
    work. If the DB delete committed but disk removal failed, the response
    includes `files_failed` and webhook `ctx.partial_failure: true`.
@@ -210,9 +242,16 @@ a low-level re-stamp:
    wiki root).
 6. Re-stamp `workspace_id` across every domain table for the project in
    **one transaction**, keeping the same `project_id`
-   (`projects`, `pages`, `sessions`, `observations`, `handoffs`,
-   `audit_log`). `page_embeddings` and `links` are keyed by `page_id`, so
-   they follow with no re-stamp.
+   (`projects`, `pages`, `sessions`, `observations`, `handoffs`, `audit_log`,
+   auto-improvement state, SessionEnd consolidation jobs, and managed
+   `workstreams`). Native workstream sessions, runs, and events remain attached
+   through `workstream_id`; `page_embeddings` and `links` remain attached
+   through `page_id`, so none of those rows need a direct re-stamp.
+
+After a successful CLI true move, or a completed copy-purge move, the client
+rekeys its local `show` checkout link. Existing destination links win during a
+merge. Direct admin API callers leave client-local registries untouched; a
+later successful managed `run` repairs the relevant link.
 
 Ordering is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of
 disk**: a rename failure touches nothing; a crash between the two steps leaves
@@ -245,10 +284,18 @@ deploy — the admission/git-mirror webhooks all fire), source embeddings
 are carried over verbatim, and only then is the source purged
 (`merged_into_existing: true`, `source_purged: true`).
 
+`--force` overrides only the hook router's active-project guard. It never
+deletes a live managed-workstream lease during this destructive path; finish
+or cancel that run before retrying. A true move keeps the same project and
+lease ids, so it does not need this additional guard.
+
 Copy-before-purge means any copy failure aborts **before** the purge,
 leaving the source intact. An unreadable source file is skipped and also
 blocks the purge (`source_purged: false`) so a fixed re-run is safe
-(re-running is idempotent — copied pages just supersede).
+(re-running is idempotent — copied pages just supersede). A **live managed
+run** under the source blocks the purge leg the same way: the move returns
+409 saying how many pages were already copied, and the source stays intact
+until the session ends and the move is re-run.
 
 **Same-path conflicts (`on_conflict`).** When a source page's path already
 exists in the destination with a different body, frontmatter, title, tier, or
@@ -281,7 +328,7 @@ supersession chain (the real page history lives in the wiki's git
 mirror). The `true-move` path has no such loss.
 
 > **Operational caveat — moving the project the current session writes
-> to.** Lifecycle hooks stamp an observation on every tool call into the
+> to.** Lifecycle hooks stamp a bounded observation on every supported tool-lifecycle event into the
 > session's project. If you move that very project mid-session, the next
 > hook re-creates the source (`scratch`-style) under the old workspace.
 > Before moving a live project, point the repo's `.ai-memory.toml` at the
@@ -306,6 +353,159 @@ Failure modes:
   committed move. If a rare rollback double-fault happens after the
   directory moved but before SQL committed, the error includes the
   exact manual repair.
+
+### `move-session`
+
+```bash
+# One session, page and history included (dry run: no --confirm)
+ai-memory move-session 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --to NAS_general
+# Apply
+ai-memory move-session 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --to NAS_general --confirm
+# Every session of a stray project, into another workspace, page regenerated later
+ai-memory move-session --from-project tmp --to NAS_general --to-workspace home \
+  --pages regenerate --confirm
+```
+
+Moves one session, or every session touching `--from-project`, into another
+project, in the same or another workspace. Use it when a session was
+captured under the wrong project (a `cd` into `/tmp` before sticky routing,
+a subagent started in a scratch directory, a repo cloned under a temporary
+name) and its observations should live with the project they are about.
+Unlike `reorg`, which re-derives every session's project from its `cwd`,
+this names the destination explicitly and leaves the rest of the store
+alone. Sessions already rooted in the destination only get their stray rows
+re-homed: the `sessions` row stays, every row of theirs still lying in
+another scope is gathered into the destination, and the report says
+`session_moved: false` with the counts. The batch form therefore sees a
+session through a `sessions` row in the source OR observations stamped into
+it, which is what empties a phantom bucket that holds only observations of
+sessions rooted elsewhere (mid-session routing before sticky).
+
+**Request.** `POST /admin/move-session` takes either
+`{"session_id": "<uuid>", "workspace"?, "project", "pages"?, "confirm"?,
+"force"?, "create"?}` or the batch form `{"from_workspace"?, "from_project",
+"workspace"?, "project", "pages"?, "confirm"?, "force"?, "create"?}`.
+`workspace` (the destination) defaults to the source workspace;
+`from_workspace` defaults to `default`. The CLI resolves `--from-project`
+like every other scope argument (marker, else literal); `--to` and
+`--to-workspace` stay literal.
+
+**What moves, per session, in ONE transaction:** the `sessions` row, every
+`observations` row of the session (including any that landed in another
+scope), the `handoffs` it produced (`from_session_id`), its
+`session_consolidation_jobs`, `auto_improve_runs` and
+`auto_improve_scheduler_claims`, and its `sessions/<id>.md` page:
+
+- `--pages move` (default): every version of the page is re-stamped into the
+  destination and the file is renamed into the destination project
+  directory, so the curated page and its supersession history follow the
+  session. Refused with `409` when the destination already has a latest page
+  (or a page file) at that path; retry with `--pages regenerate` or resolve
+  the destination page first.
+- `--pages regenerate`: the source versions are retired (`is_latest = 0`),
+  the session's `summary_page_id` is cleared when it pointed at them, and the
+  file is removed, so the next consolidation of the session writes a fresh
+  page in the destination. The file has to go: a page file left on
+  disk with no latest row is re-indexed as a new latest page by the next
+  reconciliation pass.
+
+The audit row (`op = move_session`) carries the operator when the request
+was attributed. What does NOT move: `sessions.cwd` (historical truth; the
+response carries `cwd_warning` when its basename is not the destination
+project, since new sessions started there still resolve by basename unless a
+`.ai-memory.toml` marker pins the project), other pages written during the
+session (decisions, gotchas: pages are not tracked per session), handoffs the
+session *accepted*, and `auto_improve_proposals` (they have no `session_id`;
+they target pages in the scope they were staged in). `entities` and
+`page_feedback` are not re-stamped either, the same gap `move-project` has.
+
+**Order of operations (per session):** validate the destination (404 unless
+`create`), reject a batch whose source is the destination (422; the single
+form with the session's own project is a re-home), run the guards (the
+open-session guard does not apply to a re-home, whose row does not move),
+then, under the
+wiki's exclusive mutation gate, fire `op=move_session` admission webhooks
+(source names in `ctx.workspace`/`ctx.project`, destination names in
+`ctx.destination_*`), move the file, and re-stamp SQLite. Disk goes first
+and SQL last, as in `move-project`: a store failure renames the file back,
+so the move is all-or-nothing unless the filesystem also refuses the
+rollback, in which case the error names the manual repair. A `--confirm`
+run takes a wiki checkpoint before and after; a batch takes one pair for
+the whole run.
+
+**Dry run by default.** Without `--confirm` the server runs the same
+transaction and rolls it back, so the counts in the response are exact
+(`dry_run: true`), and the CLI prints the exact command to apply. Nothing
+is written and no audit row is left; with `--create` against a destination
+that does not exist yet the dry run does not create it either: it reports
+`would_create_project: true` with the counts of what would move (the CLI
+says "would create project"), and only the `--confirm` run creates it.
+
+**Guards (409 unless `--force`).** A session that is still open (no session
+end recorded) may still receive events; a `pending`/`running` consolidation
+job would write the page under the old scope; the batch form also refuses
+the project the hook router has published as active, like `move-project`.
+`--force` proceeds. A re-home (the session row already sits in the
+destination) skips the open-session guard: the row does not move, so an
+open session only has its stray rows gathered; the job guard still applies. Note that forcing an open session leaves the hook
+router's per-session active pointer on the old scope until it expires;
+sticky routing then keeps following the session row, which is now the
+destination.
+
+**Batch form.** Every session of the source scope moves one at a time, each
+in its own transaction. The batch stops at the first refusal and the error
+body reports `moved`/`total` and the sessions already moved (they stay
+moved). A dry run of the batch shows the whole plan first.
+
+Response (`MoveSessionReport`): `session_id`, `dry_run`, `session_moved`
+(`false` for a re-home), `from`/`to`
+(`{workspace, project}`), `summary` (`observations`, `handoffs`,
+`consolidation_jobs`, `auto_improve_runs`, `auto_improve_claims`,
+`page_versions_moved`, `pages_regenerated`), `page` (`moved` |
+`regenerated` | `already in destination` for a re-home whose page rows all
+sit in the destination | `none` when the session has no page anywhere),
+`cwd`, `cwd_warning`, `would_create_project` (dry run with `create` only),
+`pre_checkpoint` (only when the wiki tree had uncommitted changes before the
+move), `checkpoint` (only when the move changed the tree). The batch wraps
+them in `{dry_run, would_create_project?, from, to, total, moved, sessions:
+[...]}`.
+
+Failure modes:
+
+- **Neither `session_id` nor `from_project`, or both** → 400.
+- **Session or destination not found** → 404 (pass `create` / `--create`
+  to create the destination).
+- **Batch source equals the destination** → 422 (the single form with the
+  session's own project is a re-home, 200 with `session_moved: false`).
+- **Open session (unless the row already sits in the destination), pending
+  consolidation job, or active source project (batch)** → 409 without
+  `force`.
+- **Latest page or page file already at `sessions/<id>.md` in the
+  destination** (`--pages move`) → 409; nothing moved.
+- **Store failure after the file moved** → 500, file renamed back; the
+  error names the manual repair if that rollback also fails.
+
+**It drains every scope, not just the one you named.** Dependent rows are
+matched by session id alone, so a session whose observations were scattered
+across projects (pre-`sticky` mid-session routing, for instance) is gathered
+whole. That is the point of the command — but it means a move can empty a
+project you did not mention, and it is **not cleanly reversible**: moving the
+session back later returns every row to a single project, and the original
+per-row split is gone.
+
+The dry run therefore names each scope it would drain, with counts:
+
+```text
+  gathering observations out of 2 scopes into default/acme-api:
+    default/scratchpad: 3 observation(s)
+    default/tmp: 1 observation(s)
+  Note: this empties every scope listed above, not only the one named as the
+  source. Moving the session back later returns all rows to a single project —
+  the split shown here is not restored.
+```
+
+`POST /admin/move-session` reports the same list as `source_scopes`. Read it
+before confirming.
 
 ### `checkpoints`
 
@@ -520,6 +720,16 @@ ai-memory rename-project --from old --to new
 # (the hook router stamps by basename(cwd) = "new"); past
 # observations stay under that project too because the project_id
 # is stable.
+```
+
+### "Reattach a session captured under the wrong project"
+
+```bash
+ai-memory move-session <session-id> --to my-project          # dry run
+ai-memory move-session <session-id> --to my-project --confirm
+# Or empty a stray project into the right one, then drop the husk:
+ai-memory move-session --from-project tmp --to my-project --confirm
+ai-memory purge-project --project tmp --confirm
 ```
 
 ## Why this matters: the flat-wiki incident

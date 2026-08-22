@@ -6,7 +6,8 @@ agent CLI actually runs.
 ## Rule Of Thumb
 
 Run `install-mcp` and `install-hooks` from the same environment that
-launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
+launches Claude Code, Codex, Command Code, Devin CLI, Cursor, Gemini CLI, Kimi Code, Kiro CLI,
+Antigravity CLI, or another agent.
 
 - If the agent runs inside WSL2, install ai-memory inside WSL2.
 - If the agent runs as a native Windows process, install ai-memory from
@@ -16,14 +17,13 @@ launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
 
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
-agents need Windows paths, but the hook runner is agent-specific:
-Claude Code invokes its hooks with Claude's direct exec form
-(`command: "…ai-memory.exe"`, `args: ["hook", "--event", …]`) with no shell — see [Native Hook
-Command](#native-hook-command-claude-code-on-windows). Set
-`AI_MEMORY_HOOK_PLATFORM=windows-bash` to fall back to the older
-`bash -c` + `.sh` Git Bash commands. Other native Windows script-hook
-agents keep the PowerShell `.ps1` default until their harness behavior
-is verified.
+agents need Windows paths, but the hook runner is agent-specific: local
+supported profiles default to host-native commands. Claude Code may use
+its supported direct exec form (`command: "…ai-memory.exe"`, `args: ["hook",
+"--event", …]`) with no shell — see [Native Hook
+Command](#native-hook-command-claude-code-on-windows). Other agents use native
+single command strings matching their hook schema. PowerShell/Git Bash script
+bundles are compatibility fallbacks and do not enforce capture-policy v1.
 
 ## Scenario A: Everything Inside WSL2
 
@@ -33,9 +33,15 @@ installed and launched inside a WSL2 distro.
 ```bash
 # Inside WSL2.
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \
-    -o ~/.local/bin/ai-memory
-chmod +x ~/.local/bin/ai-memory
+wrapper_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper
+wrapper_tmp="$(mktemp -d)"
+trap 'rm -rf "$wrapper_tmp"' EXIT
+curl -fsSL "$wrapper_base" -o "$wrapper_tmp/ai-memory-wrapper"
+curl -fsSL "$wrapper_base.sha256" -o "$wrapper_tmp/ai-memory-wrapper.sha256"
+(cd "$wrapper_tmp" && sha256sum -c ai-memory-wrapper.sha256)
+install -m 0755 "$wrapper_tmp/ai-memory-wrapper" ~/.local/bin/ai-memory
+rm -rf "$wrapper_tmp"
+trap - EXIT
 export PATH="$HOME/.local/bin:$PATH"
 
 docker run -d --name ai-memory \
@@ -69,10 +75,26 @@ the ai-memory server to run from the Docker image.
 # Install the Windows Docker wrapper.
 $UserBin = "$HOME\bin"
 New-Item -ItemType Directory -Force $UserBin | Out-Null
-foreach ($File in @("ai-memory.ps1", "ai-memory.cmd")) {
+$ReleaseBase = "https://github.com/akitaonrails/ai-memory/releases/latest/download"
+$WrapperAssets = @{
+    "ai-memory.ps1" = "ai-memory-wrapper.ps1"
+    "ai-memory.cmd" = "ai-memory-wrapper.cmd"
+}
+foreach ($Entry in $WrapperAssets.GetEnumerator()) {
+    $File = $Entry.Key
+    $Asset = $Entry.Value
     Invoke-WebRequest `
-        -Uri "https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/$File" `
+        -Uri "$ReleaseBase/$Asset" `
         -OutFile "$UserBin\$File"
+    Invoke-WebRequest `
+        -Uri "$ReleaseBase/$Asset.sha256" `
+        -OutFile "$UserBin\$File.sha256"
+    $Expected = ((Get-Content "$UserBin\$File.sha256" -Raw) -split '\s+')[0]
+    $Actual = (Get-FileHash "$UserBin\$File" -Algorithm SHA256).Hash.ToLower()
+    if ($Actual -ne $Expected.ToLower()) {
+        throw "Checksum mismatch for $Asset"
+    }
+    Remove-Item "$UserBin\$File.sha256"
 }
 Get-ChildItem "$UserBin\ai-memory.*" | Unblock-File
 
@@ -91,6 +113,8 @@ docker run -d --name ai-memory `
     -v ai-memory-data:/data `
     akitaonrails/ai-memory:latest
 
+# Do not also run `ai-memory serve`; the long-lived container above is the server.
+
 # Verify the wrapper can reach the server.
 ai-memory status
 
@@ -104,15 +128,37 @@ the CLI to render hook commands for the native Windows agent:
 
 - Config files are written through the mounted Windows home directory.
 - Hook scripts are staged under `$HOME\.local\share\ai-memory\hooks\`.
-- Claude Code hook commands call the `ai-memory` binary directly with Claude's
-  exec form (`command` executable + `args` argv array), no shell — set
-  `AI_MEMORY_HOOK_PLATFORM=windows-bash` for the old `bash -c` + `.sh`
-  Git Bash path.
-- Other native Windows script-hook agents currently call `powershell.exe` and
-  point at `.ps1` scripts.
+- Local supported profiles default to host-native commands. Claude Code may use
+  its exec form (`command` executable + `args` argv array), while other agents
+  use native single command strings matching their hook schema. The wrapper
+  renders those `.ps1` fallback commands with PowerShell `-EncodedCommand` so a
+  hook runner cannot expand their `$env:` setup before the inner PowerShell
+  process receives it. Those commands force text output and suppress progress
+  records so nested PowerShell runners do not emit `CLIXML` hook stderr.
+  PowerShell/Git Bash script bundles are compatibility fallbacks and do not
+  enforce capture-policy v1.
+
+After upgrading the wrapper/image, rerun `install-hooks --agent <agent> --apply`
+for each native Windows agent so existing hook entries receive the current
+command form.
 
 Use the matching `--client` / `--agent` values for other clients, for
-example `codex`, `cursor`, or `gemini-cli`.
+example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
+
+For Devin, `install-mcp --client devin --apply` writes MCP config to
+`%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`
+writes lifecycle hooks to `%USERPROFILE%\.devin\hooks.v1.json` by default;
+pass `--config-file "%USERPROFILE%\.devin\config.json"` if you want hooks under
+the `hooks` key in Devin's main config file.
+
+For Kiro CLI, `install-mcp --client kiro-cli --apply` writes
+`%USERPROFILE%\.kiro\settings\mcp.json` unless `$env:KIRO_HOME` overrides the
+root. `install-hooks --agent kiro-cli --apply` updates existing v2 agent files
+under `.kiro\agents`; use `--config-file` for a project-local agent. Kiro v3
+hook capture remains unsupported pending sanitized live lifecycle and built-in
+tool payload fixtures for its documented standalone schema. Run these commands
+from the same native Windows environment that launches Kiro so generated
+executable paths remain valid.
 
 ## Scenario C: Prebuilt Release Binary (No Toolchain)
 
@@ -195,11 +241,19 @@ target\debug\ai-memory.exe install-mcp --client claude-code --apply
 target\debug\ai-memory.exe install-hooks --agent claude-code --apply
 ```
 
-Native Windows builds render agent-specific lifecycle hooks. Claude Code
-defaults to the native binary command (see below); other script-hook agents
-use the PowerShell `.ps1` default. The hook bundle still ships matching `.sh`
-and `.ps1` event scripts as a fallback, and tests enforce one-to-one
-event/agent parity between them.
+Native Windows builds render agent-specific host-native lifecycle commands.
+Claude Code may use its supported binary exec form (see below); other agents
+use native single command strings matching their hook schema. The bundled `.sh`
+and `.ps1` event scripts are compatibility fallbacks and do not enforce
+capture-policy v1; tests enforce one-to-one event/agent parity between them.
+
+### Capture-policy support
+
+Native `ai-memory.exe hook` commands enforce the nearest-marker `[capture]
+ignore_paths` policy before spool or network delivery. The legacy `.ps1` and
+`.sh` paths do not. After upgrading, rerun `install-hooks --agent <agent>
+--apply` to refresh native hook entries; selected-install capability output says
+whether enforcement is active. See [Capture exclusions](marker-file.md#capture-exclusions).
 
 ## Native Hook Command (Claude Code on Windows)
 
@@ -222,26 +276,30 @@ path is roughly 3-5× faster per hook (measured ~735 ms shell → ~150-205 ms
 native on an i7-6700HQ). Notes:
 
 - The binary path comes from the `ai-memory` that runs `install-hooks`, so
-  `cargo install --path crates/ai-memory-cli` puts it on a stable
+  `cargo install --locked --path crates/ai-memory-cli` puts it on a stable
   `~/.cargo/bin` path.
 - Exec form requires a real executable path (`.exe`). It does not run `.cmd` or
   `.bat` shims through a shell. `install-hooks` uses the path of the running
   `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
-- `AI_MEMORY_HOOK_PLATFORM` accepts four values:
+- `AI_MEMORY_HOOK_PLATFORM` accepts five values:
   - `windows-native` — Claude exec-form direct binary call (default on native Windows).
+  - `windows` — PowerShell `-EncodedCommand` + staged `.ps1` script. The native
+    Windows Docker-wrapper default because the helper container cannot install
+    its Linux binary into a host hook entry.
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in, or as a fallback for older Claude Code
     builds that do not support exec form).
-  - `posix` — POSIX `.sh`. The Docker-wrapper default (the host has no local
-    binary); set it explicitly to opt a native install back into the scripts.
+  - `posix` — POSIX `.sh`. The Linux/macOS Docker-wrapper default (the host has
+    no local binary); set it explicitly to opt a native install back into the
+    scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
     --event …`) instead of the `.sh` script, so the hook uses the local event
     spool + OIDC-token fallback. The **default for native macOS / Linux
     Claude Code installs** (cargo / release binary), mirroring
-    `windows-native`. The Docker wrapper forces `posix`, so its host-rendered
-    config keeps the `.sh` scripts.
+    `windows-native`. The Linux/macOS Docker wrapper forces `posix`, so its
+    host-rendered config keeps the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
@@ -261,6 +319,12 @@ built-in timings stay short on agent-facing paths, but high-latency or
 large-backlog instances can raise them with whole-minute overrides. Unlike
 `AI_MEMORY_HOOK_PLATFORM`, these are read by the hook **at runtime**, so they
 apply to the agent's environment (no re-`install-hooks` needed):
+
+Native hooks accept well-formed JSON with or without one leading UTF-8 BOM, as
+some PowerShell pipelines add that marker when writing to a native process. Any
+other malformed stdin is not spooled or sent; the hook prints a fixed warning
+to stderr, returns `{}` on stdout, and exits successfully so it cannot break the
+host agent. The warning never includes payload contents.
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|
@@ -292,7 +356,8 @@ Windows agent builds.
   Claude Code invokes hooks as a direct binary call (no shell) by default;
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` restores the Git Bash `bash -c`
   path. WSL2 Claude Code uses normal WSL `.sh` paths.
-- Codex, OpenCode, Cursor, Gemini CLI, Grok Build CLI, and OpenClaw may each choose different
+- Codex, Command Code, Devin CLI, OpenCode, Cursor, Gemini CLI, Antigravity
+  CLI, Grok Build CLI, Zero, Kimi Code, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
   installations.
@@ -313,7 +378,8 @@ For WSL2:
 2. Confirm generated hook commands reference `.sh` files under WSL paths.
 3. Launch the agent from WSL2.
 4. Call `memory_status` from the agent.
-5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.
+5. Record `ai-memory status`, send a prompt, then confirm its `sessions` or
+   `observations` count increased.
 
 For native Windows:
 
@@ -322,10 +388,14 @@ For native Windows:
 2. Confirm generated hook commands match the agent: Claude Code should use
    the native `"…ai-memory.exe" hook --event …` command (or `bash -c` + `.sh`
    when `AI_MEMORY_HOOK_PLATFORM=windows-bash`); other script-hook agents
-   should use `.ps1` files under your Windows home directory.
+   should use `powershell.exe ... -EncodedCommand <payload>` entries for the
+   generated `.ps1` hooks under your Windows home directory.
 3. Launch the native Windows agent.
 4. Call `memory_status` from the agent.
-5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.
+5. Record `ai-memory status`, send a prompt, then confirm its `sessions` or
+   `observations` count increased.
 
 Report which mode you tested, which agent and version you used, and
 whether the hook command executed or failed with a path/shell error.
+The built-in `/web` browser lists compiled wiki pages; zero pages there does
+not mean the raw hook observations were missed.

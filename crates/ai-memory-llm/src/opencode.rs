@@ -36,6 +36,15 @@ impl OpenCodeProvider {
         let inner = OpenAiCompatProvider::new(OPENCODE_ZEN_BASE_URL, Some(api_key), model.into())?;
         Ok(Self { inner })
     }
+
+    /// Override the per-request timeout on the wrapped
+    /// [`OpenAiCompatProvider`]. The factory calls this with
+    /// `ProviderConfig::request_timeout_secs`.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.inner = self.inner.with_timeout_secs(secs);
+        self
+    }
 }
 
 #[async_trait]
@@ -58,5 +67,23 @@ impl LlmProvider for OpenCodeProvider {
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
         self.inner.complete_structured_raw(request, schema).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_reports_opencode_name_and_configured_model() {
+        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
+        assert_eq!(provider.name(), "opencode");
+        assert_eq!(provider.model(), "model-x");
+    }
+
+    #[test]
+    fn public_constants_point_at_zen_base_url() {
+        assert_eq!(OPENCODE_ZEN_BASE_URL, "https://opencode.ai/zen/go/v1");
+        assert!(!OPENCODE_DEFAULT_MODEL.is_empty());
     }
 }

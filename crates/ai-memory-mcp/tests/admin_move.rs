@@ -13,9 +13,9 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
-use ai_memory_core::{PagePath, Tier};
+use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::post as axum_post;
 use axum::{Json, Router};
 use serde_json::json;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -56,6 +57,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -85,6 +87,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -210,6 +213,22 @@ async fn move_project_true_move_into_fresh_dest() {
         .await
         .unwrap()
         .expect("src project exists");
+    let managed = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id: src_ws,
+            project_id: src_proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
     let src_dir = state.wiki.project_root(src_ws, src_proj);
     assert!(src_dir.exists(), "source dir must exist before move");
 
@@ -223,6 +242,7 @@ async fn move_project_true_move_into_fresh_dest() {
 
     let body = body_json(resp).await;
     assert_eq!(body["pages_copied"].as_u64().unwrap_or(0), 2, "{body}");
+    assert_eq!(body["workstreams_moved"].as_u64().unwrap_or(0), 1, "{body}");
     assert_eq!(body["moved_via"], "true-move", "{body}");
     // Nothing is purged in a true move — the rows are re-stamped, not copied.
     assert_eq!(body["source_purged"], false, "{body}");
@@ -244,6 +264,15 @@ async fn move_project_true_move_into_fresh_dest() {
     assert_eq!(
         dst_proj_check, src_proj,
         "true move keeps the same project_id"
+    );
+    assert!(
+        store
+            .reader
+            .managed_run_status(managed.run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the existing managed run must remain attached after the move"
     );
 
     // Both pages now belong to dst/proj (latest), content preserved.
@@ -440,6 +469,7 @@ async fn move_project_carries_source_embedding() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
 
     // Seed source page (gets a synthetic embedding on write).
@@ -568,22 +598,26 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
             project_id: src_proj,
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
+            actor_user: None,
         })
         .await
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid,
-            workspace_id: src_ws,
-            project_id: src_proj,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "prompt".into(),
-            body: "do the thing".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: src_ws,
+                project_id: src_proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "do the thing".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 
@@ -724,6 +758,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
 
@@ -778,6 +813,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -910,6 +946,80 @@ async fn move_active_project_with_force_succeeds_and_republishes() {
     );
 }
 
+#[tokio::test]
+async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "source").await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "dst",
+        "proj",
+        "notes/keep.md",
+        "destination",
+    )
+    .await;
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    state.active_project.set(src_ws, src_proj);
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id: src_ws,
+            project_id: src_proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "src",
+            "project": "proj",
+            "to_workspace": "dst",
+            "confirm": true,
+            "force": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--force cannot delete a live managed workstream"),
+        "the force boundary must be explicit: {body}"
+    );
+    assert_eq!(
+        store
+            .reader
+            .find_project(src_ws, "proj".into())
+            .await
+            .unwrap(),
+        Some(src_proj),
+        "the source must remain intact"
+    );
+    assert!(
+        store
+            .reader
+            .managed_run_status(prepared.run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the managed lease row must survive"
+    );
+}
+
 /// Build an AdminState over an already-open store (lets one test drive two
 /// routers — e.g. a move then a re-run — against the same SQLite file).
 fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
@@ -931,6 +1041,7 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     }
 }
 
@@ -1427,6 +1538,7 @@ async fn true_move_aborts_when_admission_rejects() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
 
@@ -1522,6 +1634,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     // Pre-seed BOTH sides so move-project takes the copy-purge path (merge
     // into existing dst/proj), not the lossless true-move path.
@@ -1634,6 +1747,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     // Pre-seed BOTH sides so the move takes the copy-purge (merge) path.
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
@@ -1737,6 +1851,47 @@ async fn delete_workspace_force_removes_everything() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
     seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+    let workspace_id = store
+        .reader
+        .find_workspace("victim".into())
+        .await
+        .unwrap()
+        .expect("workspace exists");
+    let project_id = store
+        .reader
+        .find_project(workspace_id, "proj".into())
+        .await
+        .unwrap()
+        .expect("project exists");
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id,
+            project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .cancel_managed_run(prepared.run_id)
+            .await
+            .unwrap()
+    );
+    let raw_dir = tmp
+        .path()
+        .join("raw/workstreams")
+        .join(prepared.workstream_id.to_string());
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::write(raw_dir.join("000001.jsonl"), "event\n").unwrap();
 
     let resp = post(
         state,
@@ -1748,6 +1903,29 @@ async fn delete_workspace_force_removes_everything() {
     let body = body_json(resp).await;
     assert_eq!(body["projects_deleted"].as_u64().unwrap_or(0), 1, "{body}");
     assert!(body["pages_deleted"].as_u64().unwrap_or(0) >= 1, "{body}");
+    assert_eq!(body["workstreams_deleted"], 1, "{body}");
+    assert_eq!(body["managed_runs_deleted"], 1, "{body}");
+    assert_eq!(
+        body["workstream_ids"],
+        json!([prepared.workstream_id.to_string()]),
+        "{body}"
+    );
+    assert!(
+        !raw_dir.exists(),
+        "workspace deletion must remove raw workstream segments"
+    );
+    let raw_suffix = Path::new("raw")
+        .join("workstreams")
+        .join(prepared.workstream_id.to_string());
+    assert!(
+        body["files_deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.as_str())
+            .any(|path| Path::new(path).ends_with(&raw_suffix)),
+        "raw cleanup must be visible in the report: {body}"
+    );
     assert!(
         store
             .reader

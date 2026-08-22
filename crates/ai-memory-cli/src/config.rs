@@ -39,6 +39,60 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
 
+/// Config-file representation of retention settings.
+///
+/// The breadth coefficient lives here rather than expanding the public
+/// `ai_memory_store::DecayParams` struct, preserving source compatibility for
+/// downstream Rust callers that construct that struct directly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecaySettings {
+    /// Per-day decay rate.
+    pub lambda: f64,
+    /// Access-reinforcement magnitude.
+    pub sigma: f64,
+    /// Per-day decay of access reinforcement.
+    pub mu: f64,
+    /// Default page salience.
+    pub salience_default: f64,
+    /// Wiki-backed eviction threshold.
+    pub cold_threshold: f64,
+    /// Grace period before permanently deleting an evicted version chain.
+    pub hard_delete_after_days: i64,
+    /// Optional weight for the number of distinct authenticated readers.
+    pub breadth_weight: f64,
+}
+
+impl Default for DecaySettings {
+    fn default() -> Self {
+        let base = ai_memory_store::DecayParams::default();
+        Self {
+            lambda: base.lambda,
+            sigma: base.sigma,
+            mu: base.mu,
+            salience_default: base.salience_default,
+            cold_threshold: base.cold_threshold,
+            hard_delete_after_days: base.hard_delete_after_days,
+            breadth_weight: 0.0,
+        }
+    }
+}
+
+impl DecaySettings {
+    /// Retention coefficients consumed by existing store/consolidation APIs.
+    #[must_use]
+    pub fn decay_params(self) -> ai_memory_store::DecayParams {
+        ai_memory_store::DecayParams {
+            lambda: self.lambda,
+            sigma: self.sigma,
+            mu: self.mu,
+            salience_default: self.salience_default,
+            cold_threshold: self.cold_threshold,
+            hard_delete_after_days: self.hard_delete_after_days,
+        }
+    }
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -80,23 +134,73 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
-    /// Opt-in: send `response_format=json_schema` (strict) to the
-    /// `openai-compat` provider instead of asking for prose JSON and
-    /// extracting the first balanced object. Off by default — the tolerant
-    /// parser stays the default for older local engines that ignore
-    /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
-    /// llama.cpp) honour structured output; this lets the operator opt in.
-    /// If the strict raw call fails, the provider falls back to the tolerant
-    /// parser. Set with `AI_MEMORY_LLM_COMPAT_STRICT=true`.
+    /// Send `response_format=json_schema` (strict) to the `openai-compat`
+    /// provider instead of relying on prose instructions and extracting the
+    /// first balanced object. On by default because every structured call
+    /// already supplies its own schema. Set
+    /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// Per-request timeout (seconds) applied to every chat
+    /// completion request and to the Copilot token exchange; the
+    /// openai-oauth token refresh keeps the built-in default ceiling
+    /// (it is a quick grant exchange). Defaults to
+    /// `ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS` (300s), which
+    /// tolerates a local engine cold-loading a large model. Raise it
+    /// for slow hosted gateways whose long completions exceed the
+    /// ceiling (observed with free aggregator tiers). Set with
+    /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
+    pub llm_timeout_secs: u64,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
-    /// configured. Off by default — SessionEnd stays cheap and
-    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
-    /// and via manual `memory_consolidate`. Set with
+    /// configured. Off by default. Provider work is durably queued after the
+    /// deterministic session page and handoff, then handled outside the hook
+    /// response by one bounded retrying worker. The LLM checkpoint otherwise
+    /// happens on PreCompact and via manual `memory_consolidate`. Set with
     /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
     pub consolidate_on_session_end: bool,
-    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
+    /// Server-side opt-in for assistant/Stop capture (#196). When true, the
+    /// server honors a client's sanitized `_ai_memory_assistant` marker on a
+    /// `Stop` event and persists the excerpt as the Stop body. Off by default;
+    /// when off the marker is stripped and the Stop stays empty. The client half
+    /// of the double opt-in is baked separately by
+    /// `install-hooks --capture-assistant`. Set with
+    /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
+    pub capture_assistant: bool,
+    /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
+    /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
+    /// contract) on every `tools/list`, regardless of client or `?flavor=`
+    /// marker. Moonshot and Bedrock reject root combinators with a 400, and
+    /// generic MCP clients (OpenCode, Cursor) never send the flavor marker —
+    /// so operators routing through a strict upstream can opt in here.
+    /// Runtime "exactly one of" validation is unchanged and remains the
+    /// enforcement backstop (issue #412). Set with
+    /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true` or `strip_root_combinators = true`
+    /// in config.toml.
+    pub strip_root_combinators: bool,
+    /// Serve MCP tool input schemas in the subset Google's `Schema`
+    /// (Vertex/Gemini `functionDeclaration.parameters`) accepts: the nullable
+    /// unions `schemars` emits for every optional argument collapse to a single
+    /// `type` plus `nullable: true`. Vertex rejects the union outright once a
+    /// client forwards it verbatim — "specified other fields alongside any_of"
+    /// — and fails the whole session at `tools/list`. Gemini CLI and
+    /// Antigravity CLI normalize schemas client-side and need nothing; this is
+    /// for pass-through clients such as OpenCode on a Gemini/Vertex model.
+    /// Implies `strip_root_combinators`. Runtime validation is unchanged. Set
+    /// with `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true` or
+    /// `gemini_safe_schemas = true` in config.toml; the per-request
+    /// `?flavor=gemini` marker on the MCP URL is the equivalent opt-in for one
+    /// client.
+    pub gemini_safe_schemas: bool,
+    /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
+    /// supported: LLM-as-judge over the configured LLM provider, so it
+    /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
+    /// an LLM call on the search hot path, trading latency for recall
+    /// at the top of the ranking. On any error or timeout the query
+    /// preserves the fused, authority-adjusted order. Set with
+    /// `AI_MEMORY_RERANKER=llm`.
+    pub reranker: Option<String>,
+    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
+    /// or `openai-compat`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
     pub embedding_model: Option<String>,
@@ -106,12 +210,17 @@ pub struct Config {
     pub embedding_base_url: Option<String>,
     /// M8 retention-sweep parameters. The defaults give an ~80-day
     /// "survival floor" for unused episodic content (above the cold
-    /// threshold), followed by ~180 days of soft-delete buffer before
-    /// hard-deletion. Tune `decay.lambda` down to slow decay or
+    /// threshold), followed by ~180 days of tombstone grace before permanent
+    /// version-chain deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
-    pub decay: ai_memory_store::DecayParams,
+    pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Memory-slot behaviour.
+    pub slots: SlotSettings,
+    /// LLM consolidation prompt limits. Defaults are sized for a model with a
+    /// 200k-token context window.
+    pub consolidation: ConsolidationSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -133,6 +242,10 @@ pub struct Config {
     /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
+    /// `[routing]` — how mid-session events whose cwd moved are attributed.
+    /// Default `follow-cwd` preserves the historical per-event resolution;
+    /// `sticky` keeps the session's project. See [`RoutingSettings`].
+    pub routing: RoutingSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -190,6 +303,10 @@ pub struct RuntimeEnv {
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
+    scope_cwd: Option<String>,
+    ignore_marker: bool,
+    project_strategy: Option<String>,
+    claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
@@ -212,6 +329,16 @@ impl RuntimeEnv {
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
+            scope_cwd: env_string("AI_MEMORY_SCOPE_CWD"),
+            // One-invocation escape hatch: run a command against the fallback
+            // scope without editing (or leaving) the marker's tree.
+            ignore_marker: env_string("AI_MEMORY_IGNORE_MARKER")
+                .is_some_and(|value| crate::marker::is_truthy(&value)),
+            // Install-wide project strategy, matching what `install-hooks
+            // --project-strategy` bakes into the generated hook commands.
+            // Consulted only when a marker does not pin one.
+            project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
+            claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
             // ANTHROPIC_OAUTH_TOKEN is our canonical name — accept both.
@@ -238,6 +365,37 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host_cwd(&self) -> Option<&str> {
         self.host_cwd.as_deref()
+    }
+
+    /// Container-visible cwd used only for marker discovery.
+    #[must_use]
+    pub fn scope_cwd(&self) -> Option<&str> {
+        self.scope_cwd.as_deref()
+    }
+
+    /// Operator home captured by the single config-read path.
+    #[must_use]
+    pub fn home_dir(&self) -> Option<&str> {
+        self.home_dir.as_deref()
+    }
+
+    /// Whether `AI_MEMORY_IGNORE_MARKER` asked this invocation to resolve its
+    /// scope as if no `.ai-memory.toml` existed.
+    #[must_use]
+    pub fn ignore_marker(&self) -> bool {
+        self.ignore_marker
+    }
+
+    /// Install-wide `--project-strategy` default baked into the environment.
+    #[must_use]
+    pub fn project_strategy(&self) -> Option<&str> {
+        self.project_strategy.as_deref()
+    }
+
+    /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.
+    #[must_use]
+    pub fn claude_code_session_id(&self) -> Option<&str> {
+        self.claude_code_session_id.as_deref()
     }
 
     #[cfg(test)]
@@ -280,13 +438,17 @@ where
 }
 
 /// `[auth]` section of `config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// Shared bearer token. When set, all HTTP routes require
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Mark the browser session cookie `Secure`. Enable this only when a
+    /// trusted reverse proxy terminates HTTPS for `/web`; direct HTTP browsers
+    /// deliberately will not send a Secure cookie.
+    pub secure_cookie: bool,
     /// Username attributed to writes authenticated by the bearer
     /// token (rung 1: "identified single-user"). When set, the
     /// auth middleware injects an
@@ -297,6 +459,13 @@ pub struct AuthSettings {
     /// pre-multi-user behaviour — bearer authenticates but
     /// attributes anonymously.
     pub root_username: Option<String>,
+    /// OIDC issuer for the root operator when a trusted proxy asserts stable
+    /// identities. Configure together with [`Self::root_subject`].
+    pub root_issuer: Option<String>,
+    /// OIDC subject for the root operator. Configure together with
+    /// [`Self::root_issuer`]; only this pair can grant a proxy-authenticated
+    /// request root capability. A display username is not a stable root key.
+    pub root_subject: Option<String>,
     /// Optional email for the root user, surfaced alongside
     /// `root_username` in the web UI + `/api/v1` responses.
     pub root_email: Option<String>,
@@ -308,10 +477,45 @@ pub struct AuthSettings {
     /// `users.token_hash` rows useless to an offline attacker.
     /// Auto-generated by `ai-memory init` (32 bytes of OS CSPRNG,
     /// hex-encoded). MUST NOT change after the first user is added
-    /// — rotating it invalidates every existing token. Only used
-    /// when multi-user is enabled (at least one row in `users`);
-    /// rung-1 single-user setups don't read it.
+    /// — rotating it invalidates every existing token. It enables DB-user
+    /// token resolution even during first-user bootstrap; operational admin
+    /// access becomes root-only once a user row exists.
     pub token_pepper: Option<String>,
+    /// Dedicated bearer token for a trusted authenticating proxy, allowing it
+    /// to name the real end user in `X-Memory-Actor-*` headers.
+    ///
+    /// A proxy that terminates SSO usually cannot forward the user's own
+    /// credential upstream. This token must differ from [`Self::bearer_token`]
+    /// so an omitted or malformed identity cannot fall through as root.
+    /// Actor headers on ordinary root and DB-user requests are ignored.
+    ///
+    /// Only set this when the server is reachable *only* through that proxy.
+    pub actor_proxy_bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for AuthSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSettings")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secure_cookie", &self.secure_cookie)
+            .field("root_username", &self.root_username)
+            .field("root_issuer", &self.root_issuer)
+            .field("root_subject", &self.root_subject)
+            .field("root_email", &self.root_email)
+            .field("root_name", &self.root_name)
+            .field(
+                "token_pepper",
+                &self.token_pepper.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "actor_proxy_bearer_token",
+                &self.actor_proxy_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -347,6 +551,18 @@ impl Default for AutoScopeSettings {
     }
 }
 
+/// `[routing]` section of `config.toml`.
+///
+/// Set under `[routing]` in `config.toml` or via the
+/// `AI_MEMORY_ROUTING__MID_SESSION` env var.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingSettings {
+    /// `follow-cwd` (default) or `sticky`. See
+    /// [`ai_memory_core::MidSessionRouting`] for full semantics.
+    pub mid_session: ai_memory_core::MidSessionRouting,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -359,24 +575,57 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
-            llm_compat_strict: false,
+            llm_compat_strict: true,
+            llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             consolidate_on_session_end: false,
+            capture_assistant: false,
+            strip_root_combinators: false,
+            gemini_safe_schemas: false,
+            reranker: None,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
             embedding_base_url: None,
-            decay: ai_memory_store::DecayParams::default(),
+            decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            slots: SlotSettings::default(),
+            consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
+            routing: RoutingSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             cors_allow_origins: Vec::new(),
             admission_webhooks: Vec::new(),
             runtime_env: RuntimeEnv::default(),
+        }
+    }
+}
+
+/// `[consolidation]` LLM consolidation prompt sizing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsolidationSettings {
+    /// Approximate token target for the entire consolidation prompt:
+    /// observation dump, current page body, system prompt, page conventions,
+    /// slot snapshots, and the structured-output schema.
+    ///
+    /// The exact tokenizer is provider-specific, so leave headroom. This value
+    /// plus [`Self::max_output_tokens`] must fit the model's context window.
+    pub max_input_tokens: usize,
+    /// Maximum tokens the provider may generate for a consolidation response.
+    /// Small-context models must lower this together with `max_input_tokens`.
+    pub max_output_tokens: u32,
+}
+
+impl Default for ConsolidationSettings {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -529,15 +778,57 @@ impl Default for AutoImproveSettings {
     }
 }
 
+/// `[slots]` memory-slot behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlotSettings {
+    /// Namespace engine-written slots under the operator that produced them
+    /// (`_slots/u-alice/current-focus.md` instead of
+    /// `_slots/current-focus.md`). The segment is the operator's
+    /// `IdentityKey::path_segment()` — `u-<name>` for lowercase safe usernames
+    /// and a bounded deterministic identifier for mixed-case, Windows-unsafe,
+    /// or otherwise path-hostile usernames and complete OIDC issuer/subject
+    /// pairs — never a raw OIDC value.
+    ///
+    /// Off by default, so nothing changes for an existing install: with the
+    /// flag off a nested slot path carries no ownership meaning at all, and
+    /// every slot goes into every brief exactly as it did before.
+    ///
+    /// Turning it ON changes reads and writes, in both directions:
+    ///
+    /// * a session brief and the consolidation prompt see the shared slots
+    ///   plus the requesting operator's own — so a slot already stored under
+    ///   `_slots/<segment>/…` becomes visible to that operator alone;
+    /// * writing into another operator's namespace is refused (admins aside);
+    /// * a write naming the SHARED slot is namespaced into the writer's own
+    ///   prefix, whether it comes from the engine or from `memory_write_page`.
+    ///
+    /// What the flag scopes is INJECTION, not access: an exact-path read
+    /// still returns anyone's slot, like any other page.
+    ///
+    /// Turning it back OFF restores the pre-feature rule everywhere: personal
+    /// slots become visible to everyone again and nested writes stop being
+    /// gated. Un-namespaced slots are shared under either setting, so nothing
+    /// already stored is ever hidden or reinterpreted.
+    ///
+    /// Only meaningful once requests carry distinct identities; with a single
+    /// shared credential every slot lands under the same namespace.
+    pub per_user: bool,
+}
+
 /// `[maintenance]` scheduled server jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MaintenanceSettings {
     /// Master switch for scheduled jobs.
     pub enabled: bool,
-    /// Interval for the retention forget sweep. `0` disables this job.
+    /// Interval for the retention forget sweep. `0` disables this job. Successful
+    /// runs persist cadence across restarts; overdue work starts after a bounded
+    /// startup delay.
     pub forget_sweep_interval_secs: u64,
-    /// Interval for rule-based wiki lint. `0` disables this job.
+    /// Interval for rule-based wiki lint. `0` disables this job. Successful runs
+    /// persist cadence across restarts; overdue work starts after a bounded
+    /// startup delay.
     pub lint_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
@@ -627,6 +918,43 @@ impl Config {
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
 
+        if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
+            anyhow::bail!(
+                "decay.breadth_weight must be a finite number greater than or equal to zero"
+            );
+        }
+
+        // Fail at startup rather than shipping a prompt that is all scaffolding
+        // and no observations: below this floor the fixed system prompt and page
+        // conventions consume the entire budget, so every consolidation would
+        // either be evidence-free or rejected by the provider.
+        let min_input_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        if config.consolidation.max_input_tokens < min_input_tokens {
+            anyhow::bail!(
+                "consolidation.max_input_tokens must be at least {min_input_tokens} \
+                 (got {}); below that the system prompt and page conventions leave \
+                 no room for observations",
+                config.consolidation.max_input_tokens
+            );
+        }
+        let min_output_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        if config.consolidation.max_output_tokens < min_output_tokens {
+            anyhow::bail!(
+                "consolidation.max_output_tokens must be at least {min_output_tokens} \
+                 (got {}); below that a structured consolidation response is unlikely to fit",
+                config.consolidation.max_output_tokens
+            );
+        }
+        // Zero (or a sub-second remainder rounded down) would cut every
+        // provider request off before it is sent.
+        if config.llm_timeout_secs == 0 {
+            anyhow::bail!(
+                "llm_timeout_secs must be at least 1 second (got {}); \
+                 AI_MEMORY_LLM_TIMEOUT_SECS is read in seconds",
+                config.llm_timeout_secs
+            );
+        }
+
         Ok(config)
     }
 
@@ -664,10 +992,10 @@ impl Config {
         let model = match non_empty(self.llm_model.as_deref()) {
             Some(s) => s.to_string(),
             None => match provider {
-                ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
+                ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
-                ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
+                ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
+                ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
@@ -692,6 +1020,7 @@ impl Config {
                 .clone()
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
+            request_timeout_secs: self.llm_timeout_secs,
         }))
     }
 
@@ -713,6 +1042,26 @@ impl Config {
         Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
     }
 
+    /// Whether the operator opted into post-RRF reranking.
+    ///
+    /// Unknown values are rejected loudly at *startup* rather than
+    /// silently disabling the feature — a typo'd `AI_MEMORY_RERANKER`
+    /// should not look like "reranking is on" in the operator's head
+    /// while eligible queries keep their normal ranking.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for any value other than
+    /// `llm` (case-insensitive) or empty.
+    pub fn reranker_choice(&self) -> LlmResult<bool> {
+        match non_empty(self.reranker.as_deref()).map(str::to_ascii_lowercase) {
+            None => Ok(false),
+            Some(v) if v == "llm" => Ok(true),
+            Some(other) => Err(LlmError::NotConfigured(format!(
+                "AI_MEMORY_RERANKER={other} is not supported (only `llm`)"
+            ))),
+        }
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -726,9 +1075,11 @@ impl Config {
             "openai" => EmbedderChoice::OpenAi,
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
+            "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             other => {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of openai|voyage|google|gemini"
+                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
+                     openai|voyage|google|gemini|openai-compat"
                 )));
             }
         };
@@ -738,11 +1089,32 @@ impl Config {
                 EmbedderChoice::OpenAi => "text-embedding-3-small".to_string(),
                 EmbedderChoice::Voyage => "voyage-3".to_string(),
                 EmbedderChoice::Google => ai_memory_llm::GOOGLE_DEFAULT_EMBED_MODEL.to_string(),
+                EmbedderChoice::OpenAiCompat => {
+                    return Err(LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_MODEL must be set explicitly for openai-compat \
+                         (no safe default for self-hosted engines)"
+                            .into(),
+                    ));
+                }
             },
         };
-        let dim = self
-            .embedding_dim
-            .unwrap_or_else(|| ai_memory_llm::default_embedding_dim(provider, &model));
+        let dim = match self.embedding_dim {
+            Some(0) => {
+                return Err(LlmError::NotConfigured(
+                    "AI_MEMORY_EMBEDDING_DIM must be greater than zero".into(),
+                ));
+            }
+            Some(d) => d,
+            None => {
+                ai_memory_llm::try_default_embedding_dim(provider, &model).ok_or_else(|| {
+                    LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_DIM must be set explicitly for openai-compat \
+                         (self-hosted model dims vary)"
+                            .into(),
+                    )
+                })?
+            }
+        };
         let api_key = match provider {
             EmbedderChoice::OpenAi => self.openai_embedding_api_key()?,
             EmbedderChoice::Voyage => self
@@ -753,13 +1125,26 @@ impl Config {
             EmbedderChoice::Google => self.runtime_env.gemini_api_key.clone().ok_or_else(|| {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
+            // Keyless engines (Ollama, LM Studio) are the norm; a
+            // gateway key rides on LLM_API_KEY when present.
+            EmbedderChoice::OpenAiCompat => self
+                .runtime_env
+                .llm_api_key
+                .clone()
+                .unwrap_or_else(|| SecretString::from(String::new())),
         };
+        let base_url = self.embedding_base_url.clone();
+        if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
+            return Err(LlmError::NotConfigured(
+                "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
+            ));
+        }
         Ok(Some(EmbedderConfig {
             provider,
             model,
             dim,
             api_key,
-            base_url: self.embedding_base_url.clone(),
+            base_url,
         }))
     }
 
@@ -921,16 +1306,50 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn auth_settings_debug_redacts_secrets_in_auth_and_config() {
+        let auth = AuthSettings {
+            bearer_token: Some("bearer-secret-sentinel".into()),
+            root_username: Some("operator".into()),
+            token_pepper: Some("pepper-secret-sentinel".into()),
+            actor_proxy_bearer_token: Some("proxy-secret-sentinel".into()),
+            ..AuthSettings::default()
+        };
+        let config = Config {
+            auth: auth.clone(),
+            ..Config::default()
+        };
+
+        for rendered in [format!("{auth:?}"), format!("{config:?}")] {
+            assert!(rendered.contains("root_username: Some(\"operator\")"));
+            assert!(rendered.contains("<redacted>"));
+            for secret in [
+                "bearer-secret-sentinel",
+                "pepper-secret-sentinel",
+                "proxy-secret-sentinel",
+            ] {
+                assert!(!rendered.contains(secret), "Debug output exposed {secret}");
+            }
+        }
+    }
+
+    #[test]
     fn defaults_have_canonical_endings() {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
+        assert_eq!(
+            cfg.llm_timeout_secs,
+            ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS
+        );
+        assert!(!cfg.auth.secure_cookie);
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert_eq!(cfg.decay.breadth_weight, 0.0);
+        assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);
@@ -984,6 +1403,123 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_destructive_invalid_breadth_weights() {
+        for value in ["-0.1", "nan", "inf"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, format!("[decay]\nbreadth_weight = {value}\n")).unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("invalid breadth weight must fail closed");
+            assert!(
+                error.to_string().contains("breadth_weight"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// The consolidation budget must be big enough to leave room for
+    /// observations after the fixed system prompt and page conventions.
+    /// Below the floor every consolidation would be evidence-free, so it
+    /// fails at startup instead of once per PreCompact.
+    #[test]
+    fn load_rejects_a_consolidation_budget_below_the_prompt_reserve() {
+        let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        for value in [0, 1, min - 1] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\nmax_input_tokens = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an unusable consolidation budget must fail closed");
+            assert!(
+                error.to_string().contains("consolidation.max_input_tokens"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_a_consolidation_output_limit_too_small_for_json() {
+        let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        for value in [0, 1, min - 1] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\nmax_output_tokens = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an unusable consolidation output limit must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("consolidation.max_output_tokens"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A small-context provider needs both sides of the context allocation to
+    /// survive the config round-trip.
+    #[test]
+    fn load_accepts_a_small_context_consolidation_budget() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nmax_input_tokens = 7000\nmax_output_tokens = 1000\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
+        assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+    }
+
+    /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
+    /// slow hosted gateways can outlive the 300s default; the accepted floor
+    /// mirrors that motivation — anything below one second severs every
+    /// provider request before it is sent.
+    #[test]
+    fn load_round_trips_a_custom_llm_request_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_timeout_secs = 900\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.llm_timeout_secs, 900);
+    }
+
+    #[test]
+    fn load_rejects_a_zero_llm_request_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_timeout_secs = 0\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a sub-second timeout must fail closed");
+        assert!(
+            error.to_string().contains("llm_timeout_secs"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.consolidation.max_input_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS
+        );
+        assert_eq!(
+            cfg.consolidation.max_output_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[test]
     fn load_populates_home_dir_from_env() {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
@@ -1021,6 +1557,30 @@ mod tests {
     }
 
     #[test]
+    fn reranker_choice_is_explicit_case_insensitive_and_fail_closed() {
+        for value in [None, Some(""), Some("  ")] {
+            let cfg = Config {
+                reranker: value.map(str::to_string),
+                ..Config::default()
+            };
+            assert!(!cfg.reranker_choice().unwrap());
+        }
+        for value in ["llm", "LLM", " LlM "] {
+            let cfg = Config {
+                reranker: Some(value.into()),
+                ..Config::default()
+            };
+            assert!(cfg.reranker_choice().unwrap());
+        }
+        let cfg = Config {
+            reranker: Some("cross-encoder".into()),
+            ..Config::default()
+        };
+        let err = cfg.reranker_choice().unwrap_err();
+        assert!(err.to_string().contains("AI_MEMORY_RERANKER=cross-encoder"));
+    }
+
+    #[test]
     fn config_file_overrides_defaults() {
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
@@ -1031,6 +1591,9 @@ mod tests {
             log_level = "debug"
             hook_rate_per_sec = 7.5
             hook_rate_burst = 12.0
+
+            [auth]
+            secure_cookie = true
 
             [maintenance]
             enabled = false
@@ -1083,6 +1646,7 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.hook_rate_per_sec, 7.5);
         assert_eq!(cfg.hook_rate_burst, 12.0);
+        assert!(cfg.auth.secure_cookie);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -1167,6 +1731,72 @@ mod tests {
     }
 
     #[test]
+    fn openai_compat_embedding_is_keyless_and_requires_explicit_settings() {
+        // Fully specified, no key: valid (Ollama / LM Studio).
+        let cfg = Config {
+            embedding_provider: Some("openai-compat".into()),
+            embedding_model: Some("nomic-embed-text".into()),
+            embedding_dim: Some(768),
+            embedding_base_url: Some("http://localhost:11434/v1".into()),
+            ..Config::default()
+        };
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::OpenAiCompat);
+        assert_eq!(embedder.model, "nomic-embed-text");
+        assert_eq!(embedder.dim, 768);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        assert_eq!(
+            embedder.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        // A gateway key rides on LLM_API_KEY when present.
+        let cfg_with_key = Config {
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("sk-or-key")),
+                ..RuntimeEnv::default()
+            },
+            ..cfg.clone()
+        };
+        let embedder = cfg_with_key.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-or-key");
+
+        // Missing model / dim / base URL each fail closed.
+        let missing_model = Config {
+            embedding_model: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_model.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_MODEL")
+        ));
+        let missing_dim = Config {
+            embedding_dim: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_DIM")
+        ));
+        let zero_dim = Config {
+            embedding_dim: Some(0),
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            zero_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("greater than zero")
+        ));
+        let missing_base = Config {
+            embedding_base_url: None,
+            ..cfg
+        };
+        assert!(matches!(
+            missing_base.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
+        ));
+    }
+
+    #[test]
     fn openai_embedding_does_not_use_llm_api_key_without_custom_base_url() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
@@ -1194,7 +1824,7 @@ mod tests {
 
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert_eq!(provider.provider, ProviderChoice::OpenAi);
-        assert_eq!(provider.model, "gpt-4o-mini");
+        assert_eq!(provider.model, "gpt-5.4-mini");
         assert_eq!(
             provider.auth.requirement(),
             AuthRequirement::RequiredApiKey {
@@ -1211,7 +1841,23 @@ mod tests {
             provider.auth.require_api_key().unwrap().expose_secret(),
             "sk-test-key"
         );
-        assert!(!provider.compat_strict);
+        assert!(provider.compat_strict);
+    }
+
+    #[test]
+    fn anthropic_provider_uses_documented_default_model() {
+        let cfg = Config {
+            llm_provider: Some("anthropic".into()),
+            runtime_env: RuntimeEnv {
+                anthropic_api_key: Some(SecretString::from("sk-ant-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.provider, ProviderChoice::Anthropic);
+        assert_eq!(provider.model, "claude-haiku-4-5");
     }
 
     #[test]
@@ -1252,12 +1898,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_compat_provider_threads_strict_flag() {
-        let cfg = Config {
+    fn openai_compat_provider_defaults_strict_and_allows_opt_out() {
+        let mut cfg = Config {
             llm_provider: Some("openai-compat".into()),
             llm_model: Some("qwen3:32b".into()),
             llm_base_url: Some("http://localhost:11434/v1".into()),
-            llm_compat_strict: true,
             ..Config::default()
         };
 
@@ -1270,6 +1915,10 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert!(provider.compat_strict);
+
+        cfg.llm_compat_strict = false;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_strict);
     }
 
     #[test]

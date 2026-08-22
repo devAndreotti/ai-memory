@@ -20,26 +20,29 @@ ai-memory-llm.workspace = true
 ai-memory-mcp.workspace = true
 ai-memory-store.workspace = true
 ai-memory-web.workspace = true
+ai-memory-workstream.workspace = true
 ai-memory-wiki.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
-subtle.workspace = true
-getrandom.workspace = true
+sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+crossterm.workspace = true
 dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
 jiff.workspace = true
+jsonc-parser.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
@@ -47,12 +50,14 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

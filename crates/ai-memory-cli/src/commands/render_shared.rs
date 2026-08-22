@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::commands::path_util::strip_windows_verbatim_prefix;
@@ -45,6 +46,81 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     // grok both emit these; other agents keep their own event lists).
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
+/// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
+/// fires `PostToolUse` on successful calls only and reports failures
+/// separately. The failure entry reuses the post-tool-use script — the
+/// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
+/// outcome from the payload.
+///
+/// Kimi Code wires hooks as `[[hooks]]` entries in
+/// `$KIMI_CODE_HOME/config.toml` (TOML) instead of a JSON settings file,
+/// so its payload comes from [`kimi_code_hook_commands`] rather than the
+/// JSON hook shapes.
+///
+/// Adding a hook event means updating this list AND adding the matching
+/// `.sh` and `.ps1` files under `hooks/kimi-code/` (a reused script like
+/// post-tool-use needs no new file). The install-hooks parity test fails
+/// if the bundle drifts.
+pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Kiro CLI v2-engine lifecycle events. Each pair is
+/// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
+///
+/// The v2 engine embeds hooks in agent configs (`~/.kiro/agents/*.json`)
+/// keyed by camelCase triggers, per kiro.dev/docs/hooks and the
+/// shipping `HookTrigger` serde in aws/amazon-q-developer-cli
+/// (`crates/chat-cli/src/cli/agent/hook.rs`). The vocabulary is exactly
+/// these five events — there is no PreCompact/SessionEnd/subagent
+/// equivalent. Adding a hook event means updating this list AND adding
+/// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
+/// install-hooks parity test fails if the bundle drifts.
+///
+pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
+    ("agentSpawn", "session-start.sh"),
+    ("userPromptSubmit", "user-prompt-submit.sh"),
+    ("preToolUse", "pre-tool-use.sh"),
+    ("postToolUse", "post-tool-use.sh"),
+    ("stop", "stop.sh"),
+];
+
+/// Kiro CLI v3-engine lifecycle events. V3 uses PascalCase triggers in a
+/// standalone versioned hook file rather than v2's camelCase agent field.
+pub(crate) const KIRO_CLI_V3_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// Devin lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-Devin-settings, POSIX hook-script-filename)`.
+///
+/// Devin uses the same event vocabulary as Claude Code, but with two differences:
+/// - `PostCompaction` instead of `PreCompact` (triggers *after* compaction with a `summary` field)
+/// - No `SubagentStart`/`SubagentStop` (Devin does not expose subagent boundaries as hook events)
+pub(crate) const DEVIN_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostCompaction", "post-compaction.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
 ];
 
 /// Format an `Authorization: Bearer <token>` header value, or `None`
@@ -81,6 +157,94 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The single capture-policy-v1 implementation embedded in every generated
+/// JavaScript integration.  It deliberately has no package dependency: these
+/// extensions run in several hosts with different module loaders.
+#[must_use]
+pub(crate) fn ts_capture_policy_v1() -> &'static str {
+    r##"// capture-policy-v1 (generated; do not fork between adapters)
+const CAPTURE_POLICY_V1 = 1;
+const CAPTURE_MARKER_MAX_BYTES = 64 * 1024;
+const CAPTURE_MAX_PATTERNS = 128;
+const CAPTURE_MAX_PATTERN_CHARS = 1024;
+const CAPTURE_MAX_PATH_CHARS = 4096;
+const CAPTURE_MAX_CANDIDATES = 32;
+const CAPTURE_MAX_WORK = 1000000;
+const CAPTURE_MAX_CALL_ID_CHARS = 128;
+
+type CaptureDisposition = "keep" | "drop" | "metadata-only";
+type CaptureProtocol = { version: 1; disposition: CaptureDisposition; policy_state: "inactive" | "active" | "invalid"; tool_family: "file" | "search-list" | "non-file" | "unknown"; path_count: number; extraction_state: "not-applicable" | "extracted" | "missing-or-malformed" | "unsupported-schema" };
+
+type CaptureConfig = { state: "inactive" | "active" | "invalid"; patterns: { path: string; windows: boolean; directory?: string }[]; base: string };
+function readFileSync(path: string, encoding?: "utf8"): any { if (encoding) return readMarkerText(path, encoding); const fd = openSync(path, "r"); try { const bytes = Buffer.allocUnsafe(CAPTURE_MARKER_MAX_BYTES + 1); const count = readSync(fd, bytes, 0, bytes.length, 0); if (count > CAPTURE_MARKER_MAX_BYTES) throw new Error("marker too large"); const result = bytes.subarray(0, count); new TextDecoder("utf-8", { fatal: true }).decode(result); return result; } finally { closeSync(fd); } }
+function captureTrimComment(line: string): string { let quote = ""; let escaped = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (escaped) { escaped = false; continue; } if (c === "\\" && quote === '"') { escaped = true; continue; } if ((c === '"' || c === "'") && (!quote || quote === c)) quote = quote ? "" : c; else if (c === "#" && !quote) { line = line.slice(0, i); break; } } if (line.trimStart().startsWith("[") && !/^\s*\[[^\]]+\]\s*$/.test(line)) throw new Error("invalid table header"); if (quote) throw new Error("unterminated string"); return line; }
+function captureNormalize(path: string): { path: string; windows: boolean } | undefined { const p = path.replace(/\\/g, "/"); let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else if (p.startsWith("/")) { root = "/"; tail = p.slice(1).split("/"); } else return undefined; const out: string[] = []; for (const x of tail) { if (!x || x === ".") continue; if (x === "..") out.pop(); else out.push(x); } return { path: root + (out.length ? (root.endsWith("/") ? "" : "/") + out.join("/") : ""), windows: root !== "/" }; }
+function captureJoin(base: string, child: string): string { if (/^[^A-Za-z]?:|^[A-Za-z]:[^/\\]/.test(child)) return child; return `${base.replace(/[\\/]+$/, "")}/${child}`; }
+function captureValidGlob(p: string): boolean { return !!p && [...p].length <= CAPTURE_MAX_PATTERN_CHARS && !/[!{}\[\]()|^$%]/.test(p) && !p.includes("${") && !p.includes("***") && !p.replace(/\\/g, "/").split("/").includes("..") && (!p.startsWith("~") || p.startsWith("~/")) && !/^[^A-Za-z]?:/.test(p) && !/^[A-Za-z]:[^/\\]/.test(p); }
+function captureParseArray(value: string): string[] | undefined { let i = 0; const out: string[] = []; const ws = () => { while (/\s/.test(value[i] ?? "")) i++; }; const basic = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" } as Record<string, string>; ws(); if (value[i++] !== "[") return undefined; for (;;) { ws(); if (value[i] === "]") { i++; ws(); return i === value.length ? out : undefined; } const quote = value[i++]; if (quote !== '"' && quote !== "'") return undefined; let s = ""; for (;;) { if (i >= value.length) return undefined; const c = value[i++]; if (c === quote) break; if (c === "\\" && quote === '"') { const e = value[i++]; if (e in basic) s += basic[e]; else if (e === "u" || e === "U") { const count = e === "u" ? 4 : 8; const hex = value.slice(i, i + count); if (!new RegExp(`^[0-9A-Fa-f]{${count}}$`).test(hex)) return undefined; const n = Number.parseInt(hex, 16); if (n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return undefined; s += String.fromCodePoint(n); i += count; } else return undefined; } else if (c === "\n" || c === "\r") return undefined; else s += c; } out.push(s); ws(); if (value[i] === ",") { i++; continue; } if (value[i] === "]") continue; return undefined; } }
+function captureConfig(cwd: string | undefined): CaptureConfig {
+  const marker = findMarker(cwd);
+  const candidateBase = captureNormalize(cwd ? resolve(cwd) : "")?.path ?? "";
+  if (!marker) return { state: "inactive", patterns: [], base: candidateBase };
+  try {
+    const bytes = readFileSync(marker);
+    const markerBase = captureNormalize(dirname(marker))?.path ?? candidateBase;
+    if (bytes.byteLength > CAPTURE_MARKER_MAX_BYTES) return { state: "invalid", patterns: [], base: candidateBase };
+    let section = "";
+    let value = "";
+    let collecting = false;
+    let seen = false;
+    for (const raw of bytes.toString("utf8").split(/\r?\n/)) {
+      const line = captureTrimComment(raw).trim();
+      if (!line) continue;
+      const table = /^\[([^\]]+)\]$/.exec(line);
+      if (table) {
+        if (collecting) return { state: "invalid", patterns: [], base: candidateBase };
+        section = table[1];
+        continue;
+      }
+      if (section !== "capture") continue;
+      if (!seen) {
+        const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
+        if (!kv || kv[1] !== "ignore_paths") return { state: "invalid", patterns: [], base: candidateBase };
+        seen = true;
+        value = kv[2];
+        collecting = !value.includes("]");
+      } else if (collecting) {
+        value += ` ${line}`;
+        collecting = !value.includes("]");
+      } else return { state: "invalid", patterns: [], base: candidateBase };
+    }
+    if (collecting) return { state: "invalid", patterns: [], base: candidateBase };
+    if (!seen) return { state: "inactive", patterns: [], base: candidateBase };
+    const strings = captureParseArray(value);
+    if (!strings || strings.length > CAPTURE_MAX_PATTERNS) return { state: "invalid", patterns: [], base: candidateBase };
+    const home = homedir();
+    const patterns = strings.map((source) => {
+      if (!captureValidGlob(source)) return undefined;
+      const expanded = source.startsWith("~/")
+        ? captureJoin(home, source.slice(2))
+        : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(source)
+          ? source
+          : captureJoin(markerBase, source);
+      const normalized = captureNormalize(expanded);
+      if (!normalized) return undefined;
+      return { path: normalized.path, windows: normalized.windows, directory: normalized.path.endsWith("/**") ? (normalized.path.slice(0, -3) || "/") : undefined };
+    });
+    if (patterns.some((p) => !p)) return { state: "invalid", patterns: [], base: candidateBase };
+    return patterns.length
+      ? { state: "active", patterns: patterns as CaptureConfig["patterns"], base: candidateBase }
+      : { state: "inactive", patterns: [], base: candidateBase };
+  } catch (_e) {
+    return { state: "invalid", patterns: [], base: candidateBase };
+  }
+}
+function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const p = [...pattern]; const c = [...candidate]; const eq = (a: string, b: string) => insensitive && a.charCodeAt(0) < 128 && b.charCodeAt(0) < 128 ? a.toLowerCase() === b.toLowerCase() : a === b; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : eq(x, ch) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous[p.length]; }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","execute","run_command","web_search"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && tool.family === "file") disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+"##
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
@@ -127,6 +291,47 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    capture_assistant: bool,
+) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::for_bash_runner(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_claude_code_script_payload_for_test(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::Posix,
+    )
+}
+
+fn build_claude_code_payload_with_data_dir_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+    platform: HookCommandPlatform,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
@@ -134,13 +339,9 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
         server_url,
         auth_token,
         HookShape::Nested,
-        HookCommandContext::new(
-            HookCommandPlatform::for_bash_runner(),
-            "claude-code",
-            data_dir,
-            project_strategy,
-        )
-        .allow_claude_windows_exec(),
+        HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
+            .allow_claude_windows_exec()
+            .with_capture_assistant(capture_assistant),
     )
 }
 
@@ -238,6 +439,30 @@ pub(crate) fn build_zero_hooks_config(
     serde_json::json!({ "enabled": true, "hooks": hooks })
 }
 
+/// Devin hook payload for docker/setup-agent script snippets.
+/// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
+/// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
+#[must_use]
+pub(crate) fn build_devin_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DEVIN_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_script_runner(),
+            "devin",
+            None,
+            None,
+        ),
+    )
+}
+
 /// Grok Build CLI hook payload for apply/render paths. Native commands are the
 /// default; explicit script fallback still points at the Grok script bundle.
 pub(crate) fn build_grok_payload_with_data_dir(
@@ -262,6 +487,33 @@ pub(crate) fn build_grok_payload_with_data_dir(
     )
 }
 
+/// Devin hook payload for apply/render paths. Native commands are the
+/// default; explicit script fallback still points at the Devin script bundle.
+/// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
+/// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
+#[must_use]
+pub(crate) fn build_devin_payload_with_data_dir(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DEVIN_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_runner(),
+            "devin",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 /// Different agents nest hook entries differently. Two shapes
 /// cover everyone we support:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +524,10 @@ pub(crate) enum HookShape {
     /// Gemini CLI tolerates (but doesn't require) a sibling
     /// `sequential` key at the outer level — we don't set it.
     Nested,
+    /// Command Code's nested handler shape without an outer matcher. Its
+    /// stable hook schema treats omission as "all tools" and does not fire
+    /// SessionStart/Stop when a matcher is present.
+    NestedWithoutMatcher,
     /// Cursor: `"e": [ { "type":"command", "command":"...",
     /// "matcher":"" } ]` (no inner `hooks` array). Cursor's
     /// `hooks.json` also requires a sibling `version: 1` key at
@@ -305,6 +561,16 @@ pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle
+/// events but remain experimental, so the first-party integration uses only
+/// these documented stable boundaries.
+pub(crate) const COMMAND_CODE_EVENTS: [(&str, &str); 4] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
     ("Stop", "stop.sh"),
 ];
 
@@ -345,6 +611,10 @@ pub(crate) const GEMINI_EVENTS: [(&str, &str); 5] = [
 pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
     events: &CODEX_EVENTS,
     shape: HookShape::Nested,
+};
+pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
+    events: &COMMAND_CODE_EVENTS,
+    shape: HookShape::NestedWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -411,12 +681,13 @@ fn build_antigravity_payload_for_platform(
     for (event, script) in &ANTIGRAVITY_TOOL_EVENTS {
         let s = script_for_platform(script, platform);
         let abs = emit_root.join(s.as_ref());
-        let handler = hook_handler_value(HookHandlerSpec::ShellString(hook_command(
+        let handler = hook_handler_value(hook_handler_spec(
             &abs,
             server_url,
             auth_token,
             HookCommandContext::new(platform, agent, data_dir, project_strategy),
-        )));
+            HookShape::Nested,
+        ));
         group.insert(
             (*event).to_string(),
             json!([{
@@ -430,12 +701,13 @@ fn build_antigravity_payload_for_platform(
     for (event, script) in &ANTIGRAVITY_LIFECYCLE_EVENTS {
         let s = script_for_platform(script, platform);
         let abs = emit_root.join(s.as_ref());
-        let handler = hook_handler_value(HookHandlerSpec::ShellString(hook_command(
+        let handler = hook_handler_value(hook_handler_spec(
             &abs,
             server_url,
             auth_token,
             HookCommandContext::new(platform, agent, data_dir, project_strategy),
-        )));
+            HookShape::Flat,
+        ));
         group.insert((*event).to_string(), Value::Array(vec![handler]));
     }
 
@@ -488,6 +760,31 @@ pub(crate) fn build_profile_payload_for_agent(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn build_profile_script_payload_for_test(
+    profile: &HookProfile,
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    agent: &str,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload(
+        profile.events,
+        emit_root,
+        server_url,
+        auth_token,
+        profile.shape,
+        HookCommandContext::new(
+            HookCommandPlatform::Posix,
+            agent,
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 fn build_hook_payload(
     events: &[(&str, &str)],
     emit_root: &Path,
@@ -499,9 +796,169 @@ fn build_hook_payload(
     build_hook_payload_for_platform(events, emit_root, server_url, auth_token, shape, context)
 }
 
+/// Build the `(event, command)` pairs behind Kimi Code's `[[hooks]]`
+/// TOML entries. Kimi Code hook entries accept only `event` / `matcher`
+/// / `command` / `timeout` — any other key makes the whole config.toml
+/// fail to load — so callers emit exactly `event` + `command` and leave
+/// the rest at Kimi Code's defaults (no `matcher` = match everything;
+/// no `timeout` = 30s). Commands come from the shared `hook_command`
+/// helper for the current platform: native `ai-memory hook --event …`
+/// invocations by default, or the staged script bundle (`.sh` on
+/// POSIX, `.ps1` on Windows) on the compatibility platforms.
+pub(crate) fn kimi_code_hook_commands(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    kimi_code_hook_commands_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandPlatform::current(),
+        data_dir,
+        project_strategy,
+    )
+}
+
+fn kimi_code_hook_commands_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    KIMI_CODE_EVENTS
+        .iter()
+        .map(|(event, script)| {
+            let script = script_for_platform(script, platform);
+            let abs = emit_root.join(script.as_ref());
+            let command = hook_command(
+                &abs,
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, "kimi-code", data_dir, project_strategy),
+            );
+            (*event, command)
+        })
+        .collect()
+}
+
+/// Build the `hooks` map for a Kiro CLI v2-engine agent config. Entry
+/// shape per the shipping `Hook` struct (aws/amazon-q-developer-cli
+/// `crates/chat-cli/src/cli/agent/hook.rs`): a flat
+/// `{ "command": … }` object per trigger. Two deliberate omissions:
+///
+/// - no `matcher` key: in Kiro v2 an *absent* matcher applies the hook
+///   to every tool, while an empty-string matcher is a tool-name
+///   pattern that matches nothing — the opposite of Claude Code's
+///   empty-matcher convention, so `HookShape::Flat` must not be reused;
+/// - no `type` key: the v2 `Hook` struct has no such field.
+///
+/// `agentSpawn` sets `max_output_size` above the 10 KiB default so a
+/// fetched handoff + compiled project brief is not truncated mid-JSON
+/// before Kiro adds it to the agent context.
+pub(crate) fn build_kiro_cli_v2_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    build_kiro_cli_v2_hooks_value_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandPlatform::current(),
+        data_dir,
+        project_strategy,
+    )
+}
+
+/// Session-start context injection ceiling for Kiro v2 (`max_output_size`).
+/// Kiro truncates hook stdout beyond this; 64 KiB comfortably covers a
+/// handoff plus a `[briefing]`-budgeted brief.
+pub(crate) const KIRO_CLI_V2_SESSION_START_MAX_OUTPUT: usize = 64 * 1024;
+
+fn build_kiro_cli_v2_hooks_value_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut hooks = serde_json::Map::new();
+    for (event, script) in KIRO_CLI_V2_EVENTS {
+        let script = script_for_platform(script, platform);
+        let abs = emit_root.join(script.as_ref());
+        let command = hook_command(
+            &abs,
+            server_url,
+            auth_token,
+            HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("command".to_string(), Value::String(command));
+        if event == "agentSpawn" {
+            entry.insert(
+                "max_output_size".to_string(),
+                Value::from(KIRO_CLI_V2_SESSION_START_MAX_OUTPUT),
+            );
+        }
+        hooks.insert(event.to_string(), json!([Value::Object(entry)]));
+    }
+    hooks
+}
+
+/// Build Kiro CLI v3's standalone `{ "version": "v1", "hooks": [...] }`
+/// registration document. Each entry is deliberately named so apply and
+/// uninstall can prove ownership using both the name and command signature.
+pub(crate) fn build_kiro_cli_v3_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let platform = HookCommandPlatform::current();
+    let hooks = KIRO_CLI_V3_EVENTS
+        .iter()
+        .map(|(trigger, script)| {
+            let platform_script = script_for_platform(script, platform);
+            let command = hook_command(
+                &emit_root.join(platform_script.as_ref()),
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+            );
+            let name = script.strip_suffix(".sh").map_or_else(
+                || format!("ai-memory-{script}"),
+                |stem| format!("ai-memory-{stem}"),
+            );
+            let timeout = if *trigger == "SessionStart" { 5 } else { 1 };
+            json!({
+                "name": name,
+                "trigger": trigger,
+                "action": {
+                    "type": "command",
+                    "command": command,
+                },
+                "timeout": timeout,
+                "enabled": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"version": "v1", "hooks": hooks})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HookCommandPlatform {
     Posix,
+    /// Windows script fallback: invoke the staged `.ps1` hook through an
+    /// encoded PowerShell program so a host runner cannot expand its env setup.
     Windows,
     /// Claude Code on Windows invokes hooks through bash (Git for
     /// Windows), not PowerShell. Commands use POSIX `.sh` scripts
@@ -517,9 +974,9 @@ pub(crate) enum HookCommandPlatform {
     /// POSIX (Linux/macOS), native: invoke the `ai-memory` binary directly
     /// (`<exe> hook --event …`) instead of the `.sh` script, so the hook gets
     /// the local spool + OIDC-token fallback. The **default** for native
-    /// Linux/macOS Claude Code installs (mirrors `WindowsNative`). The Docker
-    /// wrapper forces `posix` so its host-rendered config keeps the `.sh` path
-    /// (the host has no local binary). Override with
+    /// Linux/macOS Claude Code installs (mirrors `WindowsNative`). The
+    /// Linux/macOS Docker wrapper forces `posix` so its host-rendered config
+    /// keeps the `.sh` path (the host has no local binary). Override with
     /// `AI_MEMORY_HOOK_PLATFORM=posix` to get the shell scripts.
     PosixNative,
 }
@@ -537,6 +994,9 @@ struct HookCommandContext<'a> {
     /// snippets keep command-string script fallback even when the platform env
     /// is overridden to `windows-native`.
     claude_windows_exec_allowed: bool,
+    /// Bake `--capture-assistant` onto the native `stop` command only (#196).
+    /// Set exclusively by `install-hooks --agent claude-code --capture-assistant`.
+    capture_assistant: bool,
 }
 
 impl<'a> HookCommandContext<'a> {
@@ -552,12 +1012,29 @@ impl<'a> HookCommandContext<'a> {
             data_dir,
             project_strategy,
             claude_windows_exec_allowed: false,
+            capture_assistant: false,
         }
     }
 
     const fn allow_claude_windows_exec(mut self) -> Self {
         self.claude_windows_exec_allowed = true;
         self
+    }
+
+    const fn with_capture_assistant(mut self, on: bool) -> Self {
+        self.capture_assistant = on;
+        self
+    }
+}
+
+/// Bake `--capture-assistant` onto the native `stop` command only (#196), so the
+/// other events stay byte-identical. Empty for every other event, and for a
+/// context that did not opt in.
+fn native_capture_assistant_arg(context: HookCommandContext<'_>, event: &str) -> &'static str {
+    if context.capture_assistant && event == "stop" {
+        " --capture-assistant"
+    } else {
+        ""
     }
 }
 
@@ -582,9 +1059,11 @@ impl HookCommandPlatform {
 
     fn current() -> Self {
         Self::from_env_override().unwrap_or(if cfg!(windows) {
-            Self::Windows
+            Self::WindowsNative
         } else {
-            Self::Posix
+            // Local installs use the native hook command for policy-v1.
+            // `posix` remains an explicit legacy script compatibility override.
+            Self::PosixNative
         })
     }
 
@@ -593,8 +1072,8 @@ impl HookCommandPlatform {
     /// Windows unless overridden by `AI_MEMORY_HOOK_PLATFORM`.
     fn for_bash_runner() -> Self {
         // Native macOS / Linux defaults to the binary hook command (spool +
-        // OIDC), same as Windows. The Docker wrapper forces `posix` so its
-        // host-rendered config keeps using the `.sh` scripts.
+        // OIDC), same as Windows. The Linux/macOS Docker wrapper forces
+        // `posix` so its host-rendered config keeps using the `.sh` scripts.
         Self::from_env_override().unwrap_or(if cfg!(windows) {
             Self::WindowsNative
         } else {
@@ -664,6 +1143,9 @@ fn build_hook_payload_for_platform(
                 "matcher": "",
                 "hooks": [handler],
             }]),
+            HookShape::NestedWithoutMatcher => json!([{
+                "hooks": [handler],
+            }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
         };
         hooks_block.insert((*event).to_string(), entry);
@@ -682,11 +1164,10 @@ fn hook_handler_spec(
     server_url: &str,
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
-    shape: HookShape,
+    _shape: HookShape,
 ) -> HookHandlerSpec {
-    if shape == HookShape::Nested
+    if context.platform == HookCommandPlatform::WindowsNative
         && context.claude_windows_exec_allowed
-        && context.platform == HookCommandPlatform::WindowsNative
         && context.agent == "claude-code"
     {
         return windows_native_exec_spec(script, server_url, auth_token, context);
@@ -736,6 +1217,14 @@ pub(crate) fn hook_script_for_claude_code(script: &str) -> Cow<'_, str> {
     script_for_platform(script, HookCommandPlatform::for_bash_runner())
 }
 
+#[must_use]
+pub(crate) fn local_hook_policy_v1_supported() -> bool {
+    matches!(
+        HookCommandPlatform::current(),
+        HookCommandPlatform::PosixNative | HookCommandPlatform::WindowsNative
+    )
+}
+
 fn hook_command(
     script: &Path,
     server_url: &str,
@@ -755,7 +1244,14 @@ fn hook_command(
             format!("{prefix}{}", shell_quote(&script_path))
         }
         HookCommandPlatform::Windows => {
-            let mut setup = format!("$env:AI_MEMORY_HOOK_URL={}", powershell_quote(server_url));
+            // Hook runners launch this child with redirected streams. Force
+            // text output and suppress non-interactive progress so Windows
+            // PowerShell does not serialize progress records as CLIXML. Leave
+            // input formatting at its default: the hook reads raw Console.In.
+            let mut setup = format!(
+                "$ProgressPreference='SilentlyContinue'; $env:AI_MEMORY_HOOK_URL={}",
+                powershell_quote(server_url)
+            );
             if let Some(t) = auth_token {
                 setup.push_str(&format!(
                     "; $env:AI_MEMORY_AUTH_TOKEN={}",
@@ -768,9 +1264,10 @@ fn hook_command(
                     powershell_quote(s)
                 ));
             }
+            let program = format!("{setup}; & {}", powershell_quote(&script.to_string_lossy()));
+            let encoded = powershell_encoded_command(&program);
             format!(
-                "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{setup}; & {}\"",
-                powershell_quote(&script.to_string_lossy())
+                "powershell.exe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded}"
             )
         }
         HookCommandPlatform::WindowsBash => {
@@ -819,6 +1316,7 @@ fn hook_command(
                 context.project_strategy,
                 NativeQuote::Windows,
             ));
+            cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
         }
         HookCommandPlatform::PosixNative => {
@@ -847,9 +1345,18 @@ fn hook_command(
                 context.project_strategy,
                 NativeQuote::Posix,
             ));
+            cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
         }
     }
+}
+
+fn powershell_encoded_command(program: &str) -> String {
+    let utf16_le = program
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(utf16_le)
 }
 
 fn windows_native_exec_spec(
@@ -894,6 +1401,11 @@ fn windows_native_exec_spec_with_exe(
     if let Some(strategy) = context.project_strategy {
         args.push("--project-strategy".to_string());
         args.push(strategy.to_string());
+    }
+    // Native-exec is the PRIMARY Windows Claude Code path, so the flag must be
+    // baked here too — not only in the string form above (#196).
+    if context.capture_assistant && event == "stop" {
+        args.push("--capture-assistant".to_string());
     }
     HookHandlerSpec::Exec {
         command: plain_windows_path_arg(exe),
@@ -986,7 +1498,32 @@ fn win_double_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(windows)]
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    #[cfg(windows)]
+    use std::process::Stdio;
+
+    fn decode_powershell_encoded_command(command: &str) -> String {
+        let (_, encoded) = command
+            .split_once(" -EncodedCommand ")
+            .expect("missing PowerShell -EncodedCommand payload");
+        assert!(
+            !encoded.contains(char::is_whitespace),
+            "encoded payload must be one command-line token"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("invalid base64 PowerShell program");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload has an odd length");
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).expect("invalid UTF-16 PowerShell program")
+    }
 
     fn build_posix_hook_payload(
         events: &[(&str, &str)],
@@ -1014,6 +1551,160 @@ mod tests {
     fn bearer_header_prefixes_with_bearer() {
         let h = bearer_header_value(Some("abc123")).unwrap();
         assert_eq!(h, "Bearer abc123");
+    }
+
+    /// Manual Node-required runtime evidence for the exact TypeScript emitted by
+    /// `ts_capture_policy_v1`. This deliberately executes the emitted source,
+    /// rather than maintaining a JavaScript copy in the test suite.
+    #[test]
+    #[ignore = "manual Node-required generated TypeScript runtime evidence"]
+    fn generated_capture_policy_v1_node_runtime_evidence() {
+        let strip_types = Command::new("node")
+            .args(["--experimental-strip-types", "--version"])
+            .output();
+        let Ok(strip_types) = strip_types else {
+            eprintln!(
+                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
+            );
+            return;
+        };
+        if !strip_types.status.success() {
+            eprintln!(
+                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("capture-policy-runtime-evidence.ts");
+        let fixture = include_str!("../../../ai-memory-hooks/tests/fixtures/capture-policy.json");
+        let fixture = serde_json::to_string(fixture).unwrap();
+        let source = format!(
+            r#"import {{ closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync }} from "node:fs";
+import {{ dirname, join, resolve }} from "node:path";
+import {{ homedir }} from "node:os";
+
+const fixtureText = {fixture};
+const markerRoot = process.argv[2]!;
+const markerFixtures = new Map<string, string>();
+function findMarker(cwd: string | undefined): string | undefined {{ return cwd ? markerFixtures.get(cwd) : undefined; }}
+{policy}
+
+const fixture = JSON.parse(fixtureText);
+const privatePath = "/PRIVATE_PATH_SENTINEL/item";
+const privatePattern = "/PRIVATE_PATTERN_SENTINEL/item";
+const privateBody = "PRIVATE_BODY_SENTINEL";
+let serial = 0;
+function fail(label: string): never {{ throw new Error(`runtime evidence failed: ${{label}}`); }}
+function check(ok: unknown, label: string): asserts ok {{ if (!ok) fail(label); }}
+function marker(text: string, cwd = join(markerRoot, `fixture-${{serial++}}`)): string {{
+  mkdirSync(cwd, {{ recursive: true }});
+  const file = join(cwd, ".ai-memory.toml");
+  writeFileSync(file, text);
+  markerFixtures.set(cwd, file);
+  return cwd;
+}}
+function decision(payload: Record<string, unknown>, cwd: string) {{ return capturePolicy(payload, cwd); }}
+function expectDecision(payload: Record<string, unknown>, cwd: string, disposition: string, family: string, extraction: string, count: number, label: string): void {{
+  const result = decision(payload, cwd);
+  check(result.disposition === disposition, `${{label}} disposition`);
+  check(result.protocol?.tool_family === family, `${{label}} family`);
+  check(result.protocol?.extraction_state === extraction, `${{label}} extraction`);
+  check(result.protocol?.path_count === count, `${{label}} count`);
+}}
+const active = '[capture]\nignore_paths = ["secret/**"]\n';
+for (const vector of fixture.decisions.filter((v: any) => ["open-code", "omp", "pi", "openclaw"].includes(v.agent))) {{
+  const cwd = marker(active);
+  expectDecision(vector.payload, cwd, vector.disposition, vector.tool_family, vector.extraction_state, vector.path_count, `fixture-${{vector.agent}}`);
+}}
+for (const vector of fixture.normalization) {{
+  const cwd = marker(`[capture]\nignore_paths = [${{JSON.stringify(vector.pattern)}}]\n`);
+  expectDecision({{ tool: "edit", args: {{ path: vector.candidate }} }}, cwd, vector.match ? "drop" : "keep", "file", "extracted", 1, "fixture-normalization");
+}}
+expectDecision({{ tool: "edit", args: {{ path: "private/item" }} }}, marker('[capture]\nignore_paths = ["private/**"]\n'), "drop", "file", "extracted", 1, "marker-relative");
+const nestedRoot = join(markerRoot, "nested-repo");
+const nestedCwd = join(nestedRoot, "subdir");
+mkdirSync(nestedCwd, {{ recursive: true }});
+const nestedMarker = join(nestedRoot, ".ai-memory.toml");
+writeFileSync(nestedMarker, '[capture]\nignore_paths = ["private/**"]\n');
+markerFixtures.set(nestedCwd, nestedMarker);
+expectDecision({{ tool: "edit", args: {{ path: "../private/item" }} }}, nestedCwd, "drop", "file", "extracted", 1, "nested-cwd-parent-private");
+expectDecision({{ tool: "edit", args: {{ path: "private/item" }} }}, nestedCwd, "keep", "file", "extracted", 1, "nested-cwd-local-public");
+expectDecision({{ tool: "edit", args: {{ path: `${{homedir()}}/home-private/item` }} }}, marker('[capture]\nignore_paths = ["~/home-private/**"]\n'), "drop", "file", "extracted", 1, "home-expansion");
+expectDecision({{ tool: "edit", args: {{ path: "case/item" }} }}, marker('[capture]\nignore_paths = ["Case/**"]\n'), "keep", "file", "extracted", 1, "posix-case");
+expectDecision({{ tool: "edit", args: {{ path: "c:/SECRET/item" }} }}, marker('[capture]\nignore_paths = ["C:/secret/**"]\n'), "drop", "file", "extracted", 1, "windows-drive-case");
+expectDecision({{ tool: "edit", args: {{ path: "//SERVER/SHARE/item" }} }}, marker(`[capture]\nignore_paths = ['${{String.raw`\\server\share/**`}}']\n`), "drop", "file", "extracted", 1, "windows-unc-case");
+expectDecision({{ tool: "edit", args: {{ path: "x" }} }}, marker('[capture'), "metadata-only", "file", "extracted", 1, "malformed-table");
+const malformedQuoteCwd = marker('[capture]\nignore_paths = ["private/**');
+expectDecision({{ tool: "edit", args: {{ path: privatePath }} }}, malformedQuoteCwd, "metadata-only", "file", "extracted", 1, "malformed-unterminated-quote");
+const badUtf8Cwd = `/fixture/${{serial++}}`; const badUtf8 = join(markerRoot, "bad-utf8.toml"); writeFileSync(badUtf8, Buffer.from([0xff])); markerFixtures.set(badUtf8Cwd, badUtf8);
+expectDecision({{ tool: "edit", args: {{ path: "x" }} }}, badUtf8Cwd, "metadata-only", "file", "extracted", 1, "invalid-utf8");
+expectDecision({{ tool: "edit", args: {{ path: "x" }} }}, marker(`[capture]\nignore_paths = ["${{"x".repeat(65537)}}"]`), "metadata-only", "file", "extracted", 1, "large-marker");
+expectDecision({{ tool: "edit", args: {{ path: "literal#item" }} }}, marker("[capture]\nignore_paths = [\n  'literal#item',\n  \"basic#item\"\n]\n"), "drop", "file", "extracted", 1, "multiline-and-hash");
+expectDecision({{ tool: "edit", args: {{ path: "C:relative" }} }}, marker(active), "metadata-only", "file", "extracted", 1, "drive-relative");
+expectDecision({{ tool: "future-tool", args: {{ path: "secret/a" }} }}, marker(active), "keep", "unknown", "extracted", 0, "unknown-tool");
+const adversarial = "a".repeat(4090);
+expectDecision({{ tool: "multi_edit", args: {{ edits: [{{ path: "secret/a" }}, {{ path: adversarial }}] }} }}, marker('[capture]\nignore_paths = ["secret/**", "*'.concat("a".repeat(1022), '"]\n')), "drop", "file", "extracted", 2, "first-drop-beats-budget");
+
+const requests: string[] = []; const queue: Record<string, unknown>[] = [];
+function emit(payload: Record<string, unknown>, cwd: string): void {{ const result = capturePolicy(payload, cwd); if (result.disposition === "drop") return; queue.push(result.payload); requests.push(JSON.stringify(result.payload)); }}
+const gatedCwd = marker(`[capture]\nignore_paths = [${{JSON.stringify(privatePattern)}}]\n`);
+emit({{ tool: "edit", args: {{ path: "/PRIVATE_PATTERN_SENTINEL/item", nested: {{ body: privateBody }} }}, output: privateBody, error: privateBody }}, gatedCwd);
+check(queue.length === 0 && requests.length === 0, "drop-gates-queue-and-fetch");
+emit({{ tool: "edit", args: {{ path: privatePath, nested: {{ body: privateBody }} }}, output: privateBody, error: privateBody }}, malformedQuoteCwd);
+const malformedRequest = requests.at(-1) ?? "";
+const malformedQueued = JSON.stringify(queue.at(-1));
+check(JSON.parse(malformedRequest)._ai_memory_capture?.policy_state === "invalid", "malformed-quote-invalid-protocol");
+for (const forbidden of [privatePath, privateBody]) check(!malformedQueued.includes(forbidden) && !malformedRequest.includes(forbidden), "malformed-quote-redaction");
+emit({{ tool: "edit", args: {{ path: "C:relative", nested: {{ path: privatePath, body: privateBody }} }}, output: privateBody, error: privateBody, sessionID: "session-safe", cwd: "/cwd-safe", tool_call_id: "call-safe" }}, gatedCwd);
+const metadata = requests.at(-1) ?? "";
+const metadataBody = JSON.parse(metadata);
+check(metadataBody.session_id === "session-safe", "metadata-request-session");
+check(metadataBody.cwd === "/cwd-safe", "metadata-request-cwd");
+check(metadataBody.tool_family === "file", "metadata-request-family");
+check(metadataBody.tool_name === "file", "metadata-request-name");
+check(metadataBody.tool_call_id === "call-safe", "metadata-request-call");
+check(metadataBody._ai_memory_capture?.disposition === "metadata-only" && metadataBody._ai_memory_capture?.policy_state === "active", "metadata-request-protocol");
+for (const forbidden of [privatePath, privatePattern, privateBody]) check(!metadata.includes(forbidden), "metadata-request-redaction");
+const inactivePayload = {{ tool: "edit", args: {{ path: privatePath }}, output: privateBody }};
+const inactive = capturePolicy(inactivePayload, "/no-marker");
+check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
+const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
+check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
+"#,
+            fixture = fixture,
+            policy = ts_capture_policy_v1(),
+        );
+        fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                module.to_str().unwrap(),
+                temp.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Node runtime evidence failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for sentinel in [
+            "PRIVATE_PATH_SENTINEL",
+            "PRIVATE_PATTERN_SENTINEL",
+            "PRIVATE_BODY_SENTINEL",
+        ] {
+            assert!(
+                !diagnostics.contains(sentinel),
+                "Node diagnostics leaked a private sentinel"
+            );
+        }
     }
 
     #[test]
@@ -1067,6 +1758,59 @@ mod tests {
             "{command}"
         );
         assert!(!command.contains("claude-code"), "{command}");
+    }
+
+    #[test]
+    fn devin_payload_has_all_events() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_devin_payload(&root, "http://localhost:49374", None);
+        let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), DEVIN_EVENTS.len());
+        for (event, _) in DEVIN_EVENTS {
+            assert!(hooks.contains_key(event), "missing event {event}");
+        }
+    }
+
+    #[test]
+    fn devin_native_payload_uses_devin_agent() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_hook_payload_for_platform(
+            &DEVIN_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "devin", None, None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(command.contains("--agent devin"), "{command}");
+        assert!(!command.contains("grok"), "{command}");
+    }
+
+    #[test]
+    fn devin_script_payload_uses_devin_bundle() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_hook_payload_for_platform(
+            &DEVIN_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::Posix, "devin", None, None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        let normalized = command.replace('\\', "/");
+        assert!(
+            normalized.contains("/host/hooks/devin/session-start.sh"),
+            "{command}"
+        );
+        assert!(!command.contains("grok"), "{command}");
     }
 
     #[test]
@@ -1392,8 +2136,67 @@ mod tests {
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
+    fn exec_args(script: &str, capture_assistant: bool) -> Vec<String> {
+        let spec = windows_native_exec_spec_with_exe(
+            Path::new(r"C:\ai-memory\ai-memory.exe"),
+            Path::new(script),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            )
+            .with_capture_assistant(capture_assistant),
+        );
+        let HookHandlerSpec::Exec { args, .. } = spec else {
+            panic!("expected exec spec")
+        };
+        args
+    }
+
     #[test]
-    fn exec_form_is_narrow_to_claude_code_windows_native_nested() {
+    fn capture_assistant_exec_flag_only_on_stop_and_only_when_opted_in() {
+        // Bare filenames so `file_stem()` yields the event on any host (a
+        // backslash path is a single component on Unix).
+        // Opted in: only the `stop` command carries the flag (#196, D1).
+        assert!(exec_args("stop.sh", true).contains(&"--capture-assistant".to_string()));
+        assert!(
+            !exec_args("session-start.sh", true).contains(&"--capture-assistant".to_string()),
+            "flag must not leak onto non-stop commands"
+        );
+        // Not opted in: even the stop command stays byte-identical to before.
+        assert!(
+            !exec_args("stop.sh", false).contains(&"--capture-assistant".to_string()),
+            "flag must be absent without opt-in"
+        );
+    }
+
+    #[test]
+    fn capture_assistant_string_form_only_on_stop() {
+        // POSIX + Windows string forms: the flag rides only the stop command.
+        for platform in [
+            HookCommandPlatform::PosixNative,
+            HookCommandPlatform::WindowsNative,
+        ] {
+            let ctx = HookCommandContext::new(platform, "claude-code", None, None)
+                .with_capture_assistant(true);
+            let stop = hook_command(Path::new("stop.sh"), "http://h", None, ctx);
+            let start = hook_command(Path::new("session-start.sh"), "http://h", None, ctx);
+            assert!(
+                stop.contains("--capture-assistant"),
+                "{platform:?} stop missing flag: {stop}"
+            );
+            assert!(
+                !start.contains("--capture-assistant"),
+                "{platform:?} session-start must not carry flag: {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_native_exec_form_is_claude_only_and_guarded() {
         fn handler_for(
             platform: HookCommandPlatform,
             agent: &str,
@@ -1408,7 +2211,9 @@ mod tests {
                 HookCommandContext::new(platform, agent, None, None).allow_claude_windows_exec(),
             );
             match shape {
-                HookShape::Nested => v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone(),
+                HookShape::Nested | HookShape::NestedWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
+                }
                 HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
             }
         }
@@ -1430,21 +2235,42 @@ mod tests {
                 "claude-code",
                 HookShape::Nested,
             ),
-            (
-                HookCommandPlatform::WindowsNative,
-                "grok",
-                HookShape::Nested,
-            ),
-            (
-                HookCommandPlatform::WindowsNative,
-                "claude-code",
-                HookShape::Flat,
-            ),
         ] {
             let handler = handler_for(platform, agent, shape);
             assert!(
                 handler.get("args").is_none(),
                 "{platform:?}/{agent}/{shape:?} must keep command-string form: {handler}"
+            );
+        }
+
+        let claude = handler_for(
+            HookCommandPlatform::WindowsNative,
+            "claude-code",
+            HookShape::Nested,
+        );
+        assert!(
+            claude.get("args").is_some(),
+            "Claude must use exec form: {claude}"
+        );
+
+        for (agent, shape) in [
+            ("cursor", HookShape::Flat),
+            ("gemini-cli", HookShape::Flat),
+            ("codex", HookShape::Nested),
+            ("antigravity-cli", HookShape::Flat),
+            ("grok", HookShape::Nested),
+            ("devin", HookShape::Nested),
+        ] {
+            let handler = handler_for(HookCommandPlatform::WindowsNative, agent, shape);
+            assert!(
+                handler.get("args").is_none(),
+                "{agent}/{shape:?} must retain command-string schema: {handler}"
+            );
+            let command = handler["command"].as_str().unwrap();
+            assert!(
+                command.contains("hook --event session-start")
+                    && command.contains(&format!("--agent {agent}")),
+                "{agent}/{shape:?} must invoke the native hook command: {command}"
             );
         }
 
@@ -1465,7 +2291,7 @@ mod tests {
             setup_like
                 .pointer("/hooks/SessionStart/0/hooks/0/args")
                 .is_none(),
-            "setup-agent style Claude Code payload must not inherit exec form: {setup_like}"
+            "unapproved Claude render paths must retain command-string schema: {setup_like}"
         );
 
         let antigravity = build_antigravity_payload_for_platform(
@@ -1481,8 +2307,27 @@ mod tests {
             antigravity
                 .pointer("/ai-memory/PreInvocation/0/args")
                 .is_none(),
-            "antigravity must not inherit exec form: {antigravity}"
+            "Antigravity must retain command-string schema: {antigravity}"
         );
+    }
+
+    #[test]
+    fn command_code_profile_omits_matchers_and_uses_native_agent_identity() {
+        let value = build_hook_payload_for_platform(
+            &COMMAND_CODE_EVENTS,
+            Path::new("/hooks"),
+            "http://memory:49374",
+            None,
+            HookShape::NestedWithoutMatcher,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "command-code", None, None),
+        );
+
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            let definition = &value["hooks"][event][0];
+            assert!(definition.get("matcher").is_none(), "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            assert!(command.contains("--agent command-code"), "{command}");
+        }
     }
 
     #[test]
@@ -1549,17 +2394,138 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert!(cmd.starts_with("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command"));
-        assert!(cmd.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"));
-        assert!(cmd.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"));
+        assert!(cmd.starts_with(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand "
+        ));
         assert!(
-            cmd.contains("session-start.ps1"),
-            "expected ps1 script path: {cmd}"
+            !cmd.contains("$env:"),
+            "outer command must be opaque: {cmd}"
         );
         assert!(
-            !cmd.contains("session-start.sh"),
-            "Windows command must not use sh: {cmd}"
+            !cmd.contains("http://localhost:49374"),
+            "outer command must not expose values to its caller: {cmd}"
         );
+        let program = decode_powershell_encoded_command(cmd);
+        assert!(program.starts_with("$ProgressPreference='SilentlyContinue';"));
+        assert!(program.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"));
+        assert!(program.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"));
+        assert!(
+            program.contains("session-start.ps1"),
+            "expected ps1 script path: {program}"
+        );
+        assert!(
+            !program.contains("session-start.sh"),
+            "Windows command must not use sh: {program}"
+        );
+    }
+
+    #[test]
+    fn antigravity_windows_commands_survive_an_outer_powershell_runner() {
+        let root = PathBuf::from("C:/Users/alice/.local/share/ai-memory/hooks/antigravity-cli");
+        let v = build_antigravity_payload_for_platform(
+            &root,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookCommandPlatform::Windows,
+            "antigravity-cli",
+            None,
+            Some("repo-root"),
+        );
+
+        for pointer in [
+            "/ai-memory/PreInvocation/0/command",
+            "/ai-memory/PreToolUse/0/hooks/0/command",
+        ] {
+            let command = v.pointer(pointer).and_then(Value::as_str).unwrap();
+            assert!(
+                command.contains(" -EncodedCommand "),
+                "{pointer}: {command}"
+            );
+            assert!(
+                command.contains(" -OutputFormat Text "),
+                "{pointer}: nested PowerShell output must stay textual: {command}"
+            );
+            assert!(
+                !command.contains("$env:")
+                    && !command.contains("localhost:49374")
+                    && !command.contains(".ps1"),
+                "{pointer}: outer runner must see only an opaque program: {command}"
+            );
+
+            let program = decode_powershell_encoded_command(command);
+            assert!(
+                program.starts_with("$ProgressPreference='SilentlyContinue';"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
+                "{pointer}: {program}"
+            );
+            assert!(program.contains(".ps1"), "{pointer}: {program}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_encoded_hook_executes_through_an_outer_powershell() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("hook with spaces.ps1");
+        fs::write(
+            &script,
+            r#"if ($env:AI_MEMORY_HOOK_URL -ne "http://localhost:49374") { exit 9 }
+if ($env:AI_MEMORY_AUTH_TOKEN -ne "tok'en") { exit 10 }
+Write-Progress -Activity "hook progress" -Status "must stay silent"
+$payload = [Console]::In.ReadToEnd()
+[Console]::Out.Write($payload)
+"#,
+        )
+        .unwrap();
+        let command = hook_command(
+            &script,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookCommandContext::new(HookCommandPlatform::Windows, "antigravity-cli", None, None),
+        );
+
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &command,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook":"ok"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "nested PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "non-interactive hook wrote stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, br#"{"hook":"ok"}"#);
     }
 
     #[test]
@@ -1640,6 +2606,56 @@ mod tests {
                 "missing Antigravity event {expected}"
             );
         }
+    }
+
+    #[test]
+    fn kimi_code_commands_cover_all_events_with_script_paths() {
+        let root = PathBuf::from("/host/hooks/kimi-code");
+        let commands = kimi_code_hook_commands_for_platform(
+            &root,
+            "http://localhost:49374",
+            Some("tok"),
+            HookCommandPlatform::Posix,
+            None,
+            None,
+        );
+        assert_eq!(commands.len(), KIMI_CODE_EVENTS.len());
+        let events: Vec<&str> = commands.iter().map(|(event, _)| *event).collect();
+        for (event, script) in KIMI_CODE_EVENTS {
+            assert!(events.contains(&event), "missing Kimi Code event {event}");
+            let (_, cmd) = commands.iter().find(|(e, _)| *e == event).unwrap();
+            let expected = root.join(script);
+            assert!(
+                cmd.contains(expected.to_string_lossy().as_ref()),
+                "{event}: command must point at the staged script: {cmd}"
+            );
+        }
+        let (_, session_start) = &commands[0];
+        assert!(
+            session_start.contains("AI_MEMORY_HOOK_URL=http://localhost:49374"),
+            "{session_start}"
+        );
+        assert!(
+            session_start.contains("AI_MEMORY_AUTH_TOKEN=tok"),
+            "{session_start}"
+        );
+    }
+
+    #[test]
+    fn kimi_code_commands_windows_use_ps1_scripts() {
+        let root = PathBuf::from(r"C:\hooks\kimi-code");
+        let commands = kimi_code_hook_commands_for_platform(
+            &root,
+            "http://h:49374",
+            None,
+            HookCommandPlatform::Windows,
+            None,
+            None,
+        );
+        let (_, cmd) = &commands[0];
+        let program = decode_powershell_encoded_command(cmd);
+        assert!(program.contains("session-start.ps1"), "{program}");
+        assert!(!program.contains("session-start.sh"), "{program}");
     }
 
     #[test]
@@ -1745,9 +2761,10 @@ mod tests {
     #[test]
     fn windows_ps_hook_command_bakes_project_strategy_env() {
         let cmd = strategy_cmd(HookCommandPlatform::Windows, Some("repo-root"));
+        let program = decode_powershell_encoded_command(&cmd);
         assert!(
-            cmd.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
-            "powershell must bake the strategy env: {cmd}"
+            program.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
+            "powershell must bake the strategy env: {program}"
         );
     }
 
@@ -1789,13 +2806,18 @@ mod tests {
             HookCommandPlatform::WindowsNative,
         ] {
             let cmd = strategy_cmd(platform, None);
+            let inspect = if platform == HookCommandPlatform::Windows {
+                decode_powershell_encoded_command(&cmd)
+            } else {
+                cmd
+            };
             assert!(
-                !cmd.contains("AI_MEMORY_PROJECT_STRATEGY"),
-                "{platform:?}: no strategy env when None: {cmd}"
+                !inspect.contains("AI_MEMORY_PROJECT_STRATEGY"),
+                "{platform:?}: no strategy env when None: {inspect}"
             );
             assert!(
-                !cmd.contains("--project-strategy"),
-                "{platform:?}: no strategy flag when None: {cmd}"
+                !inspect.contains("--project-strategy"),
+                "{platform:?}: no strategy flag when None: {inspect}"
             );
         }
     }

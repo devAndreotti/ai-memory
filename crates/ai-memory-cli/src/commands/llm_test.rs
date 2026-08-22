@@ -24,6 +24,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url()),
         compat_strict: config.llm_compat_strict,
+        request_timeout_secs: config.llm_timeout_secs,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(
@@ -32,7 +33,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         "sending prompt",
     );
     let resp = client
-        .complete(ChatRequest::user_prompt(args.prompt))
+        .complete(representative_request(args.prompt))
         .await
         .context("calling provider")?;
 
@@ -45,6 +46,14 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
     }
     println!("{}", resp.text);
     Ok(())
+}
+
+/// Use the same sampling value as bootstrap and consolidation so this smoke
+/// test exercises provider-specific request normalization.
+fn representative_request(prompt: String) -> ChatRequest {
+    let mut request = ChatRequest::user_prompt(prompt);
+    request.temperature = Some(0.2);
+    request
 }
 
 impl From<LlmProviderChoice> for ProviderChoice {
@@ -72,5 +81,13 @@ mod tests {
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
         );
+    }
+
+    #[test]
+    fn llm_test_exercises_pipeline_sampling_compatibility() {
+        let request = representative_request("diagnostic".into());
+
+        assert_eq!(request.temperature, Some(0.2));
+        assert_eq!(request.messages[0].content, "diagnostic");
     }
 }

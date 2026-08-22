@@ -24,16 +24,20 @@ this case. Most ai-memory installs never need a proxy.
 Add a TLS-terminating proxy in front of ai-memory when any of these
 apply:
 
-- **Multi-user mode is on** (`[auth].token_pepper` set, users created via `ai-memory user add`). Per-user tokens travel between clients and the server — sniffable over plain HTTP on the LAN. See [`docs/users.md`](users.md).
+- **Multi-user mode is on** (at least one user row exists; `[auth].token_pepper`
+  is the credential prerequisite). Per-user tokens travel between clients and
+  the server — sniffable over plain HTTP on the LAN. See
+  [`docs/users.md`](users.md).
 - **The server is bound beyond loopback** (`AI_MEMORY_BIND=0.0.0.0:49374` or a LAN-routable IP). Anyone on the network segment sees plaintext token traffic and `/web` cookies.
 - **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after Basic auth lives in the clear over HTTP.
 - **You're exposing ai-memory beyond the LAN.** Cloudflare Tunnel or a public-domain Caddy with Let's Encrypt are the two patterns most homelab operators land on.
 
-ai-memory will warn at startup when it binds to a non-loopback address
-without auth, and again (one-shot) on the first request that didn't
-arrive via `X-Forwarded-Proto: https`. The warnings are advisory —
-the server doesn't refuse to start over plain HTTP. The decision to
-add TLS is yours; this page is the recipes.
+ai-memory refuses to start unauthenticated non-loopback HTTP by default.
+Configure `AI_MEMORY_AUTH_TOKEN` or bind loopback; the dangerous
+`--allow-insecure-no-auth` escape hatch exists only for intentional plain-HTTP
+LAN use. Authenticated non-loopback plain HTTP remains available and logs a
+loud warning: bearer tokens and `/web` cookies are still sniffable without
+TLS. The decision to add TLS is yours; this page is the recipes.
 
 ## Pick a path
 
@@ -119,6 +123,7 @@ Caddy will:
 
 ```bash
 AI_MEMORY_AUTH_TOKEN=...long-random-token-from-generate-auth-token...
+AI_MEMORY_AUTH__SECURE_COOKIE=true
 AI_MEMORY_ALLOWED_HOSTS=memory.example.com,localhost,127.0.0.1
 AI_MEMORY_BIND=0.0.0.0:49374
 ```
@@ -302,6 +307,7 @@ step above (Cloudflare manages the CNAME automatically).
 
 ```bash
 AI_MEMORY_AUTH_TOKEN=...long-random-token...
+AI_MEMORY_AUTH__SECURE_COOKIE=true
 AI_MEMORY_ALLOWED_HOSTS=memory.example.com,localhost,127.0.0.1
 AI_MEMORY_BIND=0.0.0.0:49374
 CLOUDFLARE_TUNNEL_TOKEN=eyJ...long-base64-from-the-cf-dashboard...
@@ -411,11 +417,17 @@ Nothing special — the server intentionally generates no absolute URLs
 in responses, so it doesn't matter whether `https://` or `http://`
 sits in front. The bearer token middleware reads `Authorization`
 directly off the request, which proxies forward verbatim. The
-`/api/v1` ETag is computed from request-independent fields. The
-`/web` cookie set after Basic auth uses `SameSite=Lax` without
-`Secure`, which lets it ride either transport — when fronted with
-HTTPS, modern browsers automatically tighten the cookie to the proxy
-origin's secure flag set anyway.
+`/api/v1` ETag is computed from request-independent fields.
+
+For browser access to `/web` through HTTPS, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` (or `[auth] secure_cookie = true`). This
+marks the Basic-auth session cookie `Secure`; it is always `HttpOnly`,
+`SameSite=Strict`, and `Path=/`. ai-memory intentionally does **not** infer
+HTTPS from `X-Forwarded-Proto` or any other proxy header. Close direct HTTP
+access to the public hostname, or redirect it to HTTPS. Enabling
+`secure_cookie` on a direct HTTP deployment makes browsers withhold the cookie,
+which is expected safety behavior. It remains false by default so loopback and
+plain-HTTP local `/web` continue to work.
 
 The only thing to mind: **`AI_MEMORY_ALLOWED_HOSTS` must include the
 public hostname**, not just `localhost`. The host-allowlist middleware

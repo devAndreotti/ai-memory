@@ -9,13 +9,15 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, VS Code Copilot)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
   (cargo install, building from source)
+- [Managed cross-harness workstreams](managed-workstreams.md)
+  (`ai-memory run`, transparent native resume, and argument forwarding)
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
-- [Subcommand reference](#subcommand-reference)
+- [Common subcommands](#common-subcommands)
 - [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
 - [Operating without auth](#operating-without-auth) (local-only)
 - [Keeping ai-memory up to date](#keeping-ai-memory-up-to-date)
@@ -30,6 +32,12 @@ path (docker + Claude Code). This page covers everything else:
 
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
+
+> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
+> through the `podman-docker` `docker` shim or by pointing it at podman
+> directly with `AI_MEMORY_DOCKER=podman`. See
+> [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
+> engine's rootless and SELinux state.
 
 ---
 
@@ -53,8 +61,15 @@ docker run -d --name ai-memory \
 ```
 
 See [Security](../README.md#security) in the README for why
-`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both
-required for any non-loopback bind.
+`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both required for
+normal non-loopback binds. Bearer auth does not encrypt traffic: use the ready
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates from the
+[HTTPS reverse-proxy guide](https-via-proxy.md) for LAN or remote access.
+When the proxy serves `/web` over HTTPS, also set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` in the server environment and close or
+redirect direct HTTP access to that hostname. Do not set it for direct HTTP:
+browsers then correctly withhold the session cookie.
 
 ### Client side (the laptop)
 
@@ -65,6 +80,31 @@ export AI_MEMORY_AUTH_TOKEN="$TOKEN"
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+`--session-aware` is an optional Claude Code MCP mode:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+It replaces the static HTTP MCP entry with a local ai-memory stdio bridge that
+still connects to the configured remote server and bearer token, while
+forwarding Claude's lifecycle session id. Pair it with
+`[auto_scope] mode = "per_session"` when the same operator runs concurrent
+Claude Code sessions in different projects. The default static HTTP
+registration remains appropriate for one active project at a time.
+
+If `CLAUDE_CONFIG_DIR` is set, the claude-code installers match Claude Code's
+own config resolution: `install-mcp` writes the MCP registration to
+`$CLAUDE_CONFIG_DIR/.claude.json` (instead of `~/.claude.json`),
+`install-hooks` / `setup-agent` target `$CLAUDE_CONFIG_DIR/settings.json`
+(instead of `~/.claude/settings.json`), and `install-skills --scope global`
+uses `$CLAUDE_CONFIG_DIR/skills` (instead of `~/.claude/skills`). `uninstall`
+sweeps the active relocated paths alongside the home defaults. It cannot
+discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set. The
+Docker wrapper forwards the variable for config roots under its existing
+`$HOME` bind mount; use the native binary when the relocated root is outside
+`$HOME`.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
@@ -114,6 +154,11 @@ without env vars or flags, hooks reuse the existing ai-memory MCP entry for
 that agent when possible. This keeps remote MCP config and lifecycle capture
 pointed at the same server instead of falling back to loopback.
 
+All installer `--apply` modes preserve symlinked configuration files: the
+atomic update is written to the symlink target, including a missing final
+target, while the timestamped backup stays next to the user-facing config
+path. This keeps stow, chezmoi, and similar dotfile-managed installs linked.
+
 `init`, `serve`, and `generate-auth-token` do not need these env vars because
 they either create local files or start the server itself.
 
@@ -130,10 +175,13 @@ strategy into the hooks:
 ai-memory install-hooks --apply --agent claude-code --project-strategy repo-root
 ```
 
-`--project-strategy` accepts `basename` (the default; bakes nothing, so existing
-installs are unchanged) or `repo-root`. It works for every agent and delivery
-path. A per-repo `.ai-memory.toml` marker's own `project_strategy` / `project`
-still take precedence — see
+`--project-strategy` accepts `basename` (the new-install default; bakes nothing)
+or `repo-root`. Omitting it during a later `--apply` preserves the strategy
+already baked into that agent's ai-memory hooks, including during the wrapper's
+automatic post-upgrade refresh. Pass `basename` explicitly to remove an
+existing `repo-root` default. This works for every agent and delivery path. A
+per-repo `.ai-memory.toml` marker's own `project_strategy` / `project` still
+take precedence — see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
@@ -352,6 +400,11 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+For concurrent Claude Code sessions, set `[auto_scope] mode = "per_session"` in
+the server config and add `--session-aware` to the `install-mcp` command. This
+works for local and LAN servers; the generated stdio bridge keeps using
+`AI_MEMORY_SERVER_URL` / `--server-url` and `AI_MEMORY_AUTH_TOKEN`.
+
 For a bearer-protected local or LAN server, export the endpoint first. The MCP
 URL includes `/mcp`; the hook URL is the bare origin.
 
@@ -368,10 +421,98 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
+### Capture-policy capability and refresh
+
+`[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
+and generated OpenCode/OMP/Pi/OpenClaw integrations. Local installers select
+native commands where supported; legacy `.sh`/`.ps1` hooks and remote-only or
+Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
+--apply` or refresh/reinstall generated plugins after upgrading; installer
+capability output reflects the selected integration. See the canonical
+[capture exclusions reference](marker-file.md#capture-exclusions).
+
+Lifecycle observation bodies are bounded separately from the 10 MiB HTTP
+request limit. User prompts and post-compaction summaries retain up to 16 KiB;
+notifications and tool excerpts retain up to 2 KB. Native `ai-memory hook`
+commands truncate those fields UTF-8-safely before they enter the local spool
+or wire. The server repeats the event-specific caps for every integration,
+including script and generated clients, then applies a 16 KiB backstop after
+sanitization before any observation reaches SQLite or FTS. Native hook commands
+invoke the installed binary directly, so upgrading that binary is enough to
+receive the client-side cap.
+
+**Disable Claude Code prompt capture.** Regulated or mixed-trust machines can
+leave the rest of Claude Code's lifecycle capture enabled while preventing
+`UserPromptSubmit` text from entering the local spool or wire:
+
+```bash
+ai-memory install-hooks --agent claude-code --no-capture-prompts --apply
+```
+
+The installer removes only ai-memory's prompt hook and preserves third-party
+hooks registered under the same event. A later bare `install-hooks --apply`
+(including an upgrade refresh) inherits the disabled state. Re-enable prompt
+capture explicitly with `--capture-prompts`. These options are Claude Code-only:
+some other agents use their prompt hook to inject handoff context, so removing
+it would break continuity. Disabling prompt capture reduces session summaries
+and recall quality because user intent is no longer part of the observation
+stream; tool and session-boundary capture continues unchanged.
+
+Some agent harnesses attach the assistant's final turn to their `Stop` event —
+Claude Code sends it as a raw `last_assistant_message`. By default that text is
+never persisted: the native hook binary strips the raw field before it can reach
+the local spool or the wire, and the server strips it defensively on arrival.
+
+**Opt-in capture (#196).** You can opt in to storing a sanitized, 2 KB-capped
+excerpt of the assistant's final turn as the Stop body. It is a **double
+opt-in** — enable the server first, then the client:
+
+1. **Server:** set `capture_assistant = true` in the live
+   `<data_dir>/config.toml` (or the service's configured TOML file), or set
+   `AI_MEMORY_CAPTURE_ASSISTANT=true`, then restart `ai-memory serve`.
+2. **Client:** re-install the Claude Code hooks with the flag:
+
+   ```bash
+   ai-memory install-hooks --agent claude-code --capture-assistant --apply
+   ```
+
+The client sanitizes (built-in patterns) and truncates the excerpt before it
+touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
+before storing. If either side is off — or the marker is malformed — the Stop
+stays empty. Re-running `install-hooks` without `--capture-assistant` removes
+the flag (idempotent). `--capture-assistant` is Claude Code + native-platform
+only; on any other agent or the script fallback the installer refuses it rather
+than enabling something that cannot take effect. Assistant text is
+privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
+it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
+is configured) before enabling it.
+
+Upgrading the binary is sufficient for native Claude Code installs, and pending
+spooled events drain with the raw field stripped as well. Installs that run the
+`.sh`/`.ps1` script fallback (the Docker script bundle or an explicit
+`AI_MEMORY_HOOK_PLATFORM=posix`) cannot sanitize the assistant text, so a `Stop`
+payload still carrying the raw field is dropped whole by the script rather than
+POSTed verbatim. The Docker wrapper deliberately keeps script commands because a
+binary path inside its helper container is not valid on the host; running
+`install-hooks` through that wrapper refreshes the scripts but does not convert
+them. To capture assistant text safely, install a native ai-memory client on the
+agent host, then use that native executable to run
+`install-hooks --agent claude-code --apply`. Even if the script fallback is
+retained, the server still strips any raw field on receipt before persistence.
+
 Native `ai-memory hook --event ...` commands spool events locally. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
+Each spooled entry keeps one idempotency key across retries. A server that
+processed an event but lost the batch response will not duplicate its
+observation or completed session-end effects; if processing stopped after the
+observation commit, the retry re-runs downstream work. SessionEnd atomically
+commits its end watermark with its automatic handoff; a retry that finds that
+transaction complete finishes any interrupted wiki commit, durable provider
+enqueue, and ingest-key completion without adding a second handoff. Those
+incomplete effects remain at-least-once until the server marks the event
+complete.
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
@@ -474,9 +615,9 @@ AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-nati
 
 ## Configuring other agent CLIs
 
-> `install-mcp --server-url` takes the MCP endpoint **including** `/mcp`
-> (e.g. `http://homelab:49374/mcp`) — the rendered client config expects the
-> full MCP URL. `install-hooks --server-url` takes the bare server **origin**
+> `install-mcp --server-url` accepts either the bare server origin or the full
+> MCP endpoint and appends a missing `/mcp` exactly once.
+> `install-hooks --server-url` takes the bare server **origin**
 > (e.g. `http://homelab:49374`) — hook scripts append `/hook`, `/handoff`,
 > etc. themselves.
 
@@ -488,21 +629,19 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop is MCP-only today. Claude Code, Codex, OpenCode, OMP,
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle capture paths through
-`install-hooks`.
+Claude Desktop, VS Code Copilot, and Zed are MCP-only today. The
+hook-capable clients in the [README Support Matrix](../README.md#support-matrix),
+including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 
-> **Two-step hook install pattern.** Claude Code, Codex, Cursor,
-> Gemini CLI, Antigravity CLI, and Grok Build CLI use shell/PowerShell hook scripts: (1) `docker cp` the
-> bundled scripts to your home dir, (2) `docker run --rm install-hooks`
-> to render the config snippet.
-> On native Windows, Claude Code is the exception to the PowerShell default:
-> it uses Claude exec form (`command` = real `ai-memory.exe`, `args` = argv
-> tokens for `hook --event ...`) by default. Set
-> `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
-> Git Bash `bash -c` commands for the `.sh` scripts, including for older Claude
-> Code builds that do not support exec form.
-> OpenClaw, OpenCode, and OMP are different: they use generated
+> **Hook install pattern.** Local supported profiles default to host-native
+> commands. Claude Code may use its supported Windows exec form (`command` =
+> real `ai-memory.exe`, `args` = argv tokens for `hook --event ...`); other
+> agents use native single command strings according to their hook schema.
+> PowerShell/Git Bash script bundles are compatibility fallbacks and do not
+> enforce capture-policy v1. Remote-only/Docker script installs still use the
+> two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
+> `docker run --rm install-hooks` renders the config snippet.
+> OpenClaw, OpenCode, OMP, and Pi are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
 
@@ -532,7 +671,256 @@ auto-improvement eligibility for the current project, run:
 ```bash
 ai-memory finalize-session
 # add --all to close every matching open Codex session in this workspace/project
+# or target one exact concurrent session (mutually exclusive with --all)
+ai-memory finalize-session --session-id <uuid>
 ```
+
+Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
+end of one execution loop, so ai-memory intentionally records it without
+closing the conversation. Its `PreInvocation` hook likewise runs before every
+model call; ai-memory treats only the documented `invocationNum = 0` call as
+SessionStart. Later invocations return an empty hook result without capturing
+another start or fetching the single-use handoff, so a handoff created while
+the current conversation winds down remains available to the next session.
+After the final turn, finalize the latest matching Antigravity session
+explicitly:
+
+```bash
+ai-memory finalize-session --agent antigravity-cli
+# add --all only to close every matching open Antigravity session in this scope
+# or add --session-id <uuid> to close one exact concurrent session
+```
+
+### Devin CLI
+
+Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`
+for lifecycle hooks by default. If you prefer one combined Devin config file,
+pass `--config-file ~/.devin/config.json` to `install-hooks`; ai-memory then
+merges the hook entries under that file's `hooks` key.
+
+```bash
+ai-memory install-mcp --client devin --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent devin --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+ai-memory install-skills --agent devin
+```
+
+Devin's hook vocabulary is close to Claude Code's, with two important
+differences:
+
+- Devin emits `PostCompaction` after compaction and includes a `summary` field;
+  ai-memory records it as `post-compaction`.
+- Devin does not expose subagent start/stop hooks, so ai-memory cannot capture
+  nested subagent boundaries for Devin.
+
+The `SessionStart` hook injects pending handoffs through Devin's
+`hookSpecificOutput.additionalContext`. Real Devin `SessionStart` and
+`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory now infers cwd
+from `DEVIN_PROJECT_DIR` or the hook process working directory when the payload
+omits it, and mints/reuses a per-host session id from hook state when necessary,
+so those events are still captured. A payload-provided value always wins.
+
+### Kimi Code
+
+Kimi Code keeps MCP servers in `~/.kimi-code/mcp.json` and lifecycle hooks in
+`~/.kimi-code/config.toml`; both move together when `$KIMI_CODE_HOME` is set.
+The CLI also accepts `--agent kimi` as an alias. `install-mcp` writes the
+server URL with a `?flavor=moonshot` query because the Moonshot API rejects
+root-level `anyOf`/`oneOf`/`allOf` in tool parameter schemas ("moonshot
+flavored json schema") — the ai-memory server answers flavored requests with
+flat schemas, and all other clients keep the upstream shape.
+
+```bash
+ai-memory install-mcp --client kimi-code --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent kimi-code --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+`install-hooks` merges `[[hooks]]` entries into `config.toml`, preserving the
+provider/model settings the same file holds. Entries cover 10 events —
+`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure` (Kimi Code reports tool failures separately from
+successful calls; it reuses the post-tool-use handler), `Stop`,
+`SubagentStart`, `SubagentStop`, and `PreCompact` — and default to
+native `ai-memory hook --event … --agent kimi-code` commands on local installs
+(local spool plus batched delivery, capture-policy v1 enforced); the staged
+script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
+compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
+appends to the model context as a user message before the turn; Kimi Code
+fires `SessionStart` but discards that hook's stdout, so hooks installed by
+an older release consumed handoffs without delivering them. Existing native
+hook commands invoke the current `ai-memory` binary and pick up the corrected
+delivery behavior on upgrade. Re-run
+`ai-memory install-hooks --agent kimi-code --apply` only for a
+script-fallback installation so its staged scripts are refreshed.
+
+Kimi Code hook entries accept only `event`, `matcher`, `command`, and
+`timeout`; extra fields make the whole `config.toml` fail to load, so prefer
+`install-hooks --apply` over hand edits.
+
+### Command Code
+
+Command Code keeps user-scope MCP and hook configuration in separate JSON
+files under `~/.commandcode/`. Install both integrations with:
+
+```bash
+ai-memory install-mcp --client command-code --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent command-code --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` are accepted. `install-mcp`
+merges a native HTTP entry into `~/.commandcode/mcp.json`; `install-hooks`
+merges only Command Code's four stable events (`SessionStart`, `PreToolUse`,
+`PostToolUse`, and `Stop`) into `~/.commandcode/settings.json`, preserving
+other settings and hook handlers. The hook definitions deliberately omit
+`matcher`: Command Code documents omission as "all tools", while any matcher
+on `SessionStart` or `Stop` prevents that lifecycle hook from firing.
+
+Local installs use the native `ai-memory hook` command, so Command Code's
+native `session_id` and `cwd` are attributed directly;
+recognized `shell_command`, `read_file`, `write_file`, and `edit_file`
+payloads pass through the same bounded capture-exclusion policy as other
+native integrations. A pending handoff is injected through
+`hookSpecificOutput.additionalContext` at `SessionStart`.
+
+Command Code's stable `Stop` event ends a turn, not a session. Finalize the
+open session after the last turn when you need immediate consolidation and a
+handoff:
+
+```bash
+ai-memory finalize-session --agent command-code
+ai-memory finalize-session --agent command-code --session-id <uuid>
+```
+
+ai-memory does not install Command Code Mods. Mods run arbitrary unsandboxed
+code and are not needed for the stable hook or managed-session paths.
+
+Managed sessions are opt-in:
+
+```bash
+ai-memory run command-code
+ai-memory run command-code --yolo --model <model-id>
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` select the same adapter. The
+default executable is `command-code` on Unix and `cmdc` on native Windows.
+Fresh sessions keep Command Code's native UUID; returning sessions use exact
+`--session <uuid>`. The read-only adapter accepts only the observed v3 header,
+requires its UUID filename and canonical `cwd` to match the checkout, excludes
+checkpoint/prompt sidecars, hidden reasoning, images, and provider metadata,
+and preserves `parentId` on visible events for branch provenance. An unknown
+future transcript version fails closed until its schema is audited. Direct
+`cmd`, `cmdc`, or `command-code` launches remain unchanged.
+
+### Kiro CLI
+
+Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
+ai-memory supports both through explicit installer targets: `kiro-cli` remains
+the v2 target, while `kiro-cli-v3` selects the standalone v3 registration. The
+global MCP file is `$KIRO_HOME/settings/mcp.json`, defaulting to
+`~/.kiro/settings/mcp.json`; pass `--config-file .kiro/settings/mcp.json` for a
+project-scoped entry.
+
+```bash
+ai-memory install-mcp --client kiro-cli --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+```
+
+The `kiro` alias is equivalent. The installed URL includes
+`?flavor=bedrock` so Kiro's Bedrock backend receives schemas without
+root-level `anyOf`, `oneOf`, or `allOf`; nested schemas and runtime validation
+remain intact. Kiro requires HTTPS for non-loopback remote servers, so the CLI
+rejects a plain-HTTP homelab URL before changing the file. Configure a reverse
+proxy as described in [HTTPS via reverse proxy](https-via-proxy.md).
+
+Install v2 hooks with the `kiro-cli` agent value. When `--server-url` is omitted,
+`install-hooks` can infer the hook origin and bearer token from the managed MCP
+entry above.
+
+```bash
+# Default v2 engine: merge hooks into every existing global agent config.
+ai-memory install-hooks --agent kiro-cli --apply
+
+# A project-local v2 agent overrides a same-named global agent. Update the
+# selected local config explicitly instead of assuming the global copy runs.
+ai-memory install-hooks --agent kiro-cli --apply \
+    --config-file .kiro/agents/<agent-name>.json
+```
+
+The v2 engine stores camelCase hooks inside agent JSON files. ai-memory updates
+existing `$KIRO_HOME/agents/*.json` files only; it will not fabricate an agent
+that Kiro never selects. Create and select an agent first when that directory
+is empty. Kiro gives [project-local agents precedence over global agents](https://kiro.dev/docs/cli/custom-agents/configuration-reference/),
+so use `--config-file` when the active definition lives under
+`.kiro/agents/`. All target files are parsed before any one is changed, and
+unrelated agent fields, third-party hooks, and each agent's existing
+`--project-strategy` remain intact.
+
+The install registers spawn, user-prompt, pre-tool, post-tool, and stop capture,
+remains fail-open when ai-memory is unavailable, and delivers a pending handoff
+through successful `agentSpawn` stdout. Verified v2 tool payloads enforce
+`[capture] ignore_paths`; an unrecognized payload shape is stored as bounded
+metadata rather than exposing file content.
+
+Install v3 hooks with the explicit `kiro-cli-v3` target. This distinction is
+intentional: `kiro` and `kiro-cli` continue to mean v2 so an upgrade cannot
+silently rewrite an existing installation into an incompatible format. The
+standalone registration was acceptance-tested with an interactive Kiro CLI
+2.16.2 `--v3` session.
+
+```bash
+# Global v3 registration under $KIRO_HOME/hooks (default ~/.kiro/hooks).
+ai-memory install-hooks --agent kiro-cli-v3 --apply
+
+# Project-local v3 registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --config-file .kiro/hooks/ai-memory.json
+```
+
+The v3 installer writes the documented standalone `version: "v1"` schema with
+PascalCase triggers. It preserves third-party entries in a shared file,
+refuses an unsupported schema version or a third-party collision with an
+ai-memory-reserved hook name, and bounds capture-only commands to one second.
+SessionStart gets five seconds so ai-memory's bounded handoff fetch can finish.
+Both engines use the same sanitized hook-ingress boundary: documented and live
+`tool_name`/`tool_input` file operations honor `[capture] ignore_paths`, while
+unknown file-tool payload shapes degrade to metadata-only capture.
+
+Kiro v2's `stop` event ends a turn, not the session. After the final turn, close
+the matching session explicitly; use the exact id when several Kiro sessions
+are open in the same project:
+
+```bash
+ai-memory finalize-session --agent kiro-cli
+ai-memory finalize-session --agent kiro-cli --session-id <uuid>
+```
+
+`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory
+entries from global v2 agents, the current project's `.kiro/agents` directory,
+and ai-memory's global/current-project v3 registration. A purely generated v3
+file is deleted; third-party entries in a shared file remain. `ai-memory run
+kiro` (alias `kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`;
+add `--v3`, `--mode`, or `--agent-engine v3` for version-safe v3 resume. Once
+linked, a later plain Kiro launch recovers the stored engine transparently, and
+bare `ai-memory run` considers checkout-local sessions from both incompatible
+stores. See
+[managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
 ### OpenCode
 
@@ -558,6 +946,27 @@ docker run --rm akitaonrails/ai-memory:latest \
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
 
+**On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
+tool schemas to the configured provider verbatim, and Google's `Schema`
+(Vertex/Gemini `functionDeclaration.parameters`) accepts only a single `type` per
+field. `schemars` renders every optional tool argument as a nullable union
+(`"type": ["integer", "null"]`), so the provider rewrites it into `any_of` with
+`description` still beside it and Vertex fails the whole session at
+`tools/list`:
+
+```
+Unable to submit request because `ai-memory_memory_auto_improve` functionDeclaration
+`parameters.max_proposals` schema specified other fields alongside any_of.
+When using any_of, it must be the only field set.
+```
+
+Either set `gemini_safe_schemas = true` in `config.toml`
+(`AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`) on the server, which collapses those
+unions to `"type": "integer"` plus `nullable: true` for every client, or append
+`?flavor=gemini` to just this client's MCP URL. Runtime validation is unchanged
+either way. Gemini CLI and Antigravity CLI normalize schemas client-side and
+need neither.
+
 ### Oh My Pi / OMP
 
 ```bash
@@ -566,7 +975,7 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp" \
     --auth-token "$TOKEN"
 
-# Extension — write to ~/.omp/agent/extensions/ai-memory.ts.
+# Extension — write to ~/.omp/agent/extensions/ai-memory-omp.ts.
 # If you have the local wrapper installed, prefer `--apply`:
 ai-memory install-hooks --agent omp --apply \
     --server-url "http://homelab:49374" \
@@ -581,9 +990,32 @@ for hooks; both target OMP's native `.omp` integration surface.
 ### Pi
 
 Pi does not read a native `mcp.json`. ai-memory supports Pi through one
-generated TypeScript extension at `~/.pi/agent/extensions/ai-memory.ts`; the
+generated TypeScript extension at `~/.pi/agent/extensions/ai-memory-pi.ts`; the
 same file captures lifecycle events and bridges ai-memory's HTTP MCP tools into
-Pi with `pi.registerTool`.
+Pi with `pi.registerTool`. When `PI_CODING_AGENT_DIR` is set (it relocates
+Pi's whole `~/.pi/agent` home), the extension is written to
+`$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts` instead.
+
+The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
+`ai-memory-omp.ts`) so installing one never overwrites the other. They are
+not interchangeable — only Pi's bridges MCP tools.
+
+#### OMP profiles
+
+`omp --profile <name>` relocates OMP's agent home to
+`~/.omp/profiles/<name>/agent`. Point the installer at the same profile so
+the extension lands where that profile loads it:
+
+```bash
+ai-memory install-hooks --agent omp --profile work --apply
+# or set it once for the shell:
+OMP_PROFILE=work ai-memory install-hooks --agent omp --apply
+```
+
+`--profile` takes precedence over `OMP_PROFILE`, and `uninstall --profile
+<name>` removes the same file. `PI_CODING_AGENT_DIR` overrides **both** —
+when it is set it names the agent directory outright, so no profile
+subdirectory is derived from it.
 
 ```bash
 ai-memory install-hooks --agent pi --apply \
@@ -622,7 +1054,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, Grok Build CLI, Zero, VS Code Copilot
+### Other MCP clients
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -657,6 +1089,10 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client grok            --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-hooks --agent grok            --auth-token "$TOKEN" \
     --server-url "http://homelab:49374"
 
@@ -669,32 +1105,68 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client kiro-cli        --auth-token "$TOKEN" \
+    --server-url "https://memory.example/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent kiro-cli       --auth-token "$TOKEN" \
+    --server-url "https://memory.example"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client command-code    --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent command-code   --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client zed             --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
-`install-hooks`. Grok Build CLI is hook-only in ai-memory's installer today:
-`install-hooks --agent grok` captures lifecycle events, but Grok ignores
-`SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
-so you'll need to nudge the model to call `memory_query` /
-`memory_handoff_accept` itself.
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
+`install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
+`$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
+`$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
+captures lifecycle events.
+Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
+`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
+are MCP-only here, so you'll need to nudge the model to call
+`memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
-for Grok's no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
+for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
 
 ---
 
 ## Installing hooks without docker
 
-If you only need to use ai-memory *from* a machine (i.e. that
-machine doesn't run the server), the curl installer pulls shell hook
-scripts straight from GitHub for shell-hook agents:
+If you only need to use ai-memory *from* a machine (i.e. that machine doesn't
+run the server), download and verify the release installer. The installer then
+downloads and verifies the release's hook archive before writing any scripts:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/scripts/install-hooks.sh \
-    | bash -s -- --agent claude-code
+installer_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-install-hooks
+installer_tmp="$(mktemp -d)"
+trap 'rm -rf "$installer_tmp"' EXIT
+curl -fsSL "$installer_base" -o "$installer_tmp/ai-memory-install-hooks"
+curl -fsSL "$installer_base.sha256" -o "$installer_tmp/ai-memory-install-hooks.sha256"
+expected="$(awk 'NR == 1 { print $1 }' "$installer_tmp/ai-memory-install-hooks.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$installer_tmp/ai-memory-install-hooks" | awk '{ print $1 }')"
+else
+    actual="$(shasum -a 256 "$installer_tmp/ai-memory-install-hooks" | awk '{ print $1 }')"
+fi
+[ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "installer checksum mismatch" >&2; exit 1; }
+chmod +x "$installer_tmp/ai-memory-install-hooks"
+"$installer_tmp/ai-memory-install-hooks" --agent claude-code
+rm -rf "$installer_tmp"
+trap - EXIT
 
 # Then render the JSON config (still wants `ai-memory` somewhere —
 # either via docker as a one-shot, or installed locally):
@@ -775,8 +1247,9 @@ The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
 Docker Desktop wrapper, or a source build. Native Claude Code uses Claude exec
-form with a real `ai-memory.exe` by default; other native Windows script-hook
-agents use PowerShell `.ps1` defaults.
+form with a real `ai-memory.exe` by default; the Windows Docker wrapper renders
+other native Windows script-hook agents through encoded PowerShell `.ps1`
+fallback commands.
 
 When run from source, `install-hooks` finds the bundled scripts in
 the repo's `hooks/` automatically. Extracted release archives also
@@ -797,12 +1270,13 @@ ai-memory works in three intensity tiers:
 
 | Tier | What you get | Env vars | Cost |
 |---|---|---|---|
-| **Zero-LLM** (default) | FTS5 search, rule-based session summaries, auto-handoffs from prompt + tool-call history | (none) | $0 |
+| **Zero-LLM** (default) | FTS5 + manually declared entity + graph search, rule-based session summaries, auto-handoffs from prompt + tool-call history | (none) | $0 |
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
 | **+ Anthropic via subscription** | Same LLM features using a Claude Pro/Max subscription instead of an API key | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` + `ANTHROPIC_OAUTH_TOKEN` | Uses your Claude subscription |
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
-| **+ Hybrid retrieval** | RRF over FTS5 + vector cosine similarity. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` | ~$0.0001 / page on backfill |
+| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
+| **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
 
@@ -815,12 +1289,14 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
-| `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-2.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 2.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API — OpenAI-compatible endpoint at `opencode.ai/zen/go/v1`. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Reuses `LLM_API_KEY` or `OPENAI_API_KEY` with the OpenAI-compatible embedding client. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Reuses `LLM_API_KEY` with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `LLM_API_KEY` is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
@@ -868,7 +1344,18 @@ docker run -d --name ai-memory \
 ```
 
 Both `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are accepted;
-ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first.
+ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first. When either variable is exported
+on the host, the POSIX and PowerShell Docker wrappers forward its name to
+short-lived helper commands such as `llm-test`; the token value is inherited by
+Docker rather than placed in the wrapper's command line. The long-lived server
+container still needs the provider and token variables in its own environment,
+as in the example above.
+
+For both Anthropic providers, ai-memory omits `temperature` for Claude
+4.7 and later models and Claude Mythos Preview because those models reject
+non-default sampling parameters. `llm-test` deliberately starts with the same
+representative 0.2 value as bootstrap and consolidation, then exercises the
+provider's compatibility normalization before sending the request.
 
 > [!TIP]
 > **Pick a small, fast model.** ai-memory's LLM work — session
@@ -947,7 +1434,7 @@ Advanced users with a pre-minted Copilot API token can set
 Pass `--client-id` or set `AI_MEMORY_COPILOT_CLIENT_ID` if you operate your own
 OAuth app.
 
-### Self-hosted LLMs (Ollama / vLLM / LM Studio / OpenRouter)
+### OpenAI-compatible providers (Ollama / vLLM / LM Studio / hosted APIs)
 
 ```bash
 docker run -d --name ai-memory \
@@ -970,21 +1457,89 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e LLM_API_KEY=sk-or-v1-...
 ```
 
-Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints may honour
-OpenAI-style `response_format=json_schema`. If the tolerant default parser fails
-with errors such as `did not contain a JSON object` or `serde: unknown variant`,
-try strict compat mode:
+[Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
+same provider; no Atlas-specific ai-memory provider is needed. Pass its API key
+through the generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.atlascloud.ai/v1
+-e AI_MEMORY_LLM_MODEL=qwen/qwen3.5-flash
+-e LLM_API_KEY="$ATLASCLOUD_API_KEY"
+```
+
+Replace the model with another current Atlas model id when needed. ai-memory
+does not select a default for hosted compatibility endpoints.
+
+[OrcaRouter](https://www.orcarouter.ai) uses the same provider; no
+OrcaRouter-specific ai-memory provider is needed. Pass its API key through the
+generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.orcarouter.ai/v1
+-e AI_MEMORY_LLM_MODEL=openai/gpt-4o
+-e LLM_API_KEY=sk-orca-...
+```
+
+Replace the model with another current OrcaRouter model id (same
+`provider/model` format as OpenRouter, e.g. `anthropic/claude-sonnet-4.6` or
+`deepseek/deepseek-v4-flash`) when needed.
+
+OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
 -e AI_MEMORY_LLM_COMPAT_STRICT=true
 ```
 
-Strict mode is opt-in. ai-memory sends the schema-constrained request first and
-falls back to the tolerant parser only when that raw strict call fails.
+Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints honour this
+OpenAI-style `response_format=json_schema` request. ai-memory retries with its
+tolerant parser when an endpoint explicitly rejects the structured-output field
+or returns a malformed response shape. For an incompatible endpoint, opt out:
+
+```bash
+-e AI_MEMORY_LLM_COMPAT_STRICT=false
+```
+
+Hosted gateways that stream long completions past the default 300-second
+per-request ceiling fail with `http: error sending request`; raise the
+ceiling to match the gateway's worst-case generation time:
+
+```bash
+-e AI_MEMORY_LLM_TIMEOUT_SECS=900
+```
+
+#### Match the consolidation budget to a local model's context window
+
+Consolidation defaults to an approximate 100k-token input target plus a 32k
+output limit, sized for a 200k-context provider. A local model with a smaller
+window can reject the whole request (`exceed_context_size_error` from
+llama.cpp, HTTP 400 from most gateways). Lower both limits so their sum fits
+the real context window, with additional headroom for tokenizer variance:
+
+```bash
+# e.g. a model loaded with an 8k context window
+-e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=6500
+-e AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS=1000
+```
+
+The double underscore separates the `[consolidation]` section from each key.
+The input target accounts for the rendered observations, current page body,
+system prompt, page conventions, bounded slot snapshots, structured-output
+schema, and provider-envelope reserve. Tokenizers differ, so this is a
+conservative estimate rather than an exact provider token count. An automatic
+checkpoint provider failure degrades to a rule-based page rather than losing
+the checkpoint, but right-sized limits are what allow LLM consolidation to
+succeed. Startup rejects input targets below 6,000 and output limits below
+1,000 because the batch schema and a useful response cannot fit reliably below
+those floors.
 
 ---
 
-## Subcommand reference
+## Common subcommands
+
+This is the operational shortlist. Run `ai-memory --help` for the authoritative
+full command tree.
 
 Two ways to invoke a subcommand against the docker deploy:
 
@@ -996,10 +1551,12 @@ docker exec ai-memory ai-memory search "karpathy"
 docker exec ai-memory ai-memory backup --to /data/snapshot.tar.gz
 
 # B) One-shot, no running container needed for pure-stdout helpers
-#    (generate-auth-token, install-mcp, install-hooks, setup-agent, llm-test).
+#    (generate-auth-token, completions, install-mcp, install-hooks, setup-agent,
+#    llm-test).
 #    Auth login is stateful: use docker exec against the running container or
 #    the wrapper so it writes into the same data volume as the server.
 docker run --rm akitaonrails/ai-memory:latest generate-auth-token
+docker run --rm akitaonrails/ai-memory:latest completions zsh
 docker run --rm akitaonrails/ai-memory:latest install-mcp --client cursor
 docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 ```
@@ -1007,8 +1564,12 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
+| `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
+| `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
-| `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
+| `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
 | `backup --to` / `restore --from` | `docker exec` | Snapshot or restore the data dir |
 | `checkpoints` / `restore-page` | `docker exec` | List wiki git checkpoints or restore one markdown page and reindex it |
@@ -1027,6 +1588,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |
 | `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, instruction blocks, managed skill files, and generated plugin files after content/marker validation. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
 | `llm-test --provider …` | `docker run --rm -e …` | Smoke-test an LLM provider |
+| `completions <shell>` | `docker run --rm` or native binary | Print a bash/zsh/fish/PowerShell/elvish completion script; see [`shell-completions.md`](shell-completions.md) |
 
 ### Managed routing snippets and Agent Skills
 
@@ -1057,7 +1619,7 @@ without that marker are preserved unless you explicitly force replacement.
 |---|---|
 | `--no-skills` | Refresh only the markered instruction block. |
 | `--skills-scope <scope>` | Choose project-local or user-global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, or both. Values: `claude-code`, `agents`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
+| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
 | `--skills-target-dir <dir>` | Write managed skill directories below an explicit root instead of inferring from scope and agent. |
 | `--skills-force` | Replace unmanaged same-name skills during `install-instructions`; without it, they are left untouched and the command exits with an actionable error. |
 
@@ -1067,6 +1629,8 @@ Agent Skill files need a refresh:
 ```bash
 ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
+ai-memory install-skills --scope global --agent devin
+ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -1076,17 +1640,17 @@ ai-memory install-skills --target-dir .custom/skills --force
 | Flag | Meaning |
 |---|---|
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, or both. Values: `claude-code`, `agents`, `both`. Defaults to `claude-code`. |
+| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
 | `--print` | Print target paths and `SKILL.md` contents without writing files. |
 | `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
 
 Default skill target roots:
 
-| Scope | `--agent claude-code` | `--agent agents` |
-|---|---|---|
-| `project` | `.claude/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` |
+| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` |
+|---|---|---|---|---|
+| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 
@@ -1106,9 +1670,15 @@ enable `embedding_backfill_interval_secs` after configuring an embedder,
 each scheduled tick backfills every existing workspace/project and may
 increase provider usage accordingly.
 
+Forget sweep and rule-based lint persist their last successful completion. On
+restart, a job that is not due waits only its remaining interval; a never-run
+or overdue job runs once after a bounded startup delay. Failed runs are not
+recorded as successful and retry after that bounded delay. Embedding backfill
+remains opt-in and keeps its interval-only behavior (no startup catch-up).
+
 ---
 
-## Bootstrap mid-project {#bootstrap-mid-project}
+## Bootstrap mid-project
 
 When you adopt ai-memory in a project that's already been around for
 a while, the wiki starts empty. `ai-memory bootstrap` ingests the
@@ -1140,8 +1710,10 @@ remote or uses a custom host/port.
 
 ```
 --repo-path <PATH>         (default: git rev-parse --show-toplevel)
---workspace <NAME>         (default: "default")
---project <NAME>           (default: derived from cwd — main repo root's
+--workspace <NAME>         (default: the nearest `.ai-memory.toml` marker's
+                            `workspace`, else "default")
+--project <NAME>           (default: the marker's `project` when pinned,
+                            else derived from cwd — main repo root's
                             basename via `git rev-parse --show-toplevel`,
                             or basename(cwd) when no repo is found.
                             "scratch" only as a defensive fallback for
@@ -1223,8 +1795,16 @@ docker run -d --name ai-memory \
 
 Notice the bind: `127.0.0.1:49374`, not `0.0.0.0:49374`. This is the
 critical pairing - **no bearer token AND loopback only** is the only
-safe combination. The startup log will warn loudly if you bind to a
-LAN address without setting `AI_MEMORY_AUTH_TOKEN`.
+safe combination. The server refuses an unauthenticated LAN bind before it
+accepts requests. `--allow-insecure-no-auth` can override that refusal only
+for an intentional dangerous plain-HTTP deployment; prefer
+`AI_MEMORY_AUTH_TOKEN` or loopback instead.
+
+In a *container* that refusal becomes a warning, because the container must
+bind `0.0.0.0` internally for `-p` to work at all and cannot see which host
+address you published to. The `-p` above is therefore doing the real work: it
+is what keeps this container loopback-only. If you change it to publish on a
+LAN address, set `AI_MEMORY_AUTH_TOKEN` as well.
 
 Then wire up the agent CLI. Both commands default to no auth and
 `http://127.0.0.1:49374` - no extra flags needed for the local case:
@@ -1239,6 +1819,51 @@ helper container. For local loopback servers, it automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
 `ai-memory search`, and `ai-memory bootstrap` work with the same default
 URL as the generated agent config.
+
+#### SELinux-enforcing hosts
+
+On SELinux-enforcing Linux systems such as Fedora, RHEL, and openSUSE, normal
+home-directory labels can prevent the helper container from reaching agent
+config even when its UID and GID match the host user. The wrapper checks both
+the host enforcement mode and the engine's advertised security options. For the
+short-lived helper commands that touch host files (`install-*`, `setup-agent`,
+`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
+label=disable`; thin-client commands remain confined when they use the named
+data volume and implicit configuration. An explicit `--config` path or a valid
+host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
+relaxes SELinux label confinement only for that trusted helper invocation. It
+does not modify the long-lived ai-memory server, which uses an engine-managed
+named volume.
+
+`bootstrap` is in that list even though it only *reads* host files: an
+unmapped UID and a confined label block reads just as hard, and the failure is
+misleading — it degrades silently to `no .git found at /work; bootstrapping
+from README/docs/rules only` before dying with `Permission denied (os error
+13)`.
+
+The two engines report these facts under different keys. Docker answers
+`docker info --format '{{.SecurityOptions}}'`; podman has no such field and
+fails that template, so the wrapper falls back to podman's
+`{{.Host.Security.Rootless}}` and `{{.Host.Security.SELinuxEnabled}}` when the
+Docker probe comes back empty. Rootless engines additionally need `-u 0:0`,
+because only container UID 0 maps back to the invoking host user — on rootless
+podman with SELinux enforcing, both adjustments are required and neither alone
+lets the write land.
+
+Do not add `:z` or `:Z` to the wrapper's whole `$HOME` bind. Docker's
+[bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label)
+warns that relabeling system directories such as `/home` can make the host
+inoperable. Docker documents `label=disable` in the
+[`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
+
+`ai-memory run`, `ai-memory show`, and `ai-memory continue` are the exceptions:
+the current wrapper intercepts them and starts a cached checksum-verified native
+client on the host, where local checkouts, harness executables, and session
+stores exist. It preserves an explicit remote `AI_MEMORY_SERVER_URL`. If one of
+these commands logs
+`data_dir=/data`, cannot find a checkout, or cannot find `codex`, `claude`, or
+another host executable, refresh the stale wrapper with `ai-memory upgrade` on
+that client machine.
 
 ### Docker compose alternative
 
@@ -1263,16 +1888,18 @@ one-line warning when a newer image is available. Upgrade with:
 ai-memory upgrade
 ```
 
-The command self-upgrades the wrapper script, pulls the latest Docker
+The command downloads the wrapper and its SHA-256 checksum from the latest
+GitHub Release, refuses an unverified update, pulls the latest Docker
 image, re-stages hook scripts under
 `~/.local/share/ai-memory/hooks/<agent>/` for configured agents, and
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 
-Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check, or
-`AI_MEMORY_WRAPPER_URL=<url>` to pin wrapper self-upgrades to a fork or
-tagged release.
+Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check. To pin wrapper
+self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;
+the wrapper requires `<url>.sha256` unless
+`AI_MEMORY_WRAPPER_SHA256_URL=<checksum-url>` is also set.
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database
@@ -1295,7 +1922,7 @@ write to `~/.local/share/ai-memory/hooks/`.
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim
   routing snippet + managed Agent Skills, migration from other memory tools, and raw-wiki inspection
-- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
-  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
+- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config reference for
+  every client in the [README Support Matrix](../README.md#support-matrix)
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory

@@ -34,7 +34,17 @@ fn command_with_home(home: &Path) -> Command {
         .env("APPDATA", app_data)
         .env("LOCALAPPDATA", local_app_data)
         .env("AI_MEMORY_HOME", home)
-        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"));
+        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
+        // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code
+        // config sweep out of the sandbox; tests opt back in explicitly.
+        .env_remove("KIMI_CODE_HOME")
+        // The same isolation is required for Kiro's relocatable config root.
+        .env_remove("KIRO_HOME")
+        // Keep Claude installer/removal tests inside their temp HOME unless a
+        // test explicitly opts into a relocated config root.
+        .env_remove("CLAUDE_CONFIG_DIR");
     command
 }
 
@@ -112,6 +122,103 @@ fn install_then_uninstall_round_trip_claude_hooks() {
             after["hooks"].get(ours).is_none(),
             "{ours} should be removed"
         );
+    }
+}
+
+#[test]
+fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let relocated = home.path().join("claude-work");
+
+    let run = |relocate: bool, args: &[&str]| {
+        let mut command = command_with_home(home.path());
+        if relocate {
+            command.env("CLAUDE_CONFIG_DIR", &relocated);
+        }
+        command
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+
+    for relocate in [false, true] {
+        for args in [
+            &["install-hooks", "--agent", "claude-code", "--apply"][..],
+            &["install-mcp", "--client", "claude-code", "--apply"][..],
+            &[
+                "install-skills",
+                "--agent",
+                "claude-code",
+                "--scope",
+                "global",
+            ][..],
+        ] {
+            let output = run(relocate, args);
+            assert!(
+                output.status.success(),
+                "install failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    let legacy_settings = home.path().join(".claude/settings.json");
+    let legacy_mcp = home.path().join(".claude.json");
+    let legacy_skills = home.path().join(".claude/skills");
+    let relocated_settings = relocated.join("settings.json");
+    let relocated_mcp = relocated.join(".claude.json");
+    let relocated_skills = relocated.join("skills");
+    for path in [
+        &legacy_settings,
+        &legacy_mcp,
+        &relocated_settings,
+        &relocated_mcp,
+    ] {
+        assert!(path.exists(), "installer did not create {}", path.display());
+    }
+    for root in [&legacy_skills, &relocated_skills] {
+        assert!(
+            root.join(MANAGED_SKILLS[0].relative_path).exists(),
+            "installer did not create managed skills under {}",
+            root.display()
+        );
+    }
+
+    let output = run(true, &["uninstall", "--apply", "--yes"]);
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for path in [&legacy_settings, &relocated_settings] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("AI_MEMORY_HOOK_URL"),
+            "Claude hooks survived in {}",
+            path.display()
+        );
+    }
+    for path in [&legacy_mcp, &relocated_mcp] {
+        let content = std::fs::read_to_string(path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            config["mcpServers"].get("ai-memory").is_none(),
+            "Claude MCP entry survived in {}: {content}",
+            path.display(),
+        );
+    }
+    for root in [&legacy_skills, &relocated_skills] {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                !root.join(skill.relative_path).exists(),
+                "managed skill survived under {}",
+                root.display()
+            );
+        }
     }
 }
 
@@ -235,7 +342,7 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     let home = tempfile::tempdir().unwrap();
     let extensions = home.path().join(".omp/agent/extensions");
     std::fs::create_dir_all(&extensions).unwrap();
-    let extension = extensions.join("ai-memory.ts");
+    let extension = extensions.join("ai-memory-omp.ts");
     let user_content = "// user-owned extension that happens to use this filename\n";
     std::fs::write(&extension, user_content).unwrap();
 
@@ -266,7 +373,7 @@ fn uninstall_pi_extension_deletes_only_generated_bridge_file() {
     let home = tempfile::tempdir().unwrap();
     let extensions = home.path().join(".pi/agent/extensions");
     std::fs::create_dir_all(&extensions).unwrap();
-    let extension = extensions.join("ai-memory.ts");
+    let extension = extensions.join("ai-memory-pi.ts");
     let user_content = "// user-owned Pi extension\n";
     std::fs::write(&extension, user_content).unwrap();
 
@@ -405,6 +512,51 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
 }
 
 #[test]
+fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let nested = project.path().join("src").join("nested");
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let mcp = project.path().join(".swival/mcp.json");
+    write_file(&mcp, r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#);
+
+    let install = command_with_home(home.path())
+        .args(["install-mcp", "--client", "swival", "--apply"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["command"], "other-mcp",
+        "install must preserve sibling servers"
+    );
+
+    let uninstall = run_uninstall(
+        &nested,
+        home.path(),
+        &["uninstall", "--apply", "--only", "mcp", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(removed["mcpServers"]["other"]["command"], "other-mcp");
+}
+
+#[test]
 fn uninstall_mcp_name_narrows_endpoint_match() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -468,14 +620,18 @@ fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_cont
 
     let project_claude = project.path().join(".claude/skills");
     let project_agents = project.path().join(".agents/skills");
+    let project_devin = project.path().join(".devin/skills");
     let global_claude = home.path().join(".claude/skills");
     let global_agents = home.path().join(".agents/skills");
+    let global_devin = home.path().join(".devin/skills");
 
     let managed_paths = [
         project_claude.join(MANAGED_SKILLS[0].relative_path),
         project_agents.join(MANAGED_SKILLS[2].relative_path),
+        project_devin.join(MANAGED_SKILLS[1].relative_path),
         global_claude.join(MANAGED_SKILLS[3].relative_path),
         global_agents.join(MANAGED_SKILLS[4].relative_path),
+        global_devin.join(MANAGED_SKILLS[0].relative_path),
     ];
     for path in &managed_paths {
         write_file(path, &managed_content);
@@ -526,7 +682,11 @@ fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_cont
         "empty managed skill directory should be removed"
     );
     assert!(
-        !global_claude.exists() && !global_agents.exists(),
+        !project_devin.exists(),
+        "empty Devin skills root should be removed"
+    );
+    assert!(
+        !global_claude.exists() && !global_agents.exists() && !global_devin.exists(),
         "empty global skill roots should be removed"
     );
 }
@@ -780,4 +940,395 @@ fn purge_data_refuses_when_sibling_alive() {
         original,
         "no wiring should be removed when the purge is refused up front"
     );
+}
+
+#[test]
+fn uninstall_devin_hooks_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+    let hooks = devin.join("hooks.v1.json");
+    std::fs::write(
+        &hooks,
+        r#"{
+          "SessionStart": [
+            {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"},
+            {"type":"command","command":"/usr/bin/user-session-start"}
+          ],
+          "SessionEnd": [
+            {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-end.sh"}
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    assert_eq!(
+        after["SessionStart"].as_array().unwrap().len(),
+        1,
+        "third-party entry in same event must survive"
+    );
+    assert!(after.get("SessionEnd").is_none());
+    assert!(
+        after.get("hooks").is_none(),
+        "hooks.v1.json must remain flat"
+    );
+}
+
+#[test]
+fn uninstall_devin_removes_from_both_targets() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+
+    // Both hooks.v1.json and config.json with ai-memory entries
+    let hooks_v1 = devin.join("hooks.v1.json");
+    std::fs::write(
+        &hooks_v1,
+        r#"{"SessionStart":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}]}"#,
+    )
+    .unwrap();
+
+    let config = devin.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"hooks":{"SessionStart":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}]}}"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after_hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_v1).unwrap()).unwrap();
+    assert!(after_hooks.get("SessionStart").is_none());
+    assert!(
+        after_hooks.get("hooks").is_none(),
+        "hooks.v1.json must remain flat"
+    );
+
+    let after_config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert!(after_config["hooks"].get("SessionStart").is_none());
+}
+
+#[test]
+fn uninstall_mcp_removes_devin_only() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+    let config = devin.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{
+          "mcpServers": {
+            "ai-memory": {"url":"http://127.0.0.1:49374/mcp"},
+            "other-mcp": {"url":"http://other/mcp"}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args([
+            "uninstall",
+            "--apply",
+            "--only",
+            "mcp",
+            "--mcp-url",
+            "http://127.0.0.1:49374/mcp",
+            "--yes",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("ai-memory").is_none());
+    assert!(
+        after["mcpServers"].get("other-mcp").is_some(),
+        "third-party MCP server must survive"
+    );
+}
+
+#[test]
+fn uninstall_kimi_code_hooks_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let kimi = home.path().join(".kimi-code");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let config = kimi.join("config.toml");
+    std::fs::write(
+        &config,
+        r#"model = "kimi-k2"
+
+[providers.kimi]
+base_url = "https://api.moonshot.cn/v1"
+api_key = "sk-user-key"
+
+[[hooks]]
+event = "SessionStart"
+command = "AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"
+
+[[hooks]]
+event = "SessionStart"
+matcher = "*"
+command = "/usr/bin/user-session-start"
+timeout = 10
+
+[[hooks]]
+event = "Stop"
+command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --server-url http://h:49374"
+"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after = std::fs::read_to_string(&config).unwrap();
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert_eq!(doc.get("model").and_then(|m| m.as_str()), Some("kimi-k2"));
+    assert_eq!(
+        doc.get("providers")
+            .and_then(|p| p.get("kimi"))
+            .and_then(|k| k.get("api_key"))
+            .and_then(|k| k.as_str()),
+        Some("sk-user-key"),
+        "[providers] table must survive"
+    );
+    let hooks = doc
+        .get("hooks")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .expect("third-party [[hooks]] entries must survive");
+    assert_eq!(hooks.len(), 1, "only ai-memory rules removed");
+    assert_eq!(
+        hooks
+            .get(0)
+            .and_then(|t| t.get("command"))
+            .and_then(|c| c.as_str()),
+        Some("/usr/bin/user-session-start")
+    );
+    assert!(
+        !after.contains("AI_MEMORY_HOOK_URL") && !after.contains("--agent kimi-code"),
+        "no ai-memory hook command may remain: {after}"
+    );
+}
+
+#[test]
+fn uninstall_kiro_cli_hooks_removes_v2_and_v3_entries_but_preserves_user_hooks() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let kiro = home.path().join(".kiro");
+
+    // v2 engine surface: an agent config with a third-party hook next to ours.
+    let agents = kiro.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let agent_config = agents.join("dev.json");
+    std::fs::write(
+        &agent_config,
+        r#"{
+  "name": "dev",
+  "tools": ["*"],
+  "hooks": {
+    "agentSpawn": [
+      {"command": "git status"},
+      {"command": "echo ai-memory status"},
+      {"command": "AI_MEMORY_HOOK_URL=http://h /x/hooks/kiro-cli/session-start.sh", "max_output_size": 65536}
+    ],
+    "stop": [
+      {"command": "'/usr/local/bin/ai-memory' hook --event stop --agent kiro-cli --server-url http://h:49374"}
+    ]
+  }
+}"#,
+    )
+    .unwrap();
+
+    let local_agent = project.path().join(".kiro/agents/local.json");
+    write_file(
+        &local_agent,
+        r#"{"name":"local","hooks":{"stop":[{"command":"/x/hooks/kiro-cli/stop.sh"}]}}"#,
+    );
+
+    // v3 standalone surface: one ai-memory hook next to a third-party hook.
+    let hooks_dir = kiro.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let v3_file = hooks_dir.join("ai-memory.json");
+    std::fs::write(
+        &v3_file,
+        r#"{
+  "version": "v1",
+  "hooks": [
+    {"name": "ai-memory-session-start", "trigger": "SessionStart",
+     "action": {"type": "command", "command": "/x/hooks/kiro-cli/session-start.sh"}, "timeout": 10},
+    {"name": "lint-on-save", "trigger": "PostFileSave", "matcher": "\\.rs$",
+     "action": {"type": "command", "command": "cargo fmt"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    // A neighbouring third-party hooks file must never be touched.
+    let third_party_file = hooks_dir.join("team-hooks.json");
+    let third_party_body = r#"{"version":"v1","hooks":[{"name":"security-check","trigger":"PreToolUse","action":{"type":"command","command":"/usr/bin/audit"}}]}"#;
+    std::fs::write(&third_party_file, third_party_body).unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let agent_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&agent_config).unwrap()).unwrap();
+    assert_eq!(agent_after["name"], "dev", "agent definition must survive");
+    let spawn = agent_after["hooks"]["agentSpawn"].as_array().unwrap();
+    assert_eq!(spawn.len(), 2, "only exact ai-memory entries removed");
+    assert_eq!(spawn[0]["command"], "git status");
+    assert_eq!(spawn[1]["command"], "echo ai-memory status");
+    assert!(
+        agent_after["hooks"].get("stop").is_none(),
+        "an event array left empty is dropped"
+    );
+    let local_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local_agent).unwrap()).unwrap();
+    assert!(
+        local_after.get("hooks").is_none(),
+        "project-local ai-memory hooks must also be removed"
+    );
+
+    let v3_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&v3_file).unwrap()).unwrap();
+    let v3_hooks = v3_after["hooks"].as_array().unwrap();
+    assert_eq!(
+        v3_hooks.len(),
+        1,
+        "only the exact ai-memory v3 hook is removed"
+    );
+    assert_eq!(v3_hooks[0]["name"], "lint-on-save");
+
+    assert_eq!(
+        std::fs::read_to_string(&third_party_file).unwrap(),
+        third_party_body,
+        "third-party hooks files must stay byte-identical"
+    );
+}
+
+#[test]
+fn uninstall_mcp_custom_url_removes_kimi_code_only_by_endpoint() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    // KIMI_CODE_HOME moves the whole data dir; point it away from HOME to
+    // prove uninstall honours the override.
+    let kimi = home.path().join("custom-kimi-home");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let mcp = kimi.join("mcp.json");
+    std::fs::write(
+        &mcp,
+        r#"{
+          "mcpServers": {
+            "ai-memory": {"url":"http://example.invalid/mcp"},
+            "custom-memory": {"url":"http://lan:49374/mcp"},
+            "other": {"url":"http://other/mcp","headers":{"Authorization":"Bearer t"}}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args([
+            "uninstall",
+            "--apply",
+            "--only",
+            "mcp",
+            "--mcp-url",
+            "http://lan:49374/mcp",
+            "--yes",
+        ])
+        .env("KIMI_CODE_HOME", &kimi)
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("custom-memory").is_none());
+    assert!(
+        after["mcpServers"].get("ai-memory").is_some(),
+        "same name with a different endpoint must survive"
+    );
+    assert!(after["mcpServers"].get("other").is_some());
+}
+
+#[test]
+fn default_uninstall_removes_installed_kimi_code_flavored_url() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let kimi = home.path().join(".kimi-code");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let mcp = kimi.join("mcp.json");
+    std::fs::write(
+        &mcp,
+        r#"{"mcpServers":{"other":{"url":"http://other/mcp"}}}"#,
+    )
+    .unwrap();
+
+    let install = command_with_home(home.path())
+        .args([
+            "install-mcp",
+            "--client",
+            "kimi-code",
+            "--server-url",
+            "http://127.0.0.1:49374",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-mcp failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(
+        installed["mcpServers"]["ai-memory"]["url"],
+        "http://127.0.0.1:49374/mcp?flavor=moonshot"
+    );
+
+    let output = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "mcp", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(
+        after["mcpServers"].get("ai-memory").is_none(),
+        "the exact flavored URL install-mcp writes must be removed"
+    );
+    assert!(after["mcpServers"].get("other").is_some());
 }

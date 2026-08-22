@@ -103,6 +103,96 @@ pub fn spool_len(spool: &Path) -> usize {
     list_entries(spool).map_or(0, |f| f.len())
 }
 
+/// Snapshot of local hook-spool health for operator status reporting.
+///
+/// Deliberately content-free: counts, ages, and attempt sums only — never
+/// payload excerpts, URLs, or token material (the spool holds private capture
+/// until it drains).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SpoolHealth {
+    /// Events queued locally awaiting delivery.
+    pub pending: usize,
+    /// Age (ms) of the oldest queued event, or `None` when the spool is empty.
+    pub oldest_age_ms: Option<u64>,
+    /// Sum of failed-delivery attempts across all queued events.
+    pub retries_total: u64,
+}
+
+/// Snapshot local spool health: queued count and oldest-event age from the
+/// timestamp-embedded file names (no file reads), plus total retry attempts
+/// (one bounded read per queued entry — fine for an operator-invoked status
+/// command, never on the hook hot path).
+#[must_use]
+pub fn spool_health(spool: &Path) -> SpoolHealth {
+    let Some(files) = list_entries(spool) else {
+        return SpoolHealth::default();
+    };
+    if files.is_empty() {
+        return SpoolHealth::default();
+    }
+    // Keep only files whose *names* follow the spool convention. A stray
+    // `.json` that this queue did not write is not a pending hook event, and
+    // letting one drive the age is actively misleading: an unparseable name
+    // reads as `created_ms = 0`, so the oldest age becomes the whole Unix
+    // epoch — roughly 56 years of phantom backlog on a status screen whose
+    // entire job is telling an operator whether capture is keeping up.
+    //
+    // Not hypothetical on macOS: writing to a filesystem without extended
+    // attributes (FAT, SMB, some NFS) leaves AppleDouble sidecars named
+    // `._<original>`, which end in `.json` and sort before any digit.
+    let mut files: Vec<(u64, PathBuf)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let created = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(created_ms_from_name)?;
+            Some((created, path))
+        })
+        .collect();
+    if files.is_empty() {
+        return SpoolHealth::default();
+    }
+    files.sort();
+    let now = now_ms();
+    let oldest_created = files[0].0;
+    let mut health = SpoolHealth {
+        pending: files.len(),
+        oldest_age_ms: Some(now.saturating_sub(oldest_created)),
+        retries_total: 0,
+    };
+    for (_, path) in &files {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes)
+        {
+            health.retries_total += u64::from(entry.attempts);
+        }
+    }
+    health
+}
+
+/// Extract the enqueue timestamp embedded in a spool file name
+/// (`{created_ms:013}-{pid}-{seq:016x}.json`), `None` when the name does not
+/// follow that convention. Filenames are the only place `created_ms` is
+/// readable without opening the file, so oldest-age reporting never pays a
+/// read per queued event.
+///
+/// Returns `None` rather than `0` so a foreign file cannot be mistaken for an
+/// entry enqueued at the Unix epoch — see [`spool_health`].
+fn created_ms_from_name(file_name: &str) -> Option<u64> {
+    let (stamp, rest) = file_name.split_once('-')?;
+    // Require the full zero-padded width the writer emits, so a name that
+    // merely *starts* with digits is not accepted.
+    if stamp.len() != 13 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // And require the remainder to look like `{pid}-{seq}.json`.
+    if !rest.ends_with(".json") || !rest.contains('-') {
+        return None;
+    }
+    stamp.parse().ok()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -120,7 +210,7 @@ fn now_ms() -> u64 {
 /// # Errors
 /// Returns an error only when the spool file cannot be written.
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
-    std::fs::create_dir_all(spool)?;
+    create_spool_dir(spool)?;
     let seq = ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed);
     let name = format!(
         "{:013}-{}-{seq:016x}.json",
@@ -134,6 +224,41 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     std::fs::rename(&tmp, &final_path)?;
     prune_spool_file_count(spool);
     Ok(())
+}
+
+/// Create the spool directory `0700` on Unix so the excerpt bodies that reside
+/// there (up to `MAX_AGE_MS`) — and even the timestamp+pid metadata in the file
+/// names — are only reachable by the owner (#196). The spool holds private
+/// capture until it drains; a world-readable directory would leak that. On
+/// non-Unix the mode is a no-op (falls back to `create_dir_all`). Idempotent:
+/// an existing directory's mode is left untouched (never widened, never
+/// narrowed) to avoid churning a path an operator may have set deliberately.
+fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if spool.is_dir() {
+            return Ok(());
+        }
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(spool)
+        {
+            Ok(()) => Ok(()),
+            // A concurrent drainer/enqueue may have created it between the check
+            // and the call; treat an existing directory as success.
+            Err(e) if spool.is_dir() => {
+                let _ = e;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(spool)
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -624,7 +749,7 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         result.remaining += 1;
         return None;
     };
-    let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+    let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
         // Unparseable spool file: drop it so it can't wedge the queue.
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
@@ -635,7 +760,27 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         result.dropped += 1;
         return None;
     }
+    // Backstop for entries spooled by a pre-#196 binary: strip any raw
+    // assistant-message field before this entry can reach either drain path
+    // (`/hook/batch` chunk or the per-event fallback). Loading is the single
+    // choke point both paths pass through, so one strip here covers both.
+    strip_assistant_from_entry(&mut entry);
     Some(entry)
+}
+
+/// Drop any raw assistant-message field (#196) from a spooled entry's body.
+/// Reserializes only when the field was actually present, so untouched entries
+/// keep byte-exact bodies. A body that no longer parses is left as-is; the
+/// downstream `body_is_malformed` check already drops/retries it.
+fn strip_assistant_from_entry(entry: &mut SpoolEntry) {
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&entry.body) else {
+        return;
+    };
+    if ai_memory_hooks::strip_assistant_message_raw(&mut body)
+        && let Ok(reserialized) = serde_json::to_string(&body)
+    {
+        entry.body = reserialized;
+    }
 }
 
 fn body_is_malformed(entry: &SpoolEntry) -> bool {
@@ -833,6 +978,112 @@ mod tests {
     }
 
     #[test]
+    fn load_live_entry_strips_legacy_assistant_message() {
+        // Simulate a spool entry written by a pre-#196 binary: the raw body
+        // still carries `last_assistant_message`. Loading it for a drain must
+        // strip the field so neither drain path (batch or per-event fallback)
+        // can put it on the wire.
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let dirty = entry_for(
+            "https://x/hook?event=stop&agent=claude-code".into(),
+            r#"{"session_id":"legacy","last_assistant_message":"SENTINEL_ASSISTANT_MESSAGE"}"#
+                .into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &dirty).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert!(
+            !loaded.body.contains("SENTINEL_ASSISTANT_MESSAGE"),
+            "drain load left the assistant message in the body: {}",
+            loaded.body
+        );
+        assert!(
+            !loaded.body.contains("last_assistant_message"),
+            "drain load left the raw field key in the body: {}",
+            loaded.body
+        );
+        assert!(
+            loaded.body.contains("legacy"),
+            "unrelated field was dropped"
+        );
+    }
+
+    #[test]
+    fn load_live_entry_keeps_clean_body_byte_exact() {
+        // An entry with no assistant field must not be reserialized (its bytes
+        // are preserved), so the strip never churns unrelated events.
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let body = r#"{"session_id":"s","prompt":"hi"}"#;
+        let clean = entry_for(
+            "https://x/hook?event=user-prompt-submit&agent=claude-code".into(),
+            body.into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &clean).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert_eq!(loaded.body, body, "clean body must stay byte-exact");
+    }
+
+    #[test]
+    fn drain_preserves_capture_flag_and_protocol_round_trip() {
+        // An opted-in Stop entry carries `capture_assistant=1` on the URL and the
+        // sanitized `_ai_memory_assistant` marker in the body. The drain must
+        // preserve BOTH through spool → load → batch: the load-time strip only
+        // targets the raw `last_assistant_message`, never the protocol (#196).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let entry = entry_for(
+            "https://x/hook?event=stop&agent=claude-code&capture_assistant=1".into(),
+            r#"{"session_id":"s","_ai_memory_assistant":{"version":1,"excerpt":"done"}}"#.into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &entry).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert!(loaded.url.contains("capture_assistant=1"), "flag dropped");
+        assert!(
+            loaded.body.contains("_ai_memory_assistant"),
+            "protocol dropped"
+        );
+
+        let batch = batch_payload(&[(path, loaded)]).expect("batch built");
+        assert!(
+            batch.contains("capture_assistant=1"),
+            "batch lost the capture flag: {batch}"
+        );
+        assert!(
+            batch.contains("_ai_memory_assistant"),
+            "batch lost the protocol: {batch}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_creates_spool_dir_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        // A nested path that does not exist yet, so `create_spool_dir` builds it.
+        let spool = tmp.path().join("nested").join("hook-spool");
+        let entry = entry_for("https://x/hook".into(), "{}".into(), None, false);
+        enqueue(&spool, &entry).unwrap();
+        let mode = std::fs::metadata(&spool).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "spool dir must be owner-only");
+    }
+
+    #[test]
     fn enqueue_names_are_unique_in_tight_loop() {
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -932,8 +1183,15 @@ mod tests {
         );
 
         drop(first);
+        // Bounded wait instead of NoWait: a child process fork+exec'd by a
+        // concurrently running test briefly inherits this flock's fd between
+        // fork and exec (the lock lives until the duplicated descriptor is
+        // closed by exec's CLOEXEC), so an instantaneous re-acquire can
+        // spuriously see the lock still held. The bounded window still
+        // proves release-on-drop; only a leaked/undropped lock would hold
+        // for a full five seconds.
         assert!(
-            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            acquire_drain_lock(&spool, DrainLockWait::Bounded(Duration::from_secs(5)))
                 .unwrap()
                 .is_some(),
             "lock should release on drop"
@@ -1897,5 +2155,123 @@ mod tests {
             1,
             "the spool entry survives a failed rewrite"
         );
+    }
+
+    #[test]
+    fn spool_health_is_default_when_dir_missing_or_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-spool");
+        assert_eq!(spool_health(&missing), SpoolHealth::default());
+
+        let empty = spool_dir(tmp.path());
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(spool_health(&empty), SpoolHealth::default());
+    }
+
+    #[test]
+    fn spool_health_reports_pending_oldest_age_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        // Two events with distinct enqueue times; the second carries two failed
+        // attempts. Names embed `created_ms`, so oldest-age comes from the name.
+        let mut old = entry_for("https://x/hook?event=old".into(), "{}".into(), None, false);
+        old.created_ms = now_ms().saturating_sub(5 * 60 * 1000);
+        let mut new = entry_for("https://x/hook?event=new".into(), "{}".into(), None, false);
+        new.created_ms = now_ms().saturating_sub(60 * 1000);
+        new.attempts = 2;
+        enqueue(&spool, &old).unwrap();
+        enqueue(&spool, &new).unwrap();
+
+        let before = now_ms();
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 2);
+        assert_eq!(health.retries_total, 2);
+        let oldest = health
+            .oldest_age_ms
+            .expect("non-empty spool reports an age");
+        assert!(
+            (5 * 60 * 1000..=5 * 60 * 1000 + 1_000).contains(&oldest),
+            "oldest age ~5m, got {oldest}ms (measured at {before})"
+        );
+    }
+
+    #[test]
+    fn spool_health_ignores_unparseable_entries_for_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "0000000000042-1-0000000000000001.json",
+            "https://x/hook".into(),
+        );
+        std::fs::write(
+            spool.join("0000000000043-1-0000000000000002.json"),
+            b"not a spool entry",
+        )
+        .unwrap();
+
+        let before = now_ms();
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 2);
+        assert_eq!(health.retries_total, 0);
+        let oldest = health
+            .oldest_age_ms
+            .expect("non-empty spool reports an age");
+        assert!(
+            oldest >= before.saturating_sub(42),
+            "oldest name parses to 42ms, age {oldest}ms"
+        );
+    }
+
+    #[test]
+    fn created_ms_from_name_handles_malformed_names() {
+        assert_eq!(
+            created_ms_from_name("0000000000042-1-0000000000000001.json"),
+            Some(42)
+        );
+        assert_eq!(created_ms_from_name("garbage.json"), None);
+        // A macOS AppleDouble sidecar: ends in `.json`, sorts before any
+        // digit, and must never be read as an epoch-0 entry.
+        assert_eq!(created_ms_from_name("._0000000000042-1-0002.json"), None);
+        // Digits alone are not enough — the writer zero-pads to 13.
+        assert_eq!(created_ms_from_name("42-1-0002.json"), None);
+        assert_eq!(created_ms_from_name("0000000000042-1-0002.txt"), None);
+    }
+
+    /// Regression: a foreign `.json` in the spool directory must not be
+    /// counted as a pending event, and must never drive the oldest age.
+    /// Before this guard an AppleDouble sidecar parsed as `created_ms = 0`
+    /// and reported roughly 56 years of backlog that did not exist.
+    #[test]
+    fn spool_health_ignores_files_this_queue_did_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+
+        let mut real = entry_for("https://x/hook".into(), "{}".into(), None, false);
+        real.created_ms = now_ms().saturating_sub(1_000);
+        enqueue(&spool, &real).unwrap();
+
+        // Sorts before any digit and still ends in `.json`.
+        std::fs::write(spool.join("._sidecar.json"), b"\x00\x05").unwrap();
+        std::fs::write(spool.join("notes.json"), b"{}").unwrap();
+
+        let health = spool_health(&spool);
+        assert_eq!(health.pending, 1, "only the real entry is pending");
+        let age = health.oldest_age_ms.expect("one real entry");
+        assert!(
+            age < 60_000,
+            "age must come from the real entry (~1s), got {age}ms"
+        );
+    }
+
+    /// A directory holding only foreign files reports empty, not epoch-aged.
+    #[test]
+    fn spool_health_is_default_when_only_foreign_files_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(spool.join("._only.json"), b"x").unwrap();
+        assert_eq!(spool_health(&spool), SpoolHealth::default());
     }
 }

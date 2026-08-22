@@ -40,6 +40,14 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
 pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, true)
+}
+
+pub(super) fn run_quiet(args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, false)
+}
+
+fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
     let block = full_block();
     let targets = resolve_targets(args.target.as_ref())?;
     let skill_args = if args.no_skills {
@@ -66,21 +74,27 @@ pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
             let outcome = apply_atomic(target, |existing| {
                 Ok(merge_instructions_block(existing, &block))
             })?;
-            println!(
-                "✓ {} {} ({})",
-                outcome.verb(),
-                target.display(),
-                match outcome {
-                    ApplyOutcome::Created => "new file",
-                    ApplyOutcome::Updated => "backup written next to it",
-                    ApplyOutcome::NoOp => "already up to date",
-                }
-            );
+            if report {
+                println!(
+                    "✓ {} {} ({})",
+                    outcome.verb(),
+                    target.display(),
+                    match outcome {
+                        ApplyOutcome::Created => "new file",
+                        ApplyOutcome::Updated => "backup written next to it",
+                        ApplyOutcome::NoOp => "already up to date",
+                    }
+                );
+            }
         }
     }
 
     if let Some(prepared_skills) = prepared_skills {
-        install_skills::run_prepared(prepared_skills)?;
+        if report {
+            install_skills::run_prepared(prepared_skills)?;
+        } else {
+            install_skills::run_prepared_quiet(prepared_skills)?;
+        }
     }
 
     Ok(())
@@ -96,12 +110,14 @@ pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
 /// 3. Only `CLAUDE.md` exists → write to it.
 /// 4. Only `AGENTS.md` exists → write to it.
 /// 5. Neither exists → default to `CLAUDE.md` AND print a hint about
-///    `--target AGENTS.md` for Codex / OpenCode / Cursor / Gemini.
+///    `--target AGENTS.md` for Codex / OpenCode / Cursor / Gemini /
+///    Kimi Code.
 ///
 /// The auto-pick exists because Claude Code uses CLAUDE.md while
-/// every other supported agent (Codex, OpenCode, Cursor, Gemini CLI)
-/// converged on AGENTS.md. The heuristic "extend whatever's already
-/// there" matches the user's intent better than a hard-coded default.
+/// every other supported agent (Codex, OpenCode, Cursor, Gemini CLI,
+/// Kimi Code) converged on AGENTS.md. The heuristic "extend whatever's
+/// already there" matches the user's intent better than a hard-coded
+/// default.
 fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::path::PathBuf>> {
     if let Some(p) = explicit {
         return Ok(vec![p.clone()]);
@@ -119,7 +135,8 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
             eprintln!(
                 "note: neither CLAUDE.md nor AGENTS.md exists in {}; \
                  creating CLAUDE.md. If you use Codex / OpenCode / \
-                 Cursor / Gemini CLI / Antigravity CLI, re-run with `--target AGENTS.md`.",
+                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code / \
+                 Kiro CLI, re-run with `--target AGENTS.md`.",
                 cwd.display()
             );
             Ok(vec![claude_md])

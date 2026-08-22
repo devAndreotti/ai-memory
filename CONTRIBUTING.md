@@ -14,6 +14,31 @@ self-contained: SQLite is bundled via `rusqlite`'s `bundled` feature, and
 `libgit2` is vendored via `git2`'s `vendored-libgit2` feature. No system
 libraries need installing beyond a standard C toolchain.
 
+## Commit attribution
+
+GitHub associates commits with accounts through the author email stored in
+each commit. Before pushing a branch, inspect every commit that the pull request
+will add:
+
+```bash
+git log --format='%h %an <%ae>' "$(git merge-base HEAD origin/main)"..HEAD
+```
+
+Use an email verified by your GitHub account, or its GitHub-provided `noreply`
+address. Set it for this checkout when your global Git identity belongs to a
+different project or employer:
+
+```bash
+git config --local user.name "Your Name"
+git config --local user.email "your-verified-address@example.com"
+```
+
+Correct attribution mistakes on the pull-request branch before it is merged.
+The project does not rewrite shared `main` history or published release tags
+solely to change attribution because doing so invalidates commit hashes and
+breaks existing clones and forks. Maintainers use [`.mailmap`](.mailmap) to
+canonicalize accidental aliases without changing published commits.
+
 ## Required gates before every PR
 
 All four must pass — the CI workflow enforces them and so does the `bin/release`
@@ -32,9 +57,26 @@ If `cargo-deny` or `cargo-audit` are not installed:
 cargo install cargo-deny cargo-audit
 ```
 
-## Workflow rules (condensed from CLAUDE.md)
+## CHANGELOG is a merge gate
 
-The full authoritative rules are in [`CLAUDE.md`](CLAUDE.md). Short version:
+Every **user-facing** change must add a `CHANGELOG.md` entry under
+`## [Unreleased]` in the same PR. User-facing means: a new CLI flag or
+subcommand, env var, HTTP/admin endpoint, MCP tool or tool-response field,
+`.ai-memory.toml` marker key, any changed behaviour or default, or an
+observable bug fix. Internal refactors, dead-code removal, and test-only
+churn are exempt.
+
+This has been the single most-forgotten obligation across review batches,
+so reviewers treat a missing entry as **blocking** — the PR template has a
+checkbox for it. Follow the existing entry style (past-tense summary,
+trailing `([#NNN])` PR/issue reference) and place it under the right
+`### Added` / `### Changed` / `### Fixed` heading.
+
+## Workflow rules (condensed from AGENTS.md)
+
+The full authoritative rules are in [`AGENTS.md`](AGENTS.md) — the single
+canonical agent/contributor rules file (`CLAUDE.md` is just a pointer to
+it). Short version:
 
 1. Work milestone by milestone. Do not start M(n+1) until every "Done when"
    bullet in M(n) passes (see `docs/design-decisions.md`).
@@ -49,7 +91,8 @@ The full authoritative rules are in [`CLAUDE.md`](CLAUDE.md). Short version:
 
 ## Cross-cutting invariants
 
-Never violate any of the invariants in `CLAUDE.md §Cross-cutting invariants`.
+Never violate any of the invariants in [`AGENTS.md`](AGENTS.md) (see the
+"Rust Engineering Rules" and "Project Maintenance Rules" sections).
 Highlights for contributors:
 
 - All SQLite writes go through the single writer actor (`WriterHandle`).

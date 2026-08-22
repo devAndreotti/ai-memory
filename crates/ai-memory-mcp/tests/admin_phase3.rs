@@ -9,7 +9,7 @@
 
 use ai_memory_core::{
     ActorContext, AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath,
-    SessionId, Tier,
+    Sanitized, Sanitizer, SessionId, Tier,
 };
 use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
@@ -55,6 +55,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -341,22 +342,26 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid_a,
-            workspace_id: ws,
-            project_id: scratch,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "alpha prompt".into(),
-            body: "".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_a,
+                workspace_id: ws,
+                project_id: scratch,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "alpha prompt".into(),
+                body: "".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 
@@ -369,22 +374,26 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid_b,
-            workspace_id: ws,
-            project_id: scratch,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "beta prompt".into(),
-            body: "".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_b,
+                workspace_id: ws,
+                project_id: scratch,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "beta prompt".into(),
+                body: "".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 
@@ -490,6 +499,8 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();
@@ -517,6 +528,8 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();
@@ -595,6 +608,8 @@ async fn lint_dry_run_returns_lint_report_shape() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();

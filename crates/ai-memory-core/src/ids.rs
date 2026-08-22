@@ -82,10 +82,14 @@ id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
+id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
+id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
+id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
 
 /// Relative path of a page within the wiki tree.
 ///
@@ -196,10 +200,22 @@ pub enum AgentKind {
     /// Pi coding agent.
     #[serde(rename = "pi")]
     Pi,
+    /// Charmbracelet Crush coding agent.
+    Crush,
     /// xAI Grok Build CLI (`grok`).
     Grok,
     /// Zero coding agent (Gitlawb/zero).
     Zero,
+    /// Devin CLI (Cognition).
+    Devin,
+    /// Kimi Code CLI (Moonshot AI).
+    KimiCode,
+    /// AWS Kiro CLI (verified v2 lifecycle protocol).
+    KiroCli,
+    /// Command Code CLI.
+    CommandCode,
+    /// Hermes Agent (Nous Research).
+    Hermes,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -210,7 +226,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 19] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -221,8 +237,14 @@ impl AgentKind {
         Self::AntigravityCli,
         Self::Omp,
         Self::Pi,
+        Self::Crush,
         Self::Grok,
         Self::Zero,
+        Self::Devin,
+        Self::KimiCode,
+        Self::KiroCli,
+        Self::CommandCode,
+        Self::Hermes,
         Self::Other,
     ];
 
@@ -240,8 +262,14 @@ impl AgentKind {
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
             Self::Pi => "pi",
+            Self::Crush => "crush",
             Self::Grok => "grok",
             Self::Zero => "zero",
+            Self::Devin => "devin",
+            Self::KimiCode => "kimi-code",
+            Self::KiroCli => "kiro-cli",
+            Self::CommandCode => "command-code",
+            Self::Hermes => "hermes",
             Self::Other => "other",
         }
     }
@@ -261,9 +289,15 @@ impl AgentKind {
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
             "pi" => Self::Pi,
+            "crush" => Self::Crush,
             "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
             "zero" => Self::Zero,
+            "devin" => Self::Devin,
+            "kimi-code" | "kimi" => Self::KimiCode,
+            "kiro-cli" | "kiro" => Self::KiroCli,
+            "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
+            "hermes" | "hermes-agent" => Self::Hermes,
             _ => Self::Other,
         }
     }
@@ -283,9 +317,32 @@ impl AgentKind {
     /// tool. Unknown future agents return `false` until we know their
     /// SessionStart stdout semantics; accepting a handoff is single-use and
     /// should fail safe.
+    ///
+    /// Kimi Code fires `SessionStart` but discards the hook's stdout/result
+    /// entirely (`packages/agent-core/src/session/index.ts` ignores the
+    /// dispatch return, verified in the v0.28.1 source), so the handoff is
+    /// delivered on `UserPromptSubmit` instead — see
+    /// [`Self::user_prompt_injects_handoff`].
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Zero | Self::Other)
+        !matches!(
+            self,
+            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Hermes | Self::Other
+        )
+    }
+
+    /// Whether this agent injects the native `user-prompt` (UserPromptSubmit)
+    /// hook's stdout into the upcoming turn as context. Only Kimi Code does:
+    /// its `SessionStart` stdout is discarded (see
+    /// [`Self::session_start_injects_handoff`]), while `UserPromptSubmit`
+    /// stdout is prepended to the turn as a user message with
+    /// `origin: {kind: 'hook_result'}` (`agent/turn/index.ts`,
+    /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
+    /// Empty stdout injects nothing, so the hook prints the raw handoff body
+    /// or nothing at all — never a JSON envelope.
+    #[must_use]
+    pub fn user_prompt_injects_handoff(self) -> bool {
+        matches!(self, Self::KimiCode)
     }
 }
 
@@ -333,6 +390,111 @@ mod tests {
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
         assert!(!AgentKind::Other.session_start_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_devin_round_trips() {
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        // serde uses rename_all = "kebab-case" → "devin".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Devin).unwrap(),
+            "\"devin\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"devin\"").unwrap(),
+            AgentKind::Devin
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("devin-2"), AgentKind::Other);
+        // Devin can inject the session-start handoff (consumes additionalContext).
+        assert!(AgentKind::Devin.session_start_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kimi_code_round_trips() {
+        assert_eq!(AgentKind::KimiCode.as_str(), "kimi-code");
+        assert_eq!(AgentKind::from_wire("kimi-code"), AgentKind::KimiCode);
+        assert_eq!(AgentKind::from_wire("kimi"), AgentKind::KimiCode);
+        // serde uses rename_all = "kebab-case" → "kimi-code".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KimiCode).unwrap(),
+            "\"kimi-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kimi-code\"").unwrap(),
+            AgentKind::KimiCode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("kimi-2"), AgentKind::Other);
+        // Kimi Code discards SessionStart stdout (verified in the v0.28.1
+        // source), so the handoff is delivered on UserPromptSubmit instead.
+        assert!(!AgentKind::KimiCode.session_start_injects_handoff());
+        assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_hermes_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Hermes.as_str(), "hermes");
+        assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
+        assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"hermes\"").unwrap(),
+            AgentKind::Hermes
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Hermes).unwrap(),
+            "\"hermes\""
+        );
+        assert!(!AgentKind::Hermes.session_start_injects_handoff());
+        assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_command_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CommandCode.as_str(), "command-code");
+        for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CommandCode);
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CommandCode).unwrap(),
+            "\"command-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"command-code\"").unwrap(),
+            AgentKind::CommandCode
+        );
+        assert!(AgentKind::CommandCode.session_start_injects_handoff());
+        assert!(!AgentKind::CommandCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kiro_cli_round_trips_and_injects_at_session_start() {
+        assert_eq!(AgentKind::KiroCli.as_str(), "kiro-cli");
+        assert_eq!(AgentKind::from_wire("kiro-cli"), AgentKind::KiroCli);
+        assert_eq!(AgentKind::from_wire("kiro"), AgentKind::KiroCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KiroCli).unwrap(),
+            "\"kiro-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kiro-cli\"").unwrap(),
+            AgentKind::KiroCli
+        );
+        assert!(AgentKind::KiroCli.session_start_injects_handoff());
+        assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn user_prompt_handoff_injection_is_kimi_only() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_handoff(),
+                agent == AgentKind::KimiCode,
+                "{}",
+                agent.as_str()
+            );
+        }
     }
 
     #[test]
@@ -391,6 +553,11 @@ mod tests {
             AgentKind::Pi
         );
 
+        let crush = serde_json::to_string(&AgentKind::Crush).unwrap();
+        assert_eq!(crush, "\"crush\"");
+        assert_eq!(AgentKind::from_wire("crush"), AgentKind::Crush);
+        assert!(!AgentKind::Crush.session_start_injects_handoff());
+
         let openclaw = serde_json::to_string(&AgentKind::OpenClaw).unwrap();
         assert_eq!(openclaw, "\"openclaw\"");
         assert_eq!(
@@ -400,5 +567,14 @@ mod tests {
 
         let antigravity = serde_json::to_string(&AgentKind::AntigravityCli).unwrap();
         assert_eq!(antigravity, "\"antigravity-cli\"");
+
+        let devin = serde_json::to_string(&AgentKind::Devin).unwrap();
+        assert_eq!(devin, "\"devin\"");
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>(&devin).unwrap(),
+            AgentKind::Devin
+        );
     }
 }

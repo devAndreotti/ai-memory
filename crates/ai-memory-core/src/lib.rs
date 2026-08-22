@@ -15,7 +15,9 @@ pub mod page;
 pub mod routing_skills;
 pub mod routing_snippet;
 pub mod sanitize;
+pub mod slots;
 pub mod user;
+mod workstream;
 
 /// Default workspace name used by the single-workspace v1 flow.
 pub const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -35,16 +37,38 @@ pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
 pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
+    MidSessionRouting,
 };
-pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
+pub use actor::{
+    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
+    SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
+    skip_admission_chain_for,
+};
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffState, NewHandoff};
+pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ObservationId, PageId, PagePath,
-    ProjectId, SessionId, UserId, WorkspaceId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
+    ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
+    WorkstreamId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
-pub use page::{LinkTarget, NewPage, Page, Tier};
+pub use page::{
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, Tier,
+    normalize_entities, normalize_entity,
+};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
-pub use sanitize::{SanitizeConfig, Sanitized, Sanitizer};
+pub use sanitize::{
+    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
+    truncate_utf8_bytes_head_tail,
+};
+pub use slots::{
+    SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
+    slot_placement,
+};
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
+pub use workstream::{
+    FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse, ManagedRunStatus,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+};

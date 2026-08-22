@@ -11,7 +11,7 @@
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
 | `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
@@ -25,8 +25,10 @@ middleware as `/mcp`, `/hook`, and `/admin/*` — they're all nested
 - **Anonymous request → `401 Unauthorized`** (when the server is running
   with a bearer token configured).
 - **Disallowed `Host` header → `403 Forbidden`** (DNS-rebinding guard).
-- The same token protects everything; there is no per-user scoping.
-  Single-tenant by design (see [`docs/design-decisions.md`](design-decisions.md) §13).
+- The static bearer is the root credential. DB-user tokens and a configured
+  trusted-proxy bearer resolve per-user identities; actor-scoped responses then
+  expose only that operator's plus shared handoffs. See
+  [`docs/users.md`](users.md) for the full auth ladder.
 
 Pass the bearer in the standard header:
 
@@ -37,7 +39,7 @@ Authorization: Bearer <token>
 Get a token:
 
 ```bash
-ai-memory generate-auth-token   # writes to stdout
+ai-memory generate-auth-token   # writes a root token to stdout
 # then export AI_MEMORY_AUTH_TOKEN=<token> in the server's environment,
 # or put it under [auth].bearer_token in config.toml
 ```
@@ -65,11 +67,11 @@ with one of these statuses:
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`. |
+| `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`, malformed session id, unknown observation `kinds` or `order`. |
 | `401 Unauthorized` | bearer missing or wrong. |
-| `403 Forbidden` | Host header not in allowlist. |
-| `404 Not Found` | workspace, project, or page doesn't exist; or page file missing on disk. |
-| `500 Internal Server Error` | reader pool / SQLite failure. Body is `{"error":"<context>"}` with the source error chain. |
+| `403 Forbidden` | Host header not in allowlist; or a non-root caller requests `all_owners=true`. |
+| `404 Not Found` | workspace, project, or page doesn't exist; page file missing on disk; or a session id that is not visible in that project for the caller. |
+| `500 Internal Server Error` | reader pool / SQLite failure. Body is always the fixed `{"error":"internal server error"}`; the underlying cause is logged server-side rather than returned, so it cannot leak paths or configuration to a browser. |
 
 ## 4. Endpoint reference
 
@@ -170,7 +172,7 @@ links + back-links.
   "frontmatter": { "tags": ["adr"], "pinned": true },
   "body": "# Standardised on Postgres\n\n…",
   "links":     [ { "path": "concepts/db-rules.md", "title": "DB rules", "kind": "rule" } ],
-  "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "fact" } ]
+  "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "session" } ]
 }
 ```
 
@@ -238,6 +240,12 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 `is_latest = 1` pages ordered by `updated_at` DESC. `limit` clamped
 `1..=100`, default `10`.
 
+Every reader surface uses the same `kind` contract. An explicit frontmatter
+`kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,
+`decisions/`, `gotchas/`, `concepts/`, `procedures/`, and `notes/` derive
+`rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
+`note`, respectively. Other paths fall back to `fact`.
+
 **Response:** `{ "pages": [BriefingPage, …] }`
 
 ```json
@@ -246,7 +254,7 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
     {
       "path": "sessions/2026-05-28.md",
       "title": "Session 2026-05-28",
-      "kind": "fact",
+      "kind": "session",
       "updated_at": "2026-05-28T14:02:11.123Z"
     }
   ]
@@ -278,9 +286,9 @@ pages. No LLM, deterministic.
   "last_observation_at": "2026-05-28T13:58:02.123Z",
   "pending_handoff_count": 0,
   "rules": [{ "path": "_rules/postgres.md", "title": "Postgres only", "kind": "rule",  "updated_at": "…" }],
-  "slots": [{ "path": "_slots/focus.md",    "title": "Current focus", "kind": "fact",  "updated_at": "…" }],
+  "slots": [{ "path": "_slots/focus.md",    "title": "Current focus", "kind": "slot",  "updated_at": "…" }],
   "recent_pages": [
-    { "path": "sessions/2026-05-28.md", "title": "Session 2026-05-28", "kind": "fact", "updated_at": "…" }
+    { "path": "sessions/2026-05-28.md", "title": "Session 2026-05-28", "kind": "session", "updated_at": "…" }
   ]
 }
 ```
@@ -290,29 +298,87 @@ pages. No LLM, deterministic.
 ```http
 GET /api/v1/workspaces/{workspace}/overview?limit=10
 GET /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=10
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=open&limit=50
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?all_owners=true
+```
+
+### Handoff listing
+
+`state` accepts `open` | `accepted` | `expired`; omit it to list every state,
+which is how you find a baton that was already consumed. Results are scoped by
+owner: an authenticated caller sees their own plus the shared handoffs, an
+anonymous browser sees only shared ones — an owned handoff (and the prompt-
+derived text inside it) is never rendered to someone it does not belong to.
+The same scoping applies to the `handoff` field of both overview endpoints and
+to `pending_handoff_count`, so the count and the fetch always agree.
+For recovery, a root-authorized request may pass `all_owners=true` to list all
+operators' rows. User and anonymous requests receive `403`; the default remains
+own plus shared, including for root.
+
+On a server that authenticates, the listing's prompt-derived fields —
+`summary`, `open_questions`, `next_steps` — are served to a caller the server
+can name and to the root operator; an automatic handoff synthesises them
+verbatim from the operator's prompts, and the listing returns the project's
+whole history rather than the single newest open row. A caller that is neither
+named nor root gets the fields absent and `redacted` set to `true`; the metadata
+(state, timestamps, agent, cwd, touched files, ownership) is always served. A
+server with no auth configured serves the bodies, since it already serves every
+page body unauthenticated.
+
+"Can name" means the identity the auth tier itself resolved
+(`ActorContext::identity_key()`): the asserted issuer/subject pair when there is
+one, otherwise the username. An ingress that terminates OIDC and forwards both
+`X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub` therefore reads its own
+handoffs and the shared ones with `redacted: false`, and no rung of the auth
+chain produces an
+authenticated-but-unnameable caller today — the redacting arm is a fail-safe
+floor, not a live tier. `owner` / `accepted_by` carry the qualified storage key
+(`user:alice`, `oidc:<issuer-byte-length>:<issuer><subject>`).
+
+```json
+{
+  "handoffs": [
+    {
+      "id": "01930…",
+      "agent": "claude-code",
+      "at": "2026-07-28T12:00:00Z",
+      "state": "accepted",
+      "summary": "…",
+      "open_questions": [],
+      "next_steps": [],
+      "redacted": false,
+      "files_touched": [],
+      "owner": "user:alice",
+      "accepted_by": "user:alice",
+      "accepted_at": "2026-07-28T13:00:00Z"
+    }
+  ]
+}
 ```
 
 Bundles what a frontend usually needs on its home view in one round-trip.
 
-**Workspace overview** returns `briefing` + `memory_health` aggregated
-across all projects in the workspace:
+**Workspace overview** returns the latest open handoff across the workspace,
+plus `briefing` and `health` aggregated across all of its projects:
 
 ```json
 {
-  "briefing":      { "counts": { … }, "activity_7d": { … }, "rules": [ … ], "recent_pages": [ … ] },
-  "memory_health": { "stale_count": 4, "duplicate_count": 1, "orphan_count": 12,
-                     "stale_pages": [HealthPage, …], "duplicate_pages": [ … ], "orphan_pages": [ … ] }
+  "handoff":  { "agent": "claude-code", "at": "…", "project": "ai-memory", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
+  "briefing": { "counts": { … }, "activity_7d": { … }, "rules": [ … ], "recent_pages": [ … ] },
+  "health":   { "stale": 4, "duplicates": 1, "contradictions": 0, "orphans": 12,
+                "audited_at": null, "stale_pages": [HealthPage, …],
+                "duplicate_pages": [ … ], "orphan_pages": [ … ] }
 }
 ```
 
-**Project overview** additionally includes the latest open handoff (or
-`null`):
+**Project overview** uses the same response shape, scoped to that project. In
+either response, `handoff` is `null` when no open handoff matches the scope:
 
 ```json
 {
-  "handoff":       { "id": "01928d…", "from_agent": "claude-code", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
-  "briefing":      { … },
-  "memory_health": { … }
+  "handoff":  { "agent": "claude-code", "at": "…", "project": "ai-memory", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
+  "briefing": { … },
+  "health":   { … }
 }
 ```
 
@@ -324,11 +390,11 @@ across all projects in the workspace:
   "project": "ai-memory",
   "path": "concepts/old-thing.md",
   "title": "Old thing",
-  "kind": "fact"
+  "kind": "concept"
 }
 ```
 
-> Note: `last_open_handoff` is **not** consumed by the read API — the
+> Note: `handoff` is **not** consumed by the read API — the
 > handoff stays "open" and can still be accepted by the next agent.
 
 ### 4.9 Cross-project graph
@@ -377,18 +443,116 @@ fresh tab gets the icon without an HTTP Basic prompt, and the
 embedded PNG is the same one any visitor to `/web` already sees, so
 the info-leak surface is nil.
 
+### 4.11 Sessions
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/sessions?limit=20&offset=0&include_open=false
+```
+
+Sessions that touched the project, newest first: a session is listed when its
+row is anchored in the project OR at least one of its observations landed
+there, so a session that changed repositories mid-flight shows up in both.
+`observation_count` counts only this project's rows. `limit` clamped
+`1..=100`, default `20`; `offset` default `0`; `include_open` default
+`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+caller the server can name sees their own sessions plus unattributed ones;
+an unnamed caller sees unattributed ones only. Never cached (`no-store`).
+
+**Response:** `{ "sessions": [SessionSummary, ...] }`
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+      "cwd": "/home/me/src/app",
+      "agent_kind": "claude-code",
+      "started_at": "2026-08-16T09:12:03.412Z",
+      "ended_at": "2026-08-16T10:47:55.001Z",
+      "observation_count": 143,
+      "actor_user": null
+    }
+  ]
+}
+```
+
+### 4.12 Session observations
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/sessions/{session_id}/observations?limit=50&offset=0&order=asc&kinds=user-prompt,stop&q=migration&body_max_chars=4000
+```
+
+One session's raw hook observations (prompts, tool calls, stops) as stored,
+paged. Only rows that landed in `{workspace}/{project}` are returned;
+`elided_other_scope` counts rows the same session left in another project.
+The session must be visible under the same predicate as 4.11 (row or
+observation in the project, owner filter passes), otherwise `404`. `limit`
+clamped `1..=200`, default `50`; `offset` default `0`; `order` is `asc`
+(capture order, default) or `desc`; `kinds` is a comma-separated list of
+`session-start`, `user-prompt`, `pre-tool-use`, `post-tool-use`,
+`pre-compact`, `post-compaction`, `notification`, `stop`, `session-end`,
+`other`; `q` is an FTS5 query restricted to the session; `body_max_chars`
+clamped `200..=16384`, default `4000`, and a longer body ends with a visible
+`[body truncated; N chars omitted]` marker. `total` counts the in-scope
+rows matching `kinds` and `q`, so paginate on `offset` without a second
+call. Bodies were sanitized and bounded on ingest; treat them as untrusted
+historical text. Never cached (`no-store`). Same payload as the MCP tool
+`memory_read_session_observations`.
+
+**Response:** `{ "session": SessionSummary, "observations": [ObservationRecord, ...], "total", "offset", "limit", "order", "elided_other_scope", "body_max_chars" }`
+
+```json
+{
+  "session": {
+    "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+    "cwd": "/home/me/src/app",
+    "agent_kind": "claude-code",
+    "started_at": "2026-08-16T09:12:03.412Z",
+    "ended_at": "2026-08-16T10:47:55.001Z",
+    "observation_count": 143,
+    "actor_user": null
+  },
+  "observations": [
+    {
+      "id": "0198f0a2-4d5e-7f60-9a0b-1c2d3e4f5a6b",
+      "session_id": "0198f0a2-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+      "kind": "user-prompt",
+      "title": "User prompt",
+      "body": "Add a migration for the sessions table ...",
+      "importance": 5,
+      "created_at": "2026-08-16T09:12:10.020Z",
+      "extension": null,
+      "source_event": null
+    }
+  ],
+  "total": 12,
+  "offset": 0,
+  "limit": 50,
+  "order": "asc",
+  "elided_other_scope": 0,
+  "body_max_chars": 4000
+}
+```
+
 ## 5. Limits and pagination
 
-- All `limit` query params clamp to `1..=100`.
+- Most `limit` query params clamp to `1..=100`; handoff history and
+  session observations clamp to `1..=200`. Session listing and session
+  observations take an `offset`; observations also report `total`.
+- Session observation bodies are capped per row by `body_max_chars`
+  (`200..=16384`, default `4000`) with a visible truncation marker.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
-- **Cache-Control + ETag.** Idempotent read endpoints (workspaces,
-  projects, pages list, page read, recent, briefing, overview) send
-  `Cache-Control: private, max-age=N` with an N tuned per endpoint
-  and a SHA-256 `ETag` derived from the response body. Browsers that
-  echo back `If-None-Match` receive a `304 Not Modified` with no body.
-  Search responses are not cacheable (request body affects the result).
+- **Cache-Control + ETag.** Identity-independent read endpoints use
+  `Cache-Control: private, max-age=N` with an endpoint-specific TTL; page reads
+  also carry a SHA-256 `ETag`, and a matching `If-None-Match` receives `304 Not
+  Modified`. Briefing, overview, handoff-list, session-list and session
+  observation responses depend on the authenticated actor and therefore use
+  `Cache-Control: private, no-store`, so
+  a browser cannot reuse Alice's prompt-derived response after credentials at
+  the same URL switch to Bob. Search responses are not cacheable because the
+  request body affects the result.
 
 ## 6. Custom UI hosting and base paths
 
@@ -519,7 +683,8 @@ Read these:
 | | Location |
 |---|---|
 | Route registration + handler bodies | `crates/ai-memory-web/src/routes/api.rs` |
-| Response structs (`PageHit`, `WorkspaceSummary`, `BriefingSnapshot`, `HealthPage`, …) | `crates/ai-memory-store/src/reader.rs` |
+| Response structs (`PageHit`, `WorkspaceSummary`, `BriefingSnapshot`, `HealthPage`, `SessionSummary`, `ObservationRecord`, …) | `crates/ai-memory-store/src/reader.rs` |
+| Session listing + per-session observation readers (`sessions_for_scope`, `session_summary_scoped`, `session_observations_scoped`) | `crates/ai-memory-store/src/reader.rs` |
 | 27 integration tests covering every endpoint (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/routes.rs` |
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |

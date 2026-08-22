@@ -1,7 +1,23 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, ObservationKind};
+use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
 use serde::{Deserialize, Serialize};
+
+use crate::capture_policy::{
+    ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+};
+
+/// Durable excerpt ceiling for user prompts. Prompts retain more working
+/// context than tool/notification summaries while remaining bounded.
+pub const USER_PROMPT_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for post-compaction summaries.
+pub const POST_COMPACTION_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for notifications.
+pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
+
+const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
 
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -22,6 +38,9 @@ pub struct HookQuery {
     /// Project name override (same source as `workspace`). When
     /// `None` the server falls back to `basename(cwd)`.
     pub project: Option<String>,
+    /// Session identifier supplied by a host-side bridge when the agent's
+    /// native hook payload does not include one. Body values still win.
+    pub session_id: Option<String>,
     /// Optional project derivation strategy from `.ai-memory.toml`.
     /// `repo-root` makes the server derive project identity from the
     /// main git repository root instead of `basename(cwd)`.
@@ -48,19 +67,42 @@ pub struct HookQuery {
     /// instead of just the current one — the meta-repo case (e.g. `ai-memory`
     /// needing to see `ai-memory-ops` / `infra` without passing `global=true`).
     pub default_global: Option<String>,
+    /// Invocation-scoped `ai-memory run` lease. Absent for every direct
+    /// harness launch, preserving legacy capture and handoff behavior.
+    pub managed_run: Option<String>,
+    /// Client-side opt-in for assistant/Stop capture, baked onto the native
+    /// `stop` hook command by `install-hooks --capture-assistant`. A truthy
+    /// value tells the server the client deliberately attached a sanitized
+    /// `_ai_memory_assistant` excerpt; the server still gates on its own
+    /// `capture_assistant` config before persisting it (#196).
+    pub capture_assistant: Option<String>,
+    /// Client idempotency key, minted once when the event is spooled and
+    /// re-sent verbatim on every retry of that entry. Lets the server drop
+    /// a replay whose previous delivery succeeded but whose response was
+    /// lost (the conservative-retry duplication vector). Absent on older
+    /// clients; older servers ignore it — both directions keep today's
+    /// behavior.
+    pub ingest_key: Option<String>,
+    /// Explicit root-only recovery propagation from `finalize-session --all-owners`.
+    pub all_owners: Option<String>,
+    /// Provenance of the `project` override: `marker` when a
+    /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
+    /// from the enclosing checkout. Absent on older clients (#394).
+    pub project_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
 /// body. We keep the original raw JSON around so consumers can extract
 /// agent-specific fields they care about.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct HookEnvelope {
     /// Mapped lifecycle event.
     pub event: HookEvent,
     /// Agent CLI identifier.
     pub agent: AgentKind,
-    /// Session identifier, if found in the body. Required for everything
-    /// except the initial `SessionStart`.
+    /// Session identifier from the body, or from the query string when a
+    /// host-side bridge had to supply it. Required for everything except the
+    /// initial `SessionStart`.
     pub session_id: Option<String>,
     /// Current working directory at the time of the event.
     pub cwd: Option<String>,
@@ -72,6 +114,9 @@ pub struct HookEnvelope {
     pub project_override: Option<String>,
     /// Project derivation strategy declared by the hook marker.
     pub project_strategy: ProjectStrategy,
+    /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
+    /// when there is no override, so the two can never disagree (#394).
+    pub project_source: ProjectSource,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -82,16 +127,66 @@ pub struct HookEnvelope {
     /// router publishes it on the actor's `ActiveProject` so default-scoped
     /// read tools broaden to a global search.
     pub recall_default_global_requested: bool,
+    /// Explicit cross-owner recovery request (never honored for ordinary hooks).
+    pub all_owners_requested: bool,
+    /// Invocation-scoped managed-run id forwarded by the host hook.
+    pub managed_run: Option<String>,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
     pub source_event: Option<String>,
+    /// Whether the client requested assistant/Stop capture for this event
+    /// (the `capture_assistant` query flag baked onto the native `stop`
+    /// command). The server still gates on its own `capture_assistant` config
+    /// before honoring it (#196).
+    pub capture_assistant_requested: bool,
+    /// Validated client idempotency key (`ingest_key` query param): 1–64
+    /// ASCII `[A-Za-z0-9_-]` chars, else dropped at parse time. `Some` makes
+    /// the ingest path dedup the event against a replayed delivery.
+    pub ingest_key: Option<String>,
     /// Optional title hint extracted from the body.
     pub title_hint: Option<String>,
     /// Optional body excerpt extracted from the agent's raw payload.
     pub body_excerpt: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
+}
+
+/// Manual `Debug` that omits raw and derived hook content. A stray `?env` or
+/// `%env` in a tracing span must not copy prompt or tool content into logs.
+impl std::fmt::Debug for HookEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookEnvelope")
+            .field("event", &self.event)
+            .field("agent", &self.agent)
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
+            .field("workspace_override", &self.workspace_override)
+            .field("project_override", &self.project_override)
+            .field("project_strategy", &self.project_strategy)
+            .field("drop_subagent_requested", &self.drop_subagent_requested)
+            .field(
+                "recall_default_global_requested",
+                &self.recall_default_global_requested,
+            )
+            .field("managed_run", &self.managed_run)
+            .field(
+                "capture_assistant_requested",
+                &self.capture_assistant_requested,
+            )
+            .field("extension", &self.extension)
+            .field("source_event", &self.source_event)
+            .field(
+                "title_hint",
+                &self.title_hint.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "body_excerpt",
+                &self.body_excerpt.as_ref().map(|_| "<redacted>"),
+            )
+            .field("raw", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
@@ -157,6 +252,66 @@ impl ProjectStrategy {
     }
 }
 
+/// Where a `project` override on the wire came from.
+///
+/// The host-side hook sends `project=` for two very different reasons: a
+/// `.ai-memory.toml` marker naming the project outright, and `repo-root`
+/// derivation of the enclosing checkout's name (which must run host-side —
+/// a containerized server cannot see the client's checkout). Both arrive as
+/// the same query parameter, so before #394's `sticky` knob the router could
+/// not honor one while overriding the other. This discriminator is that
+/// missing signal: a marker is a deliberate rescope and always wins, while a
+/// repo-root derivation is just "where the cwd happens to be" and may yield
+/// to the session under `[routing] mid_session = "sticky"`.
+///
+/// Older clients omit the parameter entirely and parse as [`Self::Unspecified`],
+/// which keeps their overrides authoritative — the pre-#394 behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectSource {
+    /// No provenance declared: either no override at all, or a client too
+    /// old to tag one. Treated as authoritative, never as fell-through.
+    #[default]
+    Unspecified,
+    /// A `.ai-memory.toml` marker named this project explicitly.
+    Marker,
+    /// The host hook derived it from the enclosing git repo root under the
+    /// `repo-root` strategy.
+    RepoRoot,
+}
+
+impl ProjectSource {
+    /// Parse the `project_src` query value. Unknown values fall back to
+    /// [`Self::Unspecified`] so a typo can never downgrade an override into
+    /// something the session is allowed to overrule.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("marker") => Self::Marker,
+            Some("repo-root" | "repo_root") => Self::RepoRoot,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Stable wire/log representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Marker => "marker",
+            Self::RepoRoot => "repo-root",
+        }
+    }
+
+    /// Whether an override from this source may yield to session-sticky
+    /// attribution. Only host-side repo-root derivation may: it carries no
+    /// operator intent, just the cwd's enclosing checkout.
+    #[must_use]
+    pub const fn yields_to_session(self) -> bool {
+        matches!(self, Self::RepoRoot)
+    }
+}
+
 /// Discriminator for the lifecycle event that triggered the hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -171,6 +326,8 @@ pub enum HookEvent {
     PostToolUse,
     /// Compaction event (context window pressure).
     PreCompact,
+    /// Post-compaction event (Devin-specific, after context compaction).
+    PostCompaction,
     /// Agent emitted a notification.
     Notification,
     /// Agent finished its turn (interactive `/stop` or natural end).
@@ -203,6 +360,7 @@ impl HookEvent {
             "pre-compact" | "pre_compact" | "PreCompact" | "preCompact" | "PreCompress" => {
                 Self::PreCompact
             }
+            "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
             "stop" | "Stop" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
@@ -224,6 +382,7 @@ impl HookEvent {
             Self::PreToolUse => ObservationKind::PreToolUse,
             Self::PostToolUse => ObservationKind::PostToolUse,
             Self::PreCompact => ObservationKind::PreCompact,
+            Self::PostCompaction => ObservationKind::PostCompaction,
             Self::Notification => ObservationKind::Notification,
             Self::Stop => ObservationKind::Stop,
             Self::SessionEnd => ObservationKind::SessionEnd,
@@ -256,7 +415,7 @@ impl HookEnvelope {
         // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
         // JSON keys are case-sensitive, so all spellings must be listed
         // or tool events fail the router's "missing session_id" check.
-        let session_id = extract_string(
+        let body_session_id = extract_string(
             &raw,
             &[
                 "session_id",
@@ -281,6 +440,7 @@ impl HookEnvelope {
                 ],
             )
         });
+        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
             .or_else(|| {
@@ -304,8 +464,19 @@ impl HookEnvelope {
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
+        // Provenance describes an override, so it is meaningless without one.
+        // Pinning it to `Unspecified` here keeps every downstream check from
+        // having to re-test `project_override.is_some()` alongside it.
+        let project_source = if project_override.is_some() {
+            ProjectSource::parse(query.project_src.as_deref())
+        } else {
+            ProjectSource::Unspecified
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
+        let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
+        let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
             let raw_source = query
@@ -319,16 +490,40 @@ impl HookEnvelope {
         } else {
             None
         };
-        let title_hint = best_title_hint(event, &raw).or_else(|| {
-            source_event
-                .as_deref()
-                .map(|source| extension_title_hint(&raw, source))
-        });
-        let body_excerpt = best_body_excerpt(event, &raw).or_else(|| {
-            source_event
-                .as_deref()
-                .and_then(|_| extension_body_excerpt(&raw))
-        });
+        let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
+        let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
+            && closed_tool_agent(agent);
+        let title_hint = if closed_tool_event {
+            tool_metadata.as_ref().map(safe_tool_title).or_else(|| {
+                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                    .then(|| legacy_tool_title(event, agent, &raw))
+                    .flatten()
+            })
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_title(event, agent, &raw)
+        } else {
+            best_title_hint(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .map(|source| extension_title_hint(&raw, source))
+            })
+        };
+        let body_excerpt = if closed_tool_event {
+            safe_tool_body(event, tool_metadata.as_ref(), agent, &raw).or_else(|| {
+                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                    .then(|| legacy_tool_body(event, agent, &raw))
+                    .flatten()
+            })
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_body(event, agent, &raw)
+        } else {
+            best_body_excerpt(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .and_then(|_| extension_body_excerpt(&raw))
+            })
+        };
+        let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
         Self {
             event,
             agent,
@@ -337,8 +532,13 @@ impl HookEnvelope {
             workspace_override,
             project_override,
             project_strategy,
+            project_source,
             drop_subagent_requested,
             recall_default_global_requested,
+            all_owners_requested,
+            managed_run,
+            capture_assistant_requested,
+            ingest_key,
             extension,
             source_event,
             title_hint,
@@ -346,6 +546,126 @@ impl HookEnvelope {
             raw,
         }
     }
+}
+
+/// An ingest key is client-controlled input: accept only short, plain tokens
+/// (1–64 ASCII alphanumerics, `-` or `_` — a UUID simple/hyphenated form
+/// fits). Anything else is treated as absent rather than rejected, so a
+/// malformed key degrades to today's at-least-once behavior instead of a 4xx.
+fn valid_ingest_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn legacy_tool_title(
+    event: HookEvent,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let payload = (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+        .then(|| raw.get("payload"))
+        .flatten()?;
+    extract_string(payload, &["tool"]).filter(|_| {
+        extract_content(
+            payload,
+            &["tool_response", "tool_output", "output", "result", "error"],
+        )
+        .is_some()
+    })
+}
+
+fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    let payload = (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+        .then(|| raw.get("payload"))
+        .flatten()?;
+    let tool = extract_string(payload, &["tool"])?;
+    let result = extract_content(
+        payload,
+        &["tool_response", "tool_output", "output", "result"],
+    )
+    .or_else(|| extract_content(payload, &["error"]))?;
+    Some(truncate_excerpt(&format!("tool: {tool}\n---\n{result}")))
+}
+
+const fn closed_tool_agent(agent: AgentKind) -> bool {
+    matches!(
+        agent,
+        AgentKind::ClaudeCode
+            | AgentKind::CommandCode
+            | AgentKind::OpenCode
+            | AgentKind::Pi
+            | AgentKind::AntigravityCli
+            | AgentKind::Hermes
+    )
+}
+
+fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
+    format!(
+        "tool {}",
+        serde_json::to_string(&metadata.tool_family)
+            .unwrap_or_default()
+            .trim_matches('"')
+    )
+}
+
+fn safe_tool_body(
+    event: HookEvent,
+    metadata: Option<&ToolObservationMetadata>,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let metadata = metadata?;
+    let mut summary = format!(
+        "tool_family: {}",
+        serde_json::to_string(&metadata.tool_family)
+            .ok()?
+            .trim_matches('"')
+    );
+    if let Some(id) = &metadata.tool_call_id {
+        summary.push_str("\ntool_call_id: ");
+        summary.push_str(id);
+    }
+    match event {
+        HookEvent::PreToolUse => Some(summary),
+        HookEvent::PostToolUse => {
+            summary.push_str("\noutcome: ");
+            summary.push_str(tool_observation_outcome(agent, raw).as_str());
+            if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
+                return Some(summary);
+            }
+            let result =
+                extract_content(raw, &["tool_response", "tool_output", "output", "result"])
+                    .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| antigravity_edit_content(agent, raw))
+                    .unwrap_or_else(|| "(no output captured)".into());
+            summary.push_str("\n---\n");
+            summary.push_str(&result);
+            Some(truncate_excerpt(&summary))
+        }
+        _ => None,
+    }
+}
+
+fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::AntigravityCli {
+        return None;
+    }
+    let tool_call = raw.get("toolCall")?;
+    let tool = tool_call.get("name")?.as_str()?;
+    if !matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "write_to_file" | "replace_file_content" | "multi_replace_file_content"
+    ) {
+        return None;
+    }
+    let args = tool_call.get("args")?;
+    extract_content(
+        args,
+        &["ReplacementContent", "CodeContent", "ReplacementChunks"],
+    )
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -452,7 +772,10 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
     match event {
         HookEvent::SessionStart => extract_string(raw, &["model", "title"]),
         HookEvent::UserPrompt => {
-            extract_string(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
+            // Kimi Code sends `prompt` as content blocks
+            // (`[{"type":"text","text":...}]`); `extract_content` flattens
+            // them and returns identical values for plain-string agents.
+            extract_content(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -462,6 +785,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
                 })
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]),
+        HookEvent::PostCompaction => extract_string(raw, &["summary"]),
         _ => None,
     }
 }
@@ -539,7 +863,8 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -552,7 +877,10 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                     .unwrap_or_else(|| "(no output captured)".into());
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"]),
+        HookEvent::Notification => extract_content(raw, &["message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"])
+            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
         _ => None,
     }
 }
@@ -570,23 +898,72 @@ fn truncate_for_title(s: &str) -> String {
 }
 
 fn truncate_excerpt(s: &str) -> String {
-    const MAX: usize = 2_000;
-    if s.len() <= MAX {
-        s.to_string()
-    } else {
-        let mut buf = String::with_capacity(MAX + '…'.len_utf8());
-        let mut end = 0;
-        for (idx, ch) in s.char_indices() {
-            let next = idx + ch.len_utf8();
-            if next > MAX {
-                break;
-            }
-            end = next;
+    truncate_utf8_bytes(s, TOOL_EXCERPT_MAX_BYTES)
+}
+
+/// Cap core lifecycle body fields before the native hook writes its local
+/// spool entry. The server independently reapplies the same per-event limits
+/// while constructing [`HookEnvelope`], and the typed persistence boundary has
+/// a universal backstop.
+pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEvent) -> bool {
+    let Some((keys, max_bytes)) = core_body_cap(event) else {
+        return false;
+    };
+    let mut changed = cap_candidate_group(raw, keys, max_bytes);
+    for container in ["payload", "event"] {
+        if let Some(nested) = raw.get_mut(container) {
+            changed |= cap_candidate_group(nested, keys, max_bytes);
         }
-        buf.push_str(&s[..end]);
-        buf.push('…');
-        buf
     }
+    changed
+}
+
+fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
+    match event {
+        HookEvent::UserPrompt => Some((
+            &["prompt", "message", "text"],
+            USER_PROMPT_EXCERPT_MAX_BYTES,
+        )),
+        HookEvent::Notification => Some((&["message", "text"], NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => Some((&["summary"], POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        _ => None,
+    }
+}
+
+fn cap_candidate_group(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let mut changed = cap_object_fields(value, keys, max_bytes);
+    if let Some(properties) = value.get_mut("properties") {
+        changed |= cap_object_fields(properties, keys, max_bytes);
+        if let Some(info) = properties.get_mut("info") {
+            changed |= cap_object_fields(info, keys, max_bytes);
+        }
+    }
+    for container in ["info", "path"] {
+        if let Some(nested) = value.get_mut(container) {
+            changed |= cap_object_fields(nested, keys, max_bytes);
+        }
+    }
+    changed
+}
+
+fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in keys {
+        let Some(field) = object.get_mut(*key) else {
+            continue;
+        };
+        let Some(text) = value_to_text(field) else {
+            continue;
+        };
+        if text.len() > max_bytes {
+            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn normalize_extension_name(value: Option<&str>) -> Option<String> {
@@ -615,6 +992,68 @@ fn normalize_token(value: &str, max_len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_source_parses_both_spellings_and_defaults_closed() {
+        assert_eq!(ProjectSource::parse(Some("marker")), ProjectSource::Marker);
+        assert_eq!(
+            ProjectSource::parse(Some("repo-root")),
+            ProjectSource::RepoRoot
+        );
+        assert_eq!(
+            ProjectSource::parse(Some("repo_root")),
+            ProjectSource::RepoRoot
+        );
+        // Absent (older client) and unknown values both stay authoritative,
+        // so a typo can never downgrade an override into something the
+        // session is allowed to overrule.
+        assert_eq!(ProjectSource::parse(None), ProjectSource::Unspecified);
+        assert_eq!(
+            ProjectSource::parse(Some("REPO-ROOT")),
+            ProjectSource::Unspecified
+        );
+        assert_eq!(
+            ProjectSource::parse(Some("nonsense")),
+            ProjectSource::Unspecified
+        );
+        // Only a host-derived name may yield to the session.
+        assert!(ProjectSource::RepoRoot.yields_to_session());
+        assert!(!ProjectSource::Marker.yields_to_session());
+        assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn project_source_is_pinned_unspecified_without_an_override() {
+        // Provenance describes an override; a `project_src` arriving without
+        // one is meaningless and must not read as a fell-through signal.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/checkouts/repo-a".into()),
+                project_src: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.project_override, None);
+        assert_eq!(env.project_source, ProjectSource::Unspecified);
+
+        // With an override it is carried through verbatim.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/checkouts/repo-a".into()),
+                project: Some("repo-a".into()),
+                project_src: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.project_override.as_deref(), Some("repo-a"));
+        assert_eq!(env.project_source, ProjectSource::RepoRoot);
+    }
 
     #[test]
     fn body_is_subagent_detects_harness_markers() {
@@ -656,6 +1095,70 @@ mod tests {
         assert_eq!(HookEvent::parse("PreToolUse"), HookEvent::PreToolUse);
         assert_eq!(HookEvent::parse("user_prompt"), HookEvent::UserPrompt);
         assert_eq!(HookEvent::parse("bogus"), HookEvent::Other);
+    }
+
+    #[test]
+    fn debug_never_renders_hook_content() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                managed_run: Some("run-1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "dbg",
+                "prompt": "SENTINEL_DERIVED_CONTENT",
+                "secret": "SENTINEL_RAW_PAYLOAD",
+            }),
+        );
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("SENTINEL_DERIVED_CONTENT")
+        );
+        let rendered = format!("{env:?}");
+        assert!(
+            !rendered.contains("SENTINEL_RAW_PAYLOAD"),
+            "Debug leaked the raw payload: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SENTINEL_DERIVED_CONTENT"),
+            "Debug leaked derived hook content: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "raw was not redacted");
+        assert!(rendered.contains("UserPrompt"), "event field went missing");
+        assert!(rendered.contains("run-1"), "managed run field went missing");
+    }
+
+    /// `ingest_key` is client-controlled input: only short plain tokens pass;
+    /// anything else degrades to "absent" (at-least-once), never a 4xx.
+    #[test]
+    fn ingest_key_is_validated_at_parse_time() {
+        let fire = |key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "k-1" }),
+            )
+        };
+        // A UUID in simple or hyphenated form passes untouched.
+        assert_eq!(
+            fire(Some("abcDEF123_-")).ingest_key.as_deref(),
+            Some("abcDEF123_-")
+        );
+        // Empty, oversized or non-token input is dropped, not rejected.
+        let oversized = "x".repeat(65);
+        for bad in ["", "spaces here", "chave!", "key\n", oversized.as_str()] {
+            assert_eq!(
+                fire(Some(bad)).ingest_key,
+                None,
+                "expected {bad:?} to be dropped"
+            );
+        }
+        assert_eq!(fire(None).ingest_key, None);
     }
 
     #[test]
@@ -725,6 +1228,28 @@ mod tests {
             HookEvent::SessionEnd.to_observation_kind(),
             ObservationKind::SessionEnd
         );
+        assert_eq!(
+            HookEvent::PostCompaction.to_observation_kind(),
+            ObservationKind::PostCompaction
+        );
+    }
+
+    #[test]
+    fn hook_event_parses_post_compaction() {
+        assert_eq!(
+            HookEvent::parse("post-compaction"),
+            HookEvent::PostCompaction
+        );
+        assert_eq!(
+            HookEvent::parse("post_compaction"),
+            HookEvent::PostCompaction
+        );
+        assert_eq!(
+            HookEvent::parse("PostCompaction"),
+            HookEvent::PostCompaction
+        );
+        // Unknown event still maps to Other.
+        assert_eq!(HookEvent::parse("unknown-event"), HookEvent::Other);
     }
 
     #[test]
@@ -757,11 +1282,112 @@ mod tests {
             "cwd": "/tmp/x",
             "model": "claude-sonnet-4-6"
         });
-        let env = HookEnvelope::from_query_and_body(q, raw);
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
         assert_eq!(env.event, HookEvent::SessionStart);
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn envelope_uses_query_session_id_when_body_omits_it() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
+
+        assert_eq!(env.event, HookEvent::PostToolUse);
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert_eq!(env.session_id.as_deref(), Some("bridge-session-123"));
+    }
+
+    #[test]
+    fn envelope_body_session_id_wins_over_query_session_id() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "session_id": "body-session-456",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.session_id.as_deref(), Some("body-session-456"));
+    }
+
+    #[test]
+    fn envelope_uses_query_cwd_when_body_omits_it() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            cwd: Some("/resolved/from/hook".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert_eq!(env.session_id.as_deref(), Some("bridge-session-123"));
+        assert_eq!(env.cwd.as_deref(), Some("/resolved/from/hook"));
+    }
+
+    #[test]
+    fn envelope_body_cwd_wins_over_query_cwd() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            cwd: Some("/resolved/from/hook".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "cwd": "/native/from/body"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.cwd.as_deref(), Some("/native/from/body"));
+    }
+
+    #[test]
+    fn devin_real_session_start_fixture_has_no_native_session_or_cwd() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("devin".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "source": "startup"
+        });
+        let env = HookEnvelope::from_query_and_body(q, raw);
+        assert_eq!(env.event, HookEvent::SessionStart);
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert!(env.session_id.is_none());
+        assert!(env.cwd.is_none());
     }
 
     #[test]
@@ -805,7 +1431,7 @@ mod tests {
             Some("ec33ebf9-0cba-4100-8142-c61503f6c587")
         );
         assert_eq!(env.cwd.as_deref(), Some("/workspace/project"));
-        assert_eq!(env.title_hint.as_deref(), Some("run_command"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
     #[test]
@@ -822,13 +1448,8 @@ mod tests {
             "error": "exit status 1"
         });
         let env = HookEnvelope::from_query_and_body(q, raw);
-
-        assert_eq!(env.title_hint.as_deref(), Some("step 5"));
-        assert!(
-            env.body_excerpt
-                .as_deref()
-                .is_some_and(|body| body.contains("exit status 1"))
-        );
+        assert!(env.title_hint.is_none());
+        assert!(env.body_excerpt.is_none());
     }
 
     /// OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
@@ -872,17 +1493,19 @@ mod tests {
                 "output": "tests passed"
             }
         });
-        let env = HookEnvelope::from_query_and_body(q, raw);
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
         assert_eq!(env.session_id.as_deref(), Some("ses_nested"));
         assert_eq!(env.cwd.as_deref(), Some("/home/user/ai-memory"));
         assert_eq!(env.title_hint.as_deref(), Some("bash"));
-        assert!(
-            env.body_excerpt
-                .as_deref()
-                .is_some_and(|body| body.contains("tests passed")),
-            "post-tool body should include nested output: {:?}",
-            env.body_excerpt
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool: bash\n---\ntests passed")
         );
+        let long = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({"payload":{"tool":"bash","output":"é".repeat(2_000)}}),
+        );
+        assert!(long.body_excerpt.unwrap().len() <= 2_000);
     }
 
     /// OpenCode's plugin `event` hook receives bus events shaped like
@@ -937,6 +1560,8 @@ mod tests {
         assert_eq!(parse_agent("omp"), AgentKind::Omp);
         assert_eq!(parse_agent("pi"), AgentKind::Pi);
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
+        assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
+        assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -961,6 +1586,41 @@ mod tests {
         assert!(env.cwd.is_none());
         assert!(env.title_hint.is_none());
         assert!(env.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn hermes_tool_title_uses_only_the_verified_shell_hook_shape() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {"path": "src/lib.rs", "content": "untrusted"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::Hermes);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("hermes-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("unverified-agent".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
     }
 
     /// Body is well-formed JSON but the expected `session_id` /
@@ -1046,6 +1706,98 @@ mod tests {
     }
 
     #[test]
+    fn core_lifecycle_bodies_use_named_utf8_safe_caps() {
+        for (event, field, cap) in [
+            ("user-prompt", "prompt", USER_PROMPT_EXCERPT_MAX_BYTES),
+            ("notification", "message", NOTIFICATION_EXCERPT_MAX_BYTES),
+            (
+                "post-compaction",
+                "summary",
+                POST_COMPACTION_EXCERPT_MAX_BYTES,
+            ),
+        ] {
+            let body = format!("{}éTAIL_SENTINEL", "x".repeat(cap - 1));
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({(field): body}),
+            );
+            let excerpt = env.body_excerpt.expect("bounded body excerpt");
+            assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
+            assert!(excerpt.ends_with('…'), "{event} omitted truncation marker");
+            assert!(
+                !excerpt.contains("TAIL_SENTINEL"),
+                "{event} retained content after the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn client_body_cap_covers_supported_nested_candidate_shapes() {
+        let mut raw = serde_json::json!({
+            "prompt": "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1),
+            "payload": {
+                "properties": {
+                    "info": {
+                        "message": [{"type": "text", "text": "y".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)}]
+                    }
+                }
+            },
+            "event": {
+                "info": {
+                    "text": "z".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)
+                }
+            }
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        for value in [
+            &raw["prompt"],
+            &raw["payload"]["properties"]["info"]["message"],
+            &raw["event"]["info"]["text"],
+        ] {
+            let text = value.as_str().expect("oversized value flattened to text");
+            assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+            assert!(text.ends_with('…'));
+        }
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::SessionStart
+        ));
+    }
+
+    /// Kimi Code's content-block `prompt` must flatten into the title
+    /// exactly like the body excerpt does.
+    #[test]
+    fn user_prompt_title_flattens_kimi_code_content_blocks() {
+        let q = HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("kimi-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session_kimi-1",
+                "cwd": "/tmp/proj",
+                "prompt": [ { "type": "text", "text": "hello" } ]
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("hello"));
+        assert_eq!(env.body_excerpt.as_deref(), Some("hello"));
+    }
+
+    #[test]
     fn post_tool_excerpt_truncates_without_splitting_utf8() {
         let q = HookQuery {
             event: "post-tool-use".into(),
@@ -1056,13 +1808,14 @@ mod tests {
         let env = HookEnvelope::from_query_and_body(
             q,
             serde_json::json!({
-                "tool": "bash",
+                "tool_name": "Bash",
+                "tool_input": {},
                 "result": output,
             }),
         );
         let excerpt = env.body_excerpt.unwrap();
         assert!(excerpt.ends_with('…'));
-        assert!(excerpt.starts_with("tool: bash\n---\n"));
+        assert!(excerpt.starts_with("tool_family: non-file\noutcome: unknown\n---\n"));
     }
 
     /// Regression: the native-binary hook command sends the script stem
@@ -1096,6 +1849,7 @@ mod tests {
             q,
             serde_json::json!({
                 "tool_name": "Bash",
+                "tool_input": {},
                 "tool_response": [{"type": "text", "text": "MARKER_OUTPUT_123"}],
             }),
         );
@@ -1123,6 +1877,7 @@ mod tests {
             q,
             serde_json::json!({
                 "tool_name": "Read",
+                "tool_input": {},
                 "tool_response": {"stdout": "MARKER_OBJ_456"},
             }),
         );
@@ -1148,5 +1903,447 @@ mod tests {
         );
         assert_eq!(env.event, HookEvent::UserPrompt);
         assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
+    }
+
+    #[test]
+    fn closed_tool_summaries_keep_only_safe_metadata_and_cap_total_body() {
+        let fixtures = [
+            (
+                "claude-code",
+                serde_json::json!({"tool_name":"Bash","tool_input":{"command":"SENTINEL_COMMAND","path":"SENTINEL_PATH"},"tool_use_id":"claude-1","output":"SENTINEL_OUTPUT"}),
+                "claude-1",
+                "unknown",
+            ),
+            (
+                "open-code",
+                serde_json::json!({"tool":"bash","args":{"command":"SENTINEL_COMMAND"},"callID":"open-1","output":"SENTINEL_OUTPUT"}),
+                "open-1",
+                "unknown",
+            ),
+            (
+                "pi",
+                serde_json::json!({"tool":"bash","args":{"command":"SENTINEL_COMMAND"},"callID":"pi-1","isError":true,"output":"SENTINEL_OUTPUT"}),
+                "pi-1",
+                "error",
+            ),
+        ];
+        for (agent, raw, id, outcome) in fixtures {
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            let pre_body = pre.body_excerpt.expect("pre summary");
+            assert!(pre_body.contains(id));
+            for sentinel in ["SENTINEL_COMMAND", "SENTINEL_PATH", "SENTINEL_OUTPUT"] {
+                assert!(!pre_body.contains(sentinel));
+            }
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let post_body = post.body_excerpt.expect("post summary");
+            assert!(post_body.contains(&format!("outcome: {outcome}")));
+        }
+
+        let long = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":"utf8-1","output": "é".repeat(2_000)}),
+        );
+        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+    }
+
+    #[test]
+    fn unknown_closed_tool_post_never_includes_output_or_name() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"ARBITRARY_TOOL_SENTINEL","tool_use_id":"unknown-1","output":"OUTPUT_SENTINEL"}),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: unknown"));
+        assert!(body.contains("tool_call_id: unknown-1"));
+        assert!(body.contains("outcome: unknown"));
+        assert!(!body.contains("ARBITRARY_TOOL_SENTINEL"));
+        assert!(!body.contains("OUTPUT_SENTINEL"));
+    }
+
+    #[test]
+    fn claude_and_opencode_paired_summaries_share_agent_ids() {
+        for (agent, pre_raw, post_raw, id) in [
+            (
+                "claude-code",
+                serde_json::json!({"tool_name":"Bash","tool_input":{"command":"PRE_COMMAND_SENTINEL"},"tool_use_id":"claude-pair"}),
+                serde_json::json!({"tool_name":"Bash","tool_use_id":"claude-pair","output":"POST_OUTPUT"}),
+                "claude-pair",
+            ),
+            (
+                "open-code",
+                serde_json::json!({"tool":"bash","args":{"path":"PRE_PATH_SENTINEL"},"callID":"open-pair"}),
+                serde_json::json!({"tool":"bash","callID":"open-pair","output":"POST_OUTPUT"}),
+                "open-pair",
+            ),
+        ] {
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                pre_raw,
+            );
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                post_raw,
+            );
+            let pre_body = pre.body_excerpt.unwrap();
+            let post_body = post.body_excerpt.unwrap();
+            assert!(pre_body.contains(id) && post_body.contains(id));
+            assert!(post_body.contains("POST_OUTPUT"));
+            assert!(!pre_body.contains("SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn antigravity_omits_id_and_unsupported_pre_has_no_body() {
+        let antigravity = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"toolCall":{"name":"run_command","args":{}},"error":"private"}),
+        );
+        let body = antigravity.body_excerpt.unwrap();
+        assert!(body.contains("outcome: error"));
+        assert!(!body.contains("tool_call_id"));
+        let unsupported = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{"command":"private"}}),
+        );
+        assert!(unsupported.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn unsupported_and_stop_tool_payloads_never_render_content() {
+        for event in ["pre-tool-use", "post-tool-use"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("other".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"tool":"SENTINEL_TOOL","args":{"command":"SENTINEL_COMMAND","path":"SENTINEL_PATH"},"output":"SENTINEL_OUTPUT"}),
+            );
+            assert!(env.title_hint.is_none());
+            assert!(env.body_excerpt.is_none());
+        }
+        let stop = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"last_assistant_message":"SENTINEL_ASSISTANT"}),
+        );
+        assert!(stop.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn antigravity_outcome_and_call_id_boundaries_are_closed() {
+        let absent = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"toolCall":{"name":"run_command","args":{}}}),
+        );
+        assert!(absent.body_excerpt.unwrap().contains("outcome: unknown"));
+        for (error, outcome) in [
+            (serde_json::json!(null), "unknown"),
+            (serde_json::json!(""), "unknown"),
+            (serde_json::json!("failed"), "error"),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"toolCall":{"name":"run_command","args":{}},"error":error}),
+            );
+            assert!(
+                env.body_excerpt
+                    .unwrap()
+                    .contains(&format!("outcome: {outcome}"))
+            );
+        }
+        let id = "a".repeat(129);
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":id}),
+        );
+        assert!(!env.body_excerpt.unwrap().contains("tool_call_id"));
+    }
+
+    #[test]
+    fn antigravity_native_file_and_search_tools_render_captured_content() {
+        for (tool, args, family) in [
+            (
+                "view_file",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "replace_file_content",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "list_dir",
+                serde_json::json!({"DirectoryPath": "src"}),
+                "search-list",
+            ),
+            (
+                "grep_search",
+                serde_json::json!({"SearchPath": "src"}),
+                "search-list",
+            ),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {"name": tool, "args": args},
+                    "tool_response": "SENTINEL_CONTENT",
+                }),
+            );
+            let body = env.body_excerpt.unwrap();
+            assert!(
+                body.contains(&format!("tool_family: {family}")),
+                "tool: {tool}, body: {body}"
+            );
+            assert!(
+                body.contains("SENTINEL_CONTENT"),
+                "tool: {tool}, body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_edit_tools_capture_real_written_content() {
+        // Fixture shapes captured from a live antigravity-cli session. The hook
+        // never sends a top-level result; the written content lives in args.
+        let write_to_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "CodeContent": "# Scratch Test File 09\n\nLine 1: first line\n",
+                        "Description": "Temporary scratch file",
+                        "Overwrite": true,
+                        "TargetFile": "/repo/scratch-test-09.md"
+                    }
+                }
+            }),
+        );
+        let body = write_to_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Scratch Test File 09"));
+
+        let replace_file_content = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/1-visao.md",
+                        "TargetContent": "old line",
+                        "ReplacementContent": "new line REPLACED_SENTINEL",
+                        "Instruction": "Add debug test comment"
+                    }
+                }
+            }),
+        );
+        let body = replace_file_content.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("REPLACED_SENTINEL"));
+
+        let multi_replace = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "multi_replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/scratch-test-09.md",
+                        "Instruction": "Edit Line 1 and Line 4",
+                        "ReplacementChunks": [
+                            {
+                                "TargetContent": "Line 1: first line",
+                                "ReplacementContent": "Line 1: first line edited",
+                                "StartLine": 3,
+                                "EndLine": 3,
+                                "AllowMultiple": false
+                            },
+                            {
+                                "TargetContent": "Line 4: fourth line",
+                                "ReplacementContent": "Line 4: fourth line edited",
+                                "StartLine": 6,
+                                "EndLine": 6,
+                                "AllowMultiple": false
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        let body = multi_replace.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Line 1: first line edited"));
+        assert!(body.contains("Line 4: fourth line edited"));
+    }
+
+    #[test]
+    fn antigravity_failed_edit_prefers_error_over_attempted_content() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "error": "EDIT_FAILED_SENTINEL",
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/src/main.rs",
+                        "ReplacementContent": "CONTENT_WAS_NOT_WRITTEN"
+                    }
+                }
+            }),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains("outcome: error"));
+        assert!(body.contains("EDIT_FAILED_SENTINEL"));
+        assert!(!body.contains("CONTENT_WAS_NOT_WRITTEN"));
+    }
+
+    #[test]
+    fn antigravity_generic_tools_and_unrelated_events_fail_closed() {
+        for tool in ["read_url_content", "read_resource", "call_mcp_tool"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {
+                        "name": tool,
+                        "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                    },
+                    "tool_response": "UNPROVEN_OUTPUT_SENTINEL"
+                }),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\noutcome: unknown")
+            );
+        }
+
+        let notification = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "notification".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                }
+            }),
+        );
+        assert!(notification.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn pi_post_outcomes_and_stable_id_are_rendered() {
+        for (is_error, outcome) in [
+            (Some(false), "success"),
+            (Some(true), "error"),
+            (None, "unknown"),
+        ] {
+            let mut raw = serde_json::json!({"tool":"bash","args":{},"callID":"pi-stable-190","output":"result"});
+            if let Some(is_error) = is_error {
+                raw["isError"] = serde_json::json!(is_error);
+            }
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some("pi".into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("pi".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert!(
+                pre.body_excerpt
+                    .unwrap()
+                    .contains("tool_call_id: pi-stable-190")
+            );
+            let body = post.body_excerpt.unwrap();
+            assert!(body.contains("tool_call_id: pi-stable-190"));
+            assert!(body.contains(&format!("outcome: {outcome}")));
+        }
     }
 }

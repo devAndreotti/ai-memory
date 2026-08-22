@@ -25,11 +25,51 @@ log_level = "info"
 # hook_rate_per_sec = 0.0
 # hook_rate_burst = 0.0
 
+# Server-side half of the assistant/Stop capture opt-in (#196). When true, the
+# server persists a Claude Code Stop event's final assistant turn (sanitized and
+# capped at 2 KB) as the Stop body. OFF by default: assistant text is privacy-
+# sensitive — it can quote code, secrets, or content from paths ai-memory never
+# sees, and it flows into consolidation/reviewer prompts (and out to a cloud LLM
+# provider if one is configured). This is a DOUBLE opt-in: the client must also
+# be installed with `ai-memory install-hooks --agent claude-code
+# --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
+# capture_assistant = false
+
+# Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
+# tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
+# Generic MCP clients (OpenCode, Cursor) never send that marker yet forward
+# schemas verbatim to strict upstreams that reject root combinators with a
+# 400. Runtime "exactly one of" validation is unchanged. Env equivalent:
+# `AI_MEMORY_STRIP_ROOT_COMBINATORS=true`.
+# strip_root_combinators = false
+
+# Serve MCP tool input schemas in the subset Google's Schema (Vertex/Gemini
+# functionDeclaration.parameters) accepts: the nullable unions schemars emits
+# for every optional tool argument (`"type": ["integer", "null"]`) collapse to a
+# single type plus `nullable: true`. A client that forwards our schema verbatim
+# to Vertex otherwise fails the whole session at tools/list with "specified
+# other fields alongside any_of". Gemini CLI and Antigravity CLI normalize
+# schemas client-side and need nothing; this is for pass-through clients such as
+# OpenCode on a Gemini/Vertex model. Implies strip_root_combinators; runtime
+# validation is unchanged. Per-client equivalent: append `?flavor=gemini` to the
+# MCP URL. Env equivalent: `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`.
+# gemini_safe_schemas = false
+
+# Optional final LLM relevance pass for project/scopes memory_query calls.
+# Requires an LLM provider and adds at most one provider call per eligible
+# query. The bounded query, page titles, and search snippets are sent to that
+# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
+# the normal ranking. Concurrent provider calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# reranker = "llm"
+
 # M8 retention-sweep parameters.
 #
 # Formula:
 #   retention = salience * exp(-lambda * age_days)
 #             + sigma * log(1 + access_count) * exp(-mu * days_since_access)
+#               * (1 + breadth_weight
+#                    * ln(1 + max(distinct_actors - 1, 0)))
 #
 # With the defaults below, an unused episodic page drops below
 # `cold_threshold = 0.20` at ~80 days; recent accesses bump it back up.
@@ -39,6 +79,7 @@ log_level = "info"
 #   - Faster decay (clean up more aggressively): lambda = 0.04 (~40d floor)
 #   - Bigger access boost (frequently-used stuff lasts longer): sigma = 1.0
 #   - Bigger time-pressure on access: mu = 0.08
+#   - Reward pages used by more identified operators: breadth_weight = 0.2
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -46,6 +87,7 @@ mu = 0.04
 salience_default = 1.0
 cold_threshold = 0.20
 hard_delete_after_days = 180
+breadth_weight = 0.0
 
 # Privacy strip.
 #
@@ -81,6 +123,23 @@ hard_delete_after_days = 180
 [sanitize]
 extra_patterns = []
 allowlist = []
+
+# Optional per-operator memory slots. Enable only when HTTP requests carry
+# consistent DB-user or trusted-proxy identities. Shared `_slots/<name>.md`
+# pages remain project-wide; engine-written slots are placed under the
+# operator's bounded namespace and only shared plus own slots are injected into
+# that operator's session brief and consolidation prompt. Exact page reads and
+# searches remain project-wide: this is context-injection isolation, not RBAC.
+[slots]
+per_user = false
+
+# LLM consolidation prompt limits. These are approximate because tokenizers
+# differ by provider and model. Their sum must fit the model's context window;
+# leave additional headroom for tokenizer variance. Small local models must
+# lower both values together. Startup minimums are 6000 input and 1000 output.
+[consolidation]
+max_input_tokens = 100000
+max_output_tokens = 32000
 
 # Auto-improvement reviewer.
 #
@@ -122,3 +181,31 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+
+# How a mid-session event is attributed when the agent's cwd has moved since
+# the session started. Session-CREATING events always resolve from their own
+# cwd, and a `.ai-memory.toml` marker naming a project always wins in both
+# modes — a marker is a deliberate rescope, not drift.
+#
+#   follow-cwd  (default) Re-resolve every mid-session event from its own cwd.
+#               A `cd` into a sibling checkout records those observations in
+#               that checkout's project, splitting one session's raw record
+#               across two projects.
+#   sticky      Keep the session's project wherever the agent wanders. Matches
+#               the one-session-one-project model the rest of the system uses
+#               (`sessions.project_id` is single-valued, and consolidation
+#               writes one page in the session's project). Recommended when
+#               one agent session means one project.
+[routing]
+mid_session = "follow-cwd"
+
+# NOTE: `[auth]` must remain the LAST section in this template.
+# `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,
+# ...) as bare keys to the end of the rendered file, so any section added
+# below would silently capture them.
+# Browser session cookies are safe on plain loopback HTTP by default. For `/web`
+# behind a trusted HTTPS-terminating reverse proxy, set this to true so browsers
+# send the cookie only over HTTPS. Do not enable it for direct HTTP: browsers
+# will not send a Secure cookie there.
+[auth]
+secure_cookie = false

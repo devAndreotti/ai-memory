@@ -121,6 +121,8 @@ impl Harness {
                     pinned: false,
                     links: Vec::new(),
                     author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .expect("seed page");
@@ -156,12 +158,18 @@ impl Harness {
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
+            ingest_gates: ai_memory_hooks::IngestGates::default(),
             consolidate_on_session_end: false,
+            session_consolidation_notify: None,
+            capture_assistant_enabled: false,
+            per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
             )),
             home_dir: None,
+            trusted_proxy_identity: false,
         });
 
         let router = Router::new()
@@ -533,7 +541,13 @@ async fn per_session_isolates_concurrent_writes() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Scenario 3 — per_actor: users sharing a session_id are still isolated.
+// Scenario 3 — per_actor: users are isolated by their own run ids.
+//
+// Durable `SessionId`s are globally unique: a foreign user reusing another
+// operator's owned session id is a terminal collision and never publishes a
+// pointer (see `autoscope_multiuser::cross_owner_same_session_collision_…`).
+// What per_actor isolates here is the pointer cache key `(user, session_id)`,
+// exercised the supported way: each user runs their own session.
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -545,18 +559,20 @@ async fn per_actor_isolates_users_sharing_session_id() {
     )
     .await;
 
-    // Alice and Bob send hooks with the SAME `session_id` but DIFFERENT
-    // users. In `per_actor` mode they must land in distinct map slots
-    // because the key is `(user, session_id)`, not `session_id` alone.
-    let shared_sess = "shared-session-x";
-    fire_hook_and_settle(&h.router, Some("alice"), shared_sess, 1).await;
-    fire_hook_and_settle(&h.router, Some("bob"), shared_sess, 5).await;
+    // Alice and Bob each send hooks from their OWN `session_id`. The
+    // per_actor map keys by `(user, session_id)`, so even identical session
+    // ids across users would land in distinct slots — the cross-owner
+    // durable-session case is covered by the collision regression instead.
+    let alice_sess = "alice-session-x";
+    let bob_sess = "bob-session-x";
+    fire_hook_and_settle(&h.router, Some("alice"), alice_sess, 1).await;
+    fire_hook_and_settle(&h.router, Some("bob"), bob_sess, 5).await;
 
     // Alice reads — must see proj-1's marker, never proj-5's.
     let resp = h
         .router
         .clone()
-        .oneshot(mcp_query_request(Some("alice"), Some(shared_sess)))
+        .oneshot(mcp_query_request(Some("alice"), Some(alice_sess)))
         .await
         .expect("alice read");
     let alice_text = extract_tool_text(&response_body_text(resp).await);
@@ -573,7 +589,7 @@ async fn per_actor_isolates_users_sharing_session_id() {
     let resp = h
         .router
         .clone()
-        .oneshot(mcp_query_request(Some("bob"), Some(shared_sess)))
+        .oneshot(mcp_query_request(Some("bob"), Some(bob_sess)))
         .await
         .expect("bob read");
     let bob_text = extract_tool_text(&response_body_text(resp).await);
@@ -976,10 +992,12 @@ async fn sustained_per_session_isolation_holds_under_continuous_traffic() {
     }
 
     let mut total_ops = 0_u64;
+    let mut ops_by_session = Vec::with_capacity(SESSIONS);
     let mut leaks = Vec::new();
-    for d in drivers {
+    for (index, d) in drivers.into_iter().enumerate() {
         let (ops, leak) = d.await.expect("driver join");
         total_ops += ops;
+        ops_by_session.push((index + 1, ops));
         if let Some(msg) = leak {
             leaks.push(msg);
         }
@@ -992,19 +1010,23 @@ async fn sustained_per_session_isolation_holds_under_continuous_traffic() {
         leaks.join("\n---\n")
     );
 
-    // Lower bound on completed ops — a generous floor that would only
-    // fail if the engine seized up entirely under load. The real signal
-    // is the leak assertion; this is just a "did we actually exercise
-    // anything" check so a future regression making each op take 5s
-    // doesn't pass a no-op test.
-    let min_ops = (SESSIONS as u64) * 50;
+    // This is a concurrency correctness test, not a shared-runner benchmark.
+    // Require repeated progress from every driver instead of an aggregate
+    // throughput floor: one fast session cannot hide another that starved,
+    // while slow Windows filesystem runners are not mistaken for data leaks.
+    const MIN_OPS_PER_SESSION: u64 = 5;
+    let stalled = ops_by_session
+        .iter()
+        .filter(|(_, ops)| *ops < MIN_OPS_PER_SESSION)
+        .map(|(session, ops)| format!("sustained-sess-{session}={ops}"))
+        .collect::<Vec<_>>();
     assert!(
-        total_ops >= min_ops,
-        "sustained-rate stress completed only {total_ops} ops across {SESSIONS} \
-         sessions in {duration_secs}s (expected >= {min_ops}). \
-         Either the harness is broken or perf regressed catastrophically."
+        stalled.is_empty(),
+        "sustained-rate stress did not make repeated progress in every session \
+         over {duration_secs}s (expected >= {MIN_OPS_PER_SESSION} each): {}",
+        stalled.join(", ")
     );
-    println!("sustained stress: {total_ops} ops in {duration_secs}s ({SESSIONS} sessions)");
+    println!("sustained stress: {total_ops} ops in {duration_secs}s: {ops_by_session:?}");
 }
 
 // ────────────────────────────────────────────────────────────────────────────

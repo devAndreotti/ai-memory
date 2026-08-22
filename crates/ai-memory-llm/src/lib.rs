@@ -26,6 +26,16 @@
 //!   otherwise parse the first balanced `{…}` from the text body.
 //!   No tenacity-style 8-128s backoff (cognee #2840 lesson).
 
+/// Default per-request timeout applied by every chat provider.
+///
+/// 300s tolerates Ollama / llama-swap cold-loading a 30B+ model from disk
+/// on first request. Once `OLLAMA_KEEP_ALIVE` keeps it warm, subsequent
+/// requests return in seconds — but the first one after the model unloaded
+/// needs the headroom. Slow hosted gateways that stream long completions
+/// may need more; operators override it with `AI_MEMORY_LLM_TIMEOUT_SECS`
+/// (read once by `Config::load`, applied to every chat provider).
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;
@@ -41,10 +51,12 @@ pub mod openai_compat;
 pub mod openai_oauth;
 pub mod opencode;
 pub mod provider;
+pub mod reranker;
 pub mod types;
 
 mod auth_file;
 mod response;
+mod stored_token;
 mod text;
 
 pub use anthropic::AnthropicProvider;
@@ -54,11 +66,13 @@ pub use copilot::{
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,
     GITHUB_DEVICE_CODE_URL,
 };
-pub use embedding::{Embedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine};
+pub use embedding::{
+    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
+};
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
-    default_embedding_dim,
+    default_embedding_dim, try_default_embedding_dim,
 };
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
@@ -66,15 +80,19 @@ pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
 pub use oidc::{
-    DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcToken, OidcTokenResponse,
-    PollOutcome, discover, poll_token_once, refresh_access_token, request_device_code,
+    DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
+    OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
+    request_device_code,
 };
 pub use openai::OpenAiProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use openai_oauth::{
     CODEX_CLIENT_ID, CODEX_RESPONSES_URL, OPENAI_OAUTH_AUTH_URL, OPENAI_OAUTH_ISSUER,
-    OPENAI_OAUTH_TOKEN_URL, OpenAiOAuthProvider, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
+    OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
+    OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
 pub use provider::{LlmProvider, complete_structured};
+pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
+pub use stored_token::StoredOAuthToken;
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};

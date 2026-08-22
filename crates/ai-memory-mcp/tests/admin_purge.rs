@@ -6,10 +6,10 @@
 
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post as route_post;
 use serde_json::json;
+use std::path::Path;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -46,6 +47,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
         db_path,
     };
     (state, store)
@@ -133,23 +135,27 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         for i in 0..3u8 {
             store
                 .writer
-                .insert_observation(NewObservation {
-                    session_id: sid,
-                    workspace_id: ws,
-                    project_id: proj,
-                    kind: ObservationKind::UserPrompt,
-                    extension: None,
-                    source_event: None,
-                    title: format!("{label} obs {i}"),
-                    body: "body".into(),
-                    importance: 5,
-                })
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id: sid,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: format!("{label} obs {i}"),
+                        body: "body".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
                 .await
                 .unwrap();
         }
@@ -168,6 +174,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    owner_user: None,
                 })
                 .await
                 .unwrap();
@@ -306,6 +313,74 @@ async fn purge_project_deletes_data_and_files() {
     );
 }
 
+#[tokio::test]
+async fn purge_project_removes_raw_workstream_segments() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let (workspace_id, _keep, project_id) = seed_two_projects(&store, &state.wiki).await;
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id,
+            project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .cancel_managed_run(prepared.run_id)
+            .await
+            .unwrap()
+    );
+    let raw_dir = tmp
+        .path()
+        .join("raw/workstreams")
+        .join(prepared.workstream_id.to_string());
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::write(raw_dir.join("000001.jsonl"), "event\n").unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    assert!(
+        !raw_dir.exists(),
+        "raw workstream directory must be removed"
+    );
+    assert_eq!(body["workstreams_deleted"], 1);
+    assert_eq!(body["managed_runs_deleted"], 1);
+    assert_eq!(
+        body["workstream_ids"],
+        json!([prepared.workstream_id.to_string()])
+    );
+    let raw_suffix = Path::new("raw")
+        .join("workstreams")
+        .join(prepared.workstream_id.to_string());
+    assert!(
+        body["files_deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.as_str())
+            .any(|path| Path::new(path).ends_with(&raw_suffix)),
+        "raw cleanup must be visible in the report: {body}"
+    );
+}
+
 /// A reject-policy purge webhook must be able to abort before DB rows or files
 /// are deleted. This guards the destructive-operation ordering.
 #[tokio::test]
@@ -354,6 +429,7 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
 
     let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
@@ -455,6 +531,7 @@ async fn purge_project_idempotent_second_call_is_404() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
 
     seed_two_projects(&store, &state_a.wiki).await;

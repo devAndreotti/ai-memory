@@ -10,15 +10,49 @@
 //! `AI_MEMORY_AUTH_TOKEN` exactly once; this module consumes those values
 //! and can fall back to the stored OIDC device-flow token used by native hooks.
 
+use std::fmt;
 use std::io::{BufWriter, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::commands::serve::normalize_prefix;
 use crate::config::{Config, DEFAULT_SERVER_URL};
+use ai_memory_web::normalize_prefix;
+
+/// Non-success response returned by the configured ai-memory server.
+#[derive(Debug)]
+pub(crate) struct ServerResponseError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl ServerResponseError {
+    #[must_use]
+    pub(crate) const fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+impl fmt::Display for ServerResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "server returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for ServerResponseError {}
+
+fn server_response_error(status: reqwest::StatusCode, body: String) -> anyhow::Error {
+    ServerResponseError { status, body }.into()
+}
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
@@ -128,6 +162,21 @@ impl ServerEndpoint {
         format!("{}{}{path}", self.url, self.base_path)
     }
 
+    /// Stable, credential-free identity for client-local state tied to this
+    /// server. The normalized mount path is part of the identity; bearer
+    /// material deliberately is not.
+    pub(crate) fn identity(&self) -> String {
+        let raw = format!("{}{}", self.url.trim_end_matches('/'), self.base_path);
+        let Ok(mut parsed) = reqwest::Url::parse(&raw) else {
+            return "<invalid-server-url>".to_owned();
+        };
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        parsed.as_str().trim_end_matches('/').to_owned()
+    }
+
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_token {
@@ -181,7 +230,7 @@ pub async fn get_json<T: DeserializeOwned>(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
+        return Err(server_response_error(status, body));
     }
     resp.json::<T>()
         .await
@@ -198,6 +247,44 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     body: &B,
 ) -> Result<T> {
     post_json_with_query(endpoint, path, &[], body).await
+}
+
+/// POST JSON and require a successful response without decoding its body.
+pub async fn post_json_no_content<B: Serialize>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.post(&url).json(body));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(server_response_error(status, body));
+    }
+    Ok(())
+}
+
+/// POST an empty body and require a successful response.
+pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.post(&url));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(server_response_error(status, body));
+    }
+    Ok(())
 }
 
 /// POST JSON body to `<endpoint>{path}` with URL-encoded query params.
@@ -221,7 +308,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
+        return Err(server_response_error(status, body));
     }
     resp.json::<T>()
         .await
@@ -311,9 +398,9 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
+        return Err(server_response_error(status, body));
     }
-    let file = std::fs::File::create(dest)
+    let file = private_output_file(dest)
         .with_context(|| format!("creating output file {}", dest.display()))?;
     let mut writer = BufWriter::new(file);
     let mut written = 0_u64;
@@ -333,9 +420,34 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     Ok(written)
 }
 
+/// Open a downloaded backup output file with private permissions before the
+/// first response bytes are written. Existing user-selected output files keep
+/// their existing permissions when overwritten.
+fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_backup_output_is_private_when_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        private_output_file(&output).unwrap();
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     // ----------------------------------------------------------------
     // ServerEndpoint::from_pair
@@ -376,6 +488,22 @@ mod tests {
     fn from_pair_non_empty_token_preserved() {
         let ep = ServerEndpoint::from_pair(None, Some("secret".to_string()));
         assert_eq!(ep.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn client_state_identity_normalizes_mounts_and_never_contains_credentials() {
+        let first = ServerEndpoint::from_pair(
+            Some("http://alice:secret@MEMORY.example:49374/wiki/".to_owned()),
+            None,
+        );
+        let second = ServerEndpoint::from_pair(
+            Some("http://memory.example:49374/wiki".to_owned()),
+            Some("bearer-secret".to_owned()),
+        );
+
+        assert_eq!(first.identity(), second.identity());
+        assert!(!first.identity().contains("alice"));
+        assert!(!first.identity().contains("secret"));
     }
 
     // ----------------------------------------------------------------
@@ -586,9 +714,11 @@ mod tests {
             access: secrecy::SecretString::from("oidc-access".to_string()),
             refresh: secrecy::SecretString::from("refresh-token".to_string()),
             expires_at_ms: u64::MAX,
-            issuer: "https://issuer.example.com/realms/team".to_string(),
-            client_id: "ai-memory-cli".to_string(),
-            token_endpoint: "https://issuer.example.com/token".to_string(),
+            extra: ai_memory_llm::OidcExtras {
+                issuer: "https://issuer.example.com/realms/team".to_string(),
+                client_id: "ai-memory-cli".to_string(),
+                token_endpoint: "https://issuer.example.com/token".to_string(),
+            },
         }
         .save(&config.oidc_device_token_path())
         .expect("save test OIDC token");

@@ -43,7 +43,7 @@ cp docker/docker-compose.prod.yml.example docker/docker-compose.prod.yml
 $EDITOR docker/docker-compose.prod.yml   # set the image tag + adjust ports if needed
 
 cp docker/.env.production.example docker/.env.production
-$EDITOR docker/.env.production        # fill API keys; pick LLM provider + model
+$EDITOR docker/.env.production        # fill credentials; pick an LLM provider (model override optional)
 
 # 2. Create the deploy dir on the homelab. Source bin/deploy.env so
 #    SERVER/DEPLOY_DIR are exported in this shell.
@@ -99,9 +99,9 @@ curl -sI http://homelab:49374/handoff \
 
 **Then update every MCP client** to send the same token. `ai-memory
 install-mcp --client <name> --auth-token <token>` prints the exact
-snippet per client (Claude Code, Codex, OpenCode, Cursor, Claude
-Desktop, Gemini CLI, OpenClaw, OMP / Oh My Pi, Antigravity CLI). The agent CLI sends an
-`Authorization: Bearer <token>` header on every call; ai-memory's
+snippet for every client in the [README Support Matrix](../README.md#support-matrix);
+run `ai-memory install-mcp --help` for the current accepted values. The agent
+CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
@@ -162,7 +162,7 @@ alternatives:
 | openai | `gpt-5.4-mini` | ~$0.002 | Cheaper, faster alternative. Decent quality. |
 | openai-oauth | `gpt-5.5` | ChatGPT subscription | ChatGPT/Codex backend. Run `docker exec -it ai-memory ai-memory auth login openai-oauth` on the server host so `<data_dir>/auth.json` lands in the mounted data volume. |
 | copilot | `gpt-5.5` | GitHub Copilot subscription | GitHub Copilot Chat backend. Run `docker exec -it ai-memory ai-memory auth login copilot` on the server host or set `COPILOT_GITHUB_TOKEN`. |
-| gemini | `gemini-2.5-flash` | free tier covers personal use | Google hosted, native `responseSchema` structured output. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| gemini | `gemini-3.5-flash` | free tier covers personal use | Google hosted, native `responseSchema` structured output. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | openai-compat (Ollama) | `qwen3:32b` | $0 | Self-hosted. Set `AI_MEMORY_LLM_BASE_URL=http://host.docker.internal:11434/v1`. Quality depends on the model. |
 
 > **What we don't recommend:** reasoning-mode models (Kimi-K2.6 in reasoning mode,
@@ -174,11 +174,17 @@ alternatives:
 ai-memory's hosted OpenAI-family providers use `json_schema` strict mode for
 structured output. The OpenAI provider normalizes schemars output into
 OpenAI's supported subset (`additionalProperties: false`, complete `required`,
-generated enum `anyOf`, and plain `$ref` nodes). For `openai-compat` local or
-gateway endpoints, the tolerant parser stays the default; set
-`AI_MEMORY_LLM_COMPAT_STRICT=true` only after confirming the endpoint honours
-OpenAI-style `response_format=json_schema`. If you switch to a niche local
-model, run a quick `ai-memory llm-test` before trusting it.
+generated enum `anyOf`, and plain `$ref` nodes). `openai-compat` local and
+gateway endpoints use the same schema-constrained request by default, with a
+tolerant fallback for explicit capability rejection or malformed output. Set
+`AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint. If you switch
+to a niche local model, run a quick `ai-memory llm-test` before trusting it.
+
+Every chat provider bounds each HTTP request at 300 seconds. Slow hosted
+gateways (observed with free aggregator tiers) can stream a long completion
+past that ceiling and fail every request with `http: error sending request`;
+raise `AI_MEMORY_LLM_TIMEOUT_SECS` in the container environment to match the
+gateway's worst-case generation time.
 
 ## Backups
 
@@ -189,7 +195,7 @@ The data dir is whatever you mounted in `docker-compose.prod.yml`
 data/
 ├── wiki/    # markdown — back up with rsync or git push to a remote
 ├── raw/    # immutable session log archive
-├── db/     # memory.sqlite (FTS5 + page_embeddings)
+├── db/     # memory.sqlite (FTS5 + entities + page_embeddings)
 ├── logs/   # daily rolling tracing
 └── models/ # reserved for future local embedders
 ```
@@ -247,6 +253,30 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   every project in the workspace, or add `--project <name>` to scope
   the rebuild. Scheduled embedding backfill can also fill missing
   rows when enabled.
+- **Capture looks delayed, or observations are missing**: `ai-memory
+  status` reports local hook-spool health — how many events are queued
+  client-side, the age of the oldest one, and the total failed-delivery
+  attempts:
+
+  ```
+    spool:
+      pending:    2
+      oldest:     15m 0s
+      retries:    4
+  ```
+
+  A non-empty spool with an aging oldest entry means hooks are reaching
+  the local queue but not the server; events are not lost, they drain
+  once it is reachable. `pending: 0` means capture is keeping up.
+
+  The spool is **client-side**, so this section reflects the machine you
+  run the command on, not the server — it is the local data dir even when
+  `AI_MEMORY_SERVER_URL` points at a homelab. It is also printed when the
+  server cannot be reached at all (to stderr, so `--json` consumers still
+  get a single object on stdout), which is precisely when a backlog is
+  worth seeing. `--json` carries the same numbers under a `spool` object
+  (`pending`, `oldest_age_ms`, `retries_total`).
+
 - **Provider failures**: `ai-memory status` reports passive LLM and
   embedding health from the last real provider call. A fresh process
   reports `unknown` until the server actually uses that role; it does

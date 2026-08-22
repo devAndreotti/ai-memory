@@ -38,6 +38,8 @@ fn new_page(
         pinned: false,
         links: Vec::new(),
         author_id: None,
+        expires_at: None,
+        entities: Vec::new(),
     }
 }
 
@@ -621,6 +623,8 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();
@@ -640,6 +644,8 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();
@@ -1066,6 +1072,355 @@ async fn api_recent_and_briefing_return_project_data() {
     assert_eq!(json["recent_pages"][0]["path"], "foo.md");
 }
 
+/// Seed one session in `(ws, proj)` with `(kind, title, body)` rows, ended
+/// when `completed`. Returns the session id.
+async fn seed_session(
+    store: &Store,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+    completed: bool,
+    rows: &[(ai_memory_core::ObservationKind, &str, &str)],
+) -> ai_memory_core::SessionId {
+    let session_id = ai_memory_core::SessionId::new();
+    store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::OpenCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    for (kind, title, body) in rows {
+        store
+            .writer
+            .insert_observation(ai_memory_core::Sanitized::new(
+                ai_memory_core::NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: *kind,
+                    extension: None,
+                    source_event: None,
+                    title: (*title).to_owned(),
+                    body: (*body).to_owned(),
+                    importance: 5,
+                },
+                &ai_memory_core::Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+    }
+    if completed {
+        store.writer.end_session(session_id, None).await.unwrap();
+    }
+    session_id
+}
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn api_sessions_lists_completed_sessions_for_the_scope() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let completed = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[(ObservationKind::UserPrompt, "done", "completed work")],
+    )
+    .await;
+    let open = seed_session(
+        &store,
+        ws,
+        proj,
+        false,
+        &[(ObservationKind::UserPrompt, "live", "still running")],
+    )
+    .await;
+    seed_session(
+        &store,
+        ws,
+        other,
+        true,
+        &[(ObservationKind::UserPrompt, "elsewhere", "other project")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let json = json_body(resp).await;
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "open and other-project sessions are hidden"
+    );
+    assert_eq!(sessions[0]["session_id"], completed.to_string());
+    assert_eq!(sessions[0]["observation_count"], 1);
+    assert!(sessions[0]["ended_at"].is_string());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions?include_open=true&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "limit=1 must cap the list");
+    assert_eq!(
+        sessions[0]["session_id"],
+        open.to_string(),
+        "newest first, and include_open surfaces the open one"
+    );
+}
+
+#[tokio::test]
+async fn api_session_observations_pages_orders_and_caps() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let long_body = "x".repeat(1_000);
+    let session_id = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[
+            (ObservationKind::UserPrompt, "first", "one quokka"),
+            (ObservationKind::PostToolUse, "second", long_body.as_str()),
+            (ObservationKind::Stop, "third", "three"),
+        ],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let base = format!("/workspaces/default/projects/scratch/sessions/{session_id}/observations");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?limit=2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let json = json_body(resp).await;
+    assert_eq!(json["session"]["session_id"], session_id.to_string());
+    assert_eq!(json["total"], 3);
+    assert_eq!(json["limit"], 2);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["order"], "asc");
+    assert_eq!(json["elided_other_scope"], 0);
+    assert_eq!(json["body_max_chars"], 4000);
+    let titles: Vec<&str> = json["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["first", "second"]);
+    assert_eq!(json["observations"][1]["body"], long_body);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{base}?order=desc&kinds=post-tool-use,stop&body_max_chars=50"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["order"], "desc");
+    assert_eq!(json["total"], 2);
+    assert_eq!(json["body_max_chars"], 200, "cap clamps up to the floor");
+    let titles: Vec<&str> = json["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["third", "second"]);
+    let body = json["observations"][1]["body"].as_str().unwrap();
+    assert!(body.starts_with(&"x".repeat(200)));
+    assert!(
+        body.ends_with("[body truncated; 800 chars omitted]"),
+        "got {body}"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?q=quokka"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["observations"][0]["title"], "first");
+}
+
+#[tokio::test]
+async fn api_session_routes_return_404_for_missing_project_and_foreign_session() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let foreign = seed_session(
+        &store,
+        ws,
+        other,
+        true,
+        &[(ObservationKind::UserPrompt, "hidden", "in other")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for uri in [
+        "/workspaces/default/projects/missing/sessions".to_owned(),
+        format!("/workspaces/default/projects/missing/sessions/{foreign}/observations"),
+        format!("/workspaces/default/projects/scratch/sessions/{foreign}/observations"),
+        format!(
+            "/workspaces/default/projects/scratch/sessions/{}/observations",
+            ai_memory_core::SessionId::new()
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn api_session_observations_reject_bad_params() {
+    use ai_memory_core::ObservationKind;
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let session_id = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[(ObservationKind::UserPrompt, "p", "b")],
+    )
+    .await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let base = format!("/workspaces/default/projects/scratch/sessions/{session_id}/observations");
+    for (uri, needle) in [
+        (
+            "/workspaces/default/projects/scratch/sessions/not-a-uuid/observations".to_owned(),
+            "invalid session id",
+        ),
+        (
+            format!("{base}?kinds=user-prompt,bogus"),
+            "unknown observation kind",
+        ),
+        (format!("{base}?order=sideways"), "unknown order"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let json = json_body(resp).await;
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains(needle), "{uri}: got {msg}");
+    }
+}
+
 #[tokio::test]
 async fn api_workspace_overview_returns_aggregated_overview() {
     let (_tmp, store, wiki) = setup().await;
@@ -1233,6 +1588,7 @@ async fn api_workspace_overview_includes_open_handoff() {
             open_questions: vec!["open_question_marker".into()],
             next_steps: vec!["next_step_marker".into()],
             files_touched: vec![],
+            owner_user: None,
         })
         .await
         .unwrap();
@@ -1303,6 +1659,7 @@ async fn api_project_overview_aggregates_handoff_briefing_health() {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         })
         .await
         .unwrap();
@@ -1335,6 +1692,561 @@ async fn api_project_overview_aggregates_handoff_briefing_health() {
         vec!["alpha.md"],
         "scoped to scratch only: {json}"
     );
+}
+
+/// Replay the extensions `require_bearer` injects, so a test can build the
+/// request the way a real server hands it to the handler: `actor` is the
+/// identity the middleware resolved (`None` = a caller the server cannot name)
+/// and `auth` is the tier (`None` = the API mounted with no auth layer).
+fn api_req(
+    uri: &str,
+    actor: Option<&str>,
+    auth: Option<ai_memory_core::AuthLevel>,
+) -> Request<Body> {
+    api_req_actor(
+        uri,
+        actor.map(|user| ai_memory_core::ActorContext {
+            user: Some(user.to_owned()),
+            ..ai_memory_core::ActorContext::default()
+        }),
+        auth,
+    )
+}
+
+/// Same, for a rung whose identity is not a plain username — the proxy that
+/// asserts a complete OIDC issuer/subject pair.
+fn api_req_actor(
+    uri: &str,
+    actor: Option<ai_memory_core::ActorContext>,
+    auth: Option<ai_memory_core::AuthLevel>,
+) -> Request<Body> {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(actor) = actor {
+        builder = builder.extension(actor);
+    }
+    if let Some(level) = auth {
+        builder = builder.extension(level);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// Owners are stored as the contract's qualified storage keys, so the fixtures
+/// stamp them through `owner_stamp` rather than hand-writing the TEXT.
+fn handoff_for(
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+    summary: &str,
+    owner: Option<&ai_memory_core::IdentityKey>,
+) -> NewHandoff {
+    NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: None,
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        cwd: Some("/tmp/scratch".into()),
+        summary: summary.into(),
+        open_questions: vec![format!("{summary}_question")],
+        next_steps: vec![format!("{summary}_step")],
+        files_touched: vec!["alpha.md".into()],
+        owner_user: ai_memory_core::owner_stamp(owner, true),
+    }
+}
+
+fn user_key(name: &str) -> ai_memory_core::IdentityKey {
+    ai_memory_core::IdentityKey::User(name.into())
+}
+
+fn sub_key(sub: &str) -> ai_memory_core::IdentityKey {
+    ai_memory_core::IdentityKey::Subject {
+        issuer: "https://idp.example".into(),
+        subject: sub.into(),
+    }
+}
+
+/// The OIDC proxy rung, end to end through the browser's own endpoint.
+///
+/// An ingress that terminates OIDC and forwards the issuer/subject pair resolves
+/// to `AuthLevel::User` with `actor.user = None`. Keying ownership on `.user`
+/// made that caller `OwnerFilter::Unattributed`, which drops their own owned
+/// rows from the listing entirely AND trips the redaction gate on the shared
+/// ones — so on an OIDC-proxy deployment every operator lost every handoff body
+/// in the web UI, including their own.
+#[tokio::test]
+async fn api_handoff_listing_serves_an_oidc_proxy_caller_their_own_rows() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // Their own row, a colleague's, and a legacy unowned one.
+    for (summary, owner) in [
+        ("mine_handoff_marker", Some(sub_key("oidc-subject-alice"))),
+        ("theirs_handoff_marker", Some(sub_key("oidc-subject-bob"))),
+        ("shared_handoff_marker", None),
+    ] {
+        store
+            .writer
+            .insert_handoff(handoff_for(ws, proj, summary, owner.as_ref()))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req_actor(
+            "/workspaces/default/projects/scratch/handoffs",
+            Some(ai_memory_core::ActorContext {
+                issuer: Some("https://idp.example".into()),
+                sub: Some("oidc-subject-alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            }),
+            Some(ai_memory_core::AuthLevel::User),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    let json: Value = serde_json::from_str(&text).unwrap();
+    let entries = json["handoffs"].as_array().unwrap();
+
+    let summaries: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e["summary"].as_str())
+        .collect();
+    assert!(
+        summaries.contains(&"mine_handoff_marker"),
+        "the proxied operator cannot read the body of their own handoff: {text}",
+    );
+    assert!(
+        summaries.contains(&"shared_handoff_marker"),
+        "a legacy unowned handoff must stay readable by everyone: {text}",
+    );
+    assert!(
+        entries.iter().all(|e| e["redacted"] == false),
+        "a caller the server can name must not be redacted: {text}",
+    );
+    // …and naming them did not widen anything: the colleague's row is neither
+    // listed nor leaked.
+    assert!(
+        !text.contains("theirs_handoff_marker"),
+        "another operator's handoff reached this caller: {text}",
+    );
+}
+
+#[tokio::test]
+async fn api_handoff_all_owners_is_root_only_and_returns_every_owner() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (summary, owner) in [
+        ("alice_all_marker", Some(user_key("alice"))),
+        ("bob_all_marker", Some(user_key("bob"))),
+        ("shared_all_marker", None),
+    ] {
+        store
+            .writer
+            .insert_handoff(handoff_for(ws, proj, summary, owner.as_ref()))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for (actor, auth) in [
+        (
+            Some(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            }),
+            Some(ai_memory_core::AuthLevel::User),
+        ),
+        (None, Some(ai_memory_core::AuthLevel::Anonymous)),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(api_req_actor(
+                "/workspaces/default/projects/scratch/handoffs?all_owners=true",
+                actor,
+                auth,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("all_owners requires root authorization"));
+        assert!(!text.contains("alice_all_marker"));
+        assert!(!text.contains("bob_all_marker"));
+    }
+
+    let resp = app
+        .oneshot(api_req_actor(
+            "/workspaces/default/projects/scratch/handoffs?all_owners=true",
+            None,
+            Some(ai_memory_core::AuthLevel::Root),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for marker in ["alice_all_marker", "bob_all_marker", "shared_all_marker"] {
+        assert!(
+            text.contains(marker),
+            "root listing omitted {marker}: {text}"
+        );
+    }
+}
+
+/// With `[auth].root_username` set every automatic handoff carries an owner, so
+/// the card must use the caller's filter — otherwise it serialises `null` while
+/// `pending_handoff_count` beside it, which does apply that filter, reports 1.
+#[tokio::test]
+async fn api_workspace_overview_card_agrees_with_pending_count_for_owner() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(handoff_for(
+            ws,
+            proj,
+            "owned_handoff_marker",
+            Some(&user_key("alice")),
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req(
+            "/workspaces/default/overview",
+            Some("alice"),
+            Some(ai_memory_core::AuthLevel::Root),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["briefing"]["pending_handoff_count"], 1);
+    assert_eq!(
+        json["handoff"]["summary"], "owned_handoff_marker",
+        "card must show the same handoff the count advertises: {json}"
+    );
+}
+
+/// The other half of the same invariant: a browser the server cannot name still
+/// sees neither the owned card nor a count promising one.
+#[tokio::test]
+async fn api_workspace_overview_hides_owned_handoff_from_unnamed_caller() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(handoff_for(
+            ws,
+            proj,
+            "owned_handoff_marker",
+            Some(&user_key("alice")),
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req("/workspaces/default/overview", None, None))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json["handoff"].is_null(), "expected no card: {json}");
+    assert_eq!(json["briefing"]["pending_handoff_count"], 0);
+}
+
+/// Default config — no `[auth]` at all — behaves exactly as it did: the whole
+/// wiki is open, so the listing carries its prompt-derived body, and a legacy
+/// handoff with no owner stays visible.
+#[tokio::test]
+async fn api_handoff_listing_serves_body_when_auth_is_off() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(handoff_for(ws, proj, "shared_handoff_marker", None))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req(
+            "/workspaces/default/projects/scratch/handoffs",
+            None,
+            Some(ai_memory_core::AuthLevel::Anonymous),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    let entry = &json["handoffs"][0];
+    assert_eq!(entry["summary"], "shared_handoff_marker");
+    assert_eq!(entry["open_questions"][0], "shared_handoff_marker_question");
+    assert_eq!(entry["next_steps"][0], "shared_handoff_marker_step");
+    assert_eq!(entry["redacted"], false);
+}
+
+/// On a server that DOES authenticate, a caller it can neither name nor place
+/// as root gets the metadata — that is what makes the listing useful — but not
+/// the text an automatic handoff synthesises from the operator's prompts.
+///
+/// No rung of `require_bearer` actually produces this pair: the DB-user rung
+/// fills `user` from the row, and the proxy downgrade only reaches
+/// `AuthLevel::User` when the proxy asserted `user` **or** `sub` — both of which
+/// `ActorContext::identity_key` resolves, so those callers get `OwnerFilter::
+/// User(_)` and the body. What this pins is the gate's own floor: whatever
+/// hands the handler a tier below root without an identity — a future rung, or
+/// a mount that injects a level and no actor — gets the fail-safe answer. Do
+/// not weaken the arm on the grounds that nothing reaches it.
+#[tokio::test]
+async fn api_handoff_listing_withholds_body_from_unnamed_nonroot_caller() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(handoff_for(ws, proj, "shared_handoff_marker", None))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req(
+            "/workspaces/default/projects/scratch/handoffs",
+            None,
+            Some(ai_memory_core::AuthLevel::User),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    let json: Value = serde_json::from_str(&text).unwrap();
+
+    let entry = &json["handoffs"][0];
+    // Metadata: still there, and the row itself is still listed — a legacy
+    // unowned handoff stays visible to everyone.
+    assert_eq!(entry["state"], "open");
+    assert_eq!(entry["agent"], "claude-code");
+    assert_eq!(entry["cwd"], "/tmp/scratch");
+    assert_eq!(entry["files_touched"][0], "alpha.md");
+    assert_eq!(entry["redacted"], true);
+    // Body: gone, and nowhere else in the payload either.
+    assert!(entry.get("summary").is_none(), "summary served: {text}");
+    assert!(entry.get("open_questions").is_none());
+    assert!(entry.get("next_steps").is_none());
+    assert!(
+        !text.contains("shared_handoff_marker"),
+        "prompt-derived text leaked: {text}"
+    );
+}
+
+/// The commonest authenticated deployment: `[auth].bearer_token` set,
+/// `[auth].root_username` left out. Handoffs carry no owner and the operator's
+/// own browser authenticates as root without a name, so a gate that asked only
+/// for a name redacted the operator's data from the operator — while the
+/// overview card next to it served the same three fields ungated.
+#[tokio::test]
+async fn api_handoff_listing_serves_body_to_root_without_root_username() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(handoff_for(ws, proj, "shared_handoff_marker", None))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req(
+            "/workspaces/default/projects/scratch/handoffs",
+            None,
+            Some(ai_memory_core::AuthLevel::Root),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    let json: Value = serde_json::from_str(&text).unwrap();
+
+    let entry = &json["handoffs"][0];
+    assert_eq!(
+        entry["redacted"], false,
+        "root redacted from itself: {text}"
+    );
+    assert_eq!(entry["summary"], "shared_handoff_marker");
+    assert_eq!(entry["open_questions"][0], "shared_handoff_marker_question");
+    assert_eq!(entry["next_steps"][0], "shared_handoff_marker_step");
+
+    // The overview card is the same operator's other view of the same row; the
+    // two endpoints must not disagree about whether it may read it.
+    let overview = api_router(store.reader.clone(), wiki.clone())
+        .oneshot(api_req(
+            "/workspaces/default/projects/scratch/overview",
+            None,
+            Some(ai_memory_core::AuthLevel::Root),
+        ))
+        .await
+        .unwrap();
+    let overview: Value = serde_json::from_slice(
+        &axum::body::to_bytes(overview.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(overview["handoff"]["summary"], "shared_handoff_marker");
+}
+
+/// A named caller gets their own handoffs in full — and still never sees
+/// somebody else's.
+#[tokio::test]
+async fn api_handoff_listing_serves_body_to_named_caller() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for handoff in [
+        handoff_for(ws, proj, "alice_handoff_marker", Some(&user_key("alice"))),
+        handoff_for(ws, proj, "bob_handoff_marker", Some(&user_key("bob"))),
+        handoff_for(ws, proj, "shared_handoff_marker", None),
+    ] {
+        store.writer.insert_handoff(handoff).await.unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(api_req(
+            "/workspaces/default/projects/scratch/handoffs",
+            Some("alice"),
+            Some(ai_memory_core::AuthLevel::User),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    let json: Value = serde_json::from_str(&text).unwrap();
+
+    let mut summaries: Vec<&str> = json["handoffs"]
+        .as_array()
+        .expect("handoffs")
+        .iter()
+        .map(|e| {
+            assert_eq!(e["redacted"], false, "body withheld from its owner: {text}");
+            e["summary"].as_str().expect("summary")
+        })
+        .collect();
+    summaries.sort_unstable();
+    // Own + shared (absent owner = shared), never bob's.
+    assert_eq!(
+        summaries,
+        vec!["alice_handoff_marker", "shared_handoff_marker"],
+        "{text}"
+    );
+    assert!(!text.contains("bob_handoff_marker"), "{text}");
 }
 
 #[tokio::test]
@@ -1617,6 +2529,50 @@ async fn api_responses_set_cache_control_private() {
         cc.contains("max-age=30"),
         "Cache-Control must be max-age=30 for /workspaces: {cc}"
     );
+}
+
+#[tokio::test]
+async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for uri in [
+        "/workspaces/default/projects/scratch/briefing",
+        "/workspaces/default/overview",
+        "/workspaces/default/projects/scratch/overview",
+        "/workspaces/default/projects/scratch/handoffs",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(api_req_actor(
+                uri,
+                Some(ai_memory_core::ActorContext {
+                    user: Some("alice".into()),
+                    ..ai_memory_core::ActorContext::default()
+                }),
+                Some(ai_memory_core::AuthLevel::User),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let cache = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .expect("actor-scoped responses need Cache-Control")
+            .to_str()
+            .unwrap();
+        assert_eq!(cache, "private, no-store", "{uri}");
+    }
 }
 
 #[tokio::test]

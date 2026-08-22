@@ -8,6 +8,10 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
+//! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
+//! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -20,6 +24,8 @@
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
+//! - `POST /admin/merge-workspace` — fold every project of one workspace into
+//!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
@@ -39,23 +45,26 @@ use std::pin::Pin;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report, run_lint, run_sweep,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
+    EmbedBackfillCounts, EmbedBackfillOptions, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
+    run_embedding_backfill, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{
-    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
+    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
-    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
+    DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool, RejectAutoImproveProposal,
+    ScopeResolutionError, SkippedProposal, StageAutoImproveRun, StoreError, WriterHandle,
+    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
+use ai_memory_wiki::{
+    AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
+};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -70,8 +79,10 @@ use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
-const EMBEDDING_WRITE_BATCH: usize = 100;
 const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
+
+#[derive(Clone, Copy)]
+struct DecayBreadthWeight(f64);
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -136,6 +147,17 @@ pub struct AdminState {
     /// stale cached pair. `None` when no hook router is attached (stdio /
     /// admin-only tests).
     pub scope_invalidator: Option<ScopeInvalidator>,
+    /// True when a trusted authenticating proxy is configured to assert
+    /// end-user identities (`[auth].actor_proxy_bearer_token`).
+    ///
+    /// Proxy-asserted operators never get a `users` row, so `users_exist()`
+    /// alone answers "does this deployment distinguish operators" with a
+    /// permanent no — and every proxied caller walks through the
+    /// single-operator escape hatch on the `/admin/*` gate. Static config, set
+    /// once at startup; `false` for every deployment that never configures a
+    /// proxy secret, which is what keeps single-operator servers on their
+    /// historical behaviour.
+    pub trusted_proxy_identity: bool,
 }
 
 /// Async hook-router project-cache invalidator installed by the serve command.
@@ -287,6 +309,10 @@ struct AutoImproveStageResponse {
     warnings: Vec<String>,
     rejected_candidates_count: usize,
     proposals: Vec<AutoImproveProposalOutcome>,
+    /// Proposals the reviewer produced but the store did not stage, with the
+    /// reason. Always present (empty on a clean run) so a consumer can tell
+    /// "nothing was dropped" from "this build does not report drops".
+    skipped: Vec<SkippedProposal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +348,9 @@ struct AutoImproveTelemetryReportStageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
     report: AutoImproveTelemetryReport,
 }
 
@@ -350,6 +379,9 @@ struct CuratorStageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
     report: CuratorReport,
 }
 
@@ -478,6 +510,10 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/projects`
+/// - `GET  /admin/open-sessions`
+/// - `GET  /admin/sessions/by-agent`
+/// - `GET  /admin/activity/by-client`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -491,10 +527,17 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
 /// - `POST /admin/move-project`
+/// - `POST /admin/move-session`
+/// - `POST /admin/merge-workspace`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
 /// - user-management routes under `/admin/users*`
 pub fn admin_router(state: AdminState) -> Router {
+    admin_router_with_decay_breadth(state, 0.0)
+}
+
+/// Build the admin router with the optional distinct-reader retention weight.
+pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
@@ -523,6 +566,10 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/open-sessions", get(handle_open_sessions))
+        .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
+        .route("/admin/activity/by-client", get(handle_activity_by_client))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -539,8 +586,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/move-session", post(handle_move_session))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
         .route("/admin/rename-workspace", post(handle_rename_workspace))
+        .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
@@ -561,6 +610,7 @@ pub fn admin_router(state: AdminState) -> Router {
             require_root_for_multiuser_admin,
         ))
         .with_state(state)
+        .layer(axum::Extension(DecayBreadthWeight(breadth_weight)))
 }
 
 async fn require_root_for_multiuser_admin(
@@ -573,7 +623,33 @@ async fn require_root_for_multiuser_admin(
         .get::<ai_memory_core::AuthLevel>()
         .copied()
         .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
-    match level.authorize(Capability::Admin, state.token_pepper.is_some()) {
+    // Read this for every request rather than caching a post-creation flag: a
+    // committed first user immediately closes bootstrap admin access, including
+    // across concurrent requests and without a server restart.
+    //
+    // Same notion of "this deployment distinguishes operators" the MCP admin
+    // gate uses. Keyed on `users_exist()` alone, a trusted-proxy deployment
+    // with no `users` rows would wave a proxy-asserted `AuthLevel::User` caller
+    // through every operational route below — purge, delete-page, backup — and
+    // only `/admin/users*` would survive on its own inner root check.
+    let distinguishes_operators = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::error!(%error, "admin authorization could not determine whether users exist");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "admin authorization unavailable: could not verify user configuration"
+                })),
+            )
+                .into_response();
+        }
+    };
+    match level.authorize(Capability::Admin, distinguishes_operators) {
         Ok(()) => next.run(req).await,
         Err(e) => (
             authz_status(e),
@@ -615,7 +691,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }),
         Err(e) => {
             warn!(error = %e, "backup failed");
@@ -629,7 +705,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 })
         }
     }
@@ -752,6 +828,24 @@ pub struct StatusReport {
     pub providers: ProviderHealthSnapshot,
 }
 
+/// `GET /admin/projects` — the authoritative list of `(workspace, project)`
+/// pairs (with page counts + last-updated), read-only. Useful to any external
+/// consumer that needs the live project inventory: a dashboard, an export, or
+/// a backup/mirror that lays the wiki out as `wiki/<workspace>/<project>/` and
+/// wants to reconcile against it — any directory whose project no longer
+/// appears here is an orphan (e.g. from a delete that bypassed the admission
+/// chain, such as an offline `--data-dir` purge or a direct DB edit) and can
+/// be pruned so the copy reflects the live server.
+async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.reader.list_projects_with_stats().await {
+        Ok(projects) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "projects": projects })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     match state.reader.status_counts().await {
         Ok(counts) => match state.reader.derived_index_status().await {
@@ -775,6 +869,235 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 Json(serde_json::json!({ "error": e.to_string() })),
             ),
         },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// open-sessions
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/open-sessions` — open (not yet ended)
+/// sessions for one scope + agent, newest first. Backs the thin
+/// `ai-memory finalize-session` command, which posts synthetic
+/// session-end hooks for whatever this returns.
+#[derive(Debug, Deserialize)]
+struct OpenSessionsQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Agent kind filter, kebab-case (`codex`, `claude-code`, …).
+    agent: String,
+    /// When true, return every open session; otherwise just the newest.
+    #[serde(default)]
+    all: bool,
+    /// Include sessions belonging to OTHER operators.
+    ///
+    /// Off by default because the caller of this endpoint (`finalize-session`)
+    /// acts destructively on what it returns: it ends the session, synthesises
+    /// a page from its observations and mints a handoff carrying its raw
+    /// prompts. Picking "the newest open session in the scope" across everyone
+    /// would do all of that to a colleague's live session. Sessions with no
+    /// recorded operator stay visible either way, so a single-operator server
+    /// is unaffected.
+    #[serde(default)]
+    all_owners: bool,
+    /// When set, narrow to exactly this session id (still subject to the
+    /// owner filter above) instead of newest-first selection — lets a
+    /// caller that captured its own session id at spawn time finalize
+    /// precisely that session, even when other sessions for the same agent
+    /// are open concurrently in the same project (e.g. multiple terminal
+    /// tabs each running Kiro CLI against one repo).
+    #[serde(default)]
+    session_id: Option<SessionId>,
+}
+
+/// Wire shape for one open session in the `GET /admin/open-sessions`
+/// response.
+#[derive(Debug, Serialize)]
+struct OpenSessionEntry {
+    session_id: String,
+    cwd: Option<String>,
+}
+
+/// Query string for `GET /admin/activity/by-client` — MCP tool-call
+/// counts per client. Server-wide: MCP-only clients (the reason this
+/// exists) are not reliably scoped to one project per call, and the
+/// endpoint mirrors the buffer's own granularity.
+///
+/// `since_days = 0` means the whole history, mirroring
+/// `/admin/sessions/by-agent`.
+#[derive(Debug, Deserialize)]
+struct ActivityByClientQuery {
+    #[serde(default)]
+    since_days: u32,
+}
+
+async fn handle_activity_by_client(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ActivityByClientQuery>,
+) -> impl IntoResponse {
+    let since_day = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+            .div_euclid(US_PER_DAY)
+    });
+    match state.reader.client_activity_since(since_day).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&rows)
+                    .map(|list| serde_json::json!({ "by_client": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_client": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Query string for `GET /admin/sessions/by-agent` — how many sessions each
+/// agent CLI opened in one scope.
+///
+/// `since_days = 0` means "no lower bound": count the project's whole
+/// history rather than an empty window, which is what a dashboard asking for
+/// "all time" wants and what a `u32` cannot express as `None`.
+#[derive(Debug, Deserialize)]
+struct SessionsByAgentQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Inclusive lookback in days; zero means all history.
+    #[serde(default)]
+    since_days: u32,
+    /// Report every operator's sessions instead of just the caller's. Same
+    /// recovery switch the other scoped admin reads expose.
+    #[serde(default)]
+    all_owners: bool,
+}
+
+/// Microseconds in a day, for the `since_days` window.
+const US_PER_DAY: i64 = 86_400_000_000;
+
+async fn handle_sessions_by_agent(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Query(query): Query<SessionsByAgentQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let since_us = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+    });
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
+    let counts: ai_memory_store::StoreResult<Vec<ai_memory_store::AgentSessionCount>> = state
+        .reader
+        .session_counts_by_agent(ws, proj, owner_filter, since_us)
+        .await;
+    match counts {
+        Ok(counts) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&counts)
+                    .map(|list| serde_json::json!({ "by_agent": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_agent": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Parse a kebab-case agent wire string into an [`AgentKind`].
+fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
+}
+
+async fn handle_open_sessions(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Query(query): Query<OpenSessionsQuery>,
+) -> impl IntoResponse {
+    if query.all && query.session_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "all and session_id cannot be combined"
+            })),
+        );
+    }
+    let Some(agent) = parse_agent_kind(&query.agent) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown agent kind: {}", query.agent)
+            })),
+        );
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
+    let sessions = if let Some(session_id) = query.session_id {
+        state
+            .reader
+            .open_session_for_scope_agent_by_id(ws, proj, agent, owner_filter, session_id)
+            .await
+            .map(|session| session.into_iter().collect())
+    } else {
+        let limit = if query.all { None } else { Some(1) };
+        state
+            .reader
+            .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
+            .await
+    };
+    match sessions {
+        Ok(sessions) => {
+            let sessions: Vec<OpenSessionEntry> = sessions
+                .into_iter()
+                .map(|s| OpenSessionEntry {
+                    session_id: s.session_id.to_string(),
+                    cwd: s.cwd,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&sessions)
+                        .map(|list| serde_json::json!({ "sessions": list }))
+                        .unwrap_or_else(|_| serde_json::json!({ "sessions": [] })),
+                ),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -820,7 +1143,7 @@ async fn handle_search(
                 Ok((ws, proj)) => {
                     state
                         .reader
-                        .search_pages_for_project(ws, proj, query.q, limit)
+                        .search_pages_for_project(ws, proj, query.q, limit, None)
                         .await
                 }
                 Err(e) => return e,
@@ -921,7 +1244,7 @@ async fn handle_read_page(
     } else if let Some(q) = query.q {
         let hits = match state
             .reader
-            .search_pages_for_project(ws, proj, q.clone(), 1)
+            .search_pages_for_project(ws, proj, q.clone(), 1, None)
             .await
         {
             Ok(h) => h,
@@ -1312,10 +1635,47 @@ async fn handle_auto_improve(
         run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
             .await
             .map_err(auto_improve_error_response)?;
+    // Whose suggestion this is. It scopes the one-pending-per-target rule
+    // (V42), and is taken from the authenticated actor's qualified identity
+    // key rather than a `users` row, because most identified operators on a
+    // shared server are named by an authenticating proxy and never get one.
+    //
+    // Only where operators are actually told apart, though: on a
+    // single-operator server this call would otherwise stage into bucket
+    // `user:<root_username>` while the scheduler and the report handlers stage
+    // into the unattributed one, leaving two proposals pending for the same
+    // page — the collision V42 promises cannot happen.
+    //
+    // Both halves go through the shared accessors — `identity_key` for "which
+    // human is this", `owner_identity` for "does this deployment name them" —
+    // rather than re-deriving either here. Its `memory_auto_improve` sibling
+    // stages into the same V42 bucket, and a bucket computed two ways is a
+    // bucket that eventually disagrees with itself.
+    let staging_owner = ai_memory_core::owner_identity(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+    );
     let proposals = auto_improve_new_proposals(&state, ws, proj, &report).await?;
-    let staged =
-        stage_auto_improve_report(&state, ws, proj, req.session_id, &cfg, &report, proposals)
-            .await?;
+    let staged = stage_auto_improve_report(
+        &state,
+        AutoImproveStagingScope {
+            ws,
+            proj,
+            session_id: req.session_id,
+            cfg: &cfg,
+            staging_owner,
+        },
+        &report,
+        proposals,
+    )
+    .await?;
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
@@ -1354,6 +1714,10 @@ async fn handle_auto_improve(
                 warnings: report.warnings,
                 rejected_candidates_count: report.rejected_candidates.len(),
                 proposals: outcomes,
+                // Store-level collisions the reviewer's run never staged.
+                // Dropped silently, a run reporting N-1 proposals has nothing
+                // saying the Nth ever existed.
+                skipped: staged.skipped,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -1484,56 +1848,79 @@ struct StagedAutoImproveData {
     run_id: ai_memory_core::AutoImproveRunId,
     proposal_ids: Vec<AutoImproveProposalId>,
     sidecar_paths: Vec<String>,
+    /// Proposals the store refused to stage. Dropping these here would hand the
+    /// operator a run reporting N-1 proposals with nothing saying the Nth
+    /// existed — the silent drop the per-proposal skip was meant to end.
+    skipped: Vec<SkippedProposal>,
+}
+
+/// Everything `stage_auto_improve_report` needs about WHO and WHERE, bundled so
+/// the helper keeps a readable arity.
+struct AutoImproveStagingScope<'a> {
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session_id: SessionId,
+    cfg: &'a AutoImproveReviewConfig,
+    /// Typed operator that staged the run; also scopes the
+    /// one-pending-per-target rule.
+    staging_owner: Option<ai_memory_core::IdentityKey>,
 }
 
 async fn stage_auto_improve_report(
     state: &AdminState,
-    ws: WorkspaceId,
-    proj: ProjectId,
-    session_id: SessionId,
-    cfg: &AutoImproveReviewConfig,
+    scope: AutoImproveStagingScope<'_>,
     report: &ai_memory_consolidate::AutoImproveReport,
     proposals: Vec<NewAutoImproveProposal>,
 ) -> Result<StagedAutoImproveData, (StatusCode, Json<serde_json::Value>)> {
+    let AutoImproveStagingScope {
+        ws,
+        proj,
+        session_id,
+        cfg,
+        staging_owner,
+    } = scope;
     let staged = state
         .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: Some(session_id),
-            provider: Some(report.provider.clone()),
-            model: Some(report.model.clone()),
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::to_value(&report.warnings)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            config_json: serde_json::json!({
-                "min_observations": cfg.min_observations,
-                "min_session_duration_secs": cfg.min_session_duration_secs,
-                "min_confidence": cfg.min_confidence,
-                "max_input_tokens": cfg.max_input_tokens,
-                "max_proposals_per_run": cfg.max_proposals_per_run,
-                "include_raw_fallback": cfg.include_raw_fallback,
-                "max_patchable_pages": cfg.max_patchable_pages,
-                "max_patchable_body_chars": cfg.max_patchable_body_chars,
-                "max_edits_per_proposal": cfg.max_edits_per_proposal,
-                "max_edit_content_chars": cfg.max_edit_content_chars,
-                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
-                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
-                "max_rejection_context": cfg.max_rejection_context,
-                "rejection_context_days": cfg.rejection_context_days,
-                "max_final_body_chars": cfg.max_final_body_chars,
-                "max_rule_page_tokens": cfg.max_rule_page_tokens,
-                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
-                "eval": cfg.eval,
-            }),
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some(cfg.proposal_actor.clone()),
-                ..ai_memory_core::ActorContext::default()
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(session_id),
+                provider: Some(report.provider.clone()),
+                model: Some(report.model.clone()),
+                summary: Some(report.summary.clone()),
+                warnings_json: serde_json::to_value(&report.warnings)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                config_json: serde_json::json!({
+                    "min_observations": cfg.min_observations,
+                    "min_session_duration_secs": cfg.min_session_duration_secs,
+                    "min_confidence": cfg.min_confidence,
+                    "max_input_tokens": cfg.max_input_tokens,
+                    "max_proposals_per_run": cfg.max_proposals_per_run,
+                    "include_raw_fallback": cfg.include_raw_fallback,
+                    "max_patchable_pages": cfg.max_patchable_pages,
+                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                    "max_edit_content_chars": cfg.max_edit_content_chars,
+                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                    "max_rejection_context": cfg.max_rejection_context,
+                    "rejection_context_days": cfg.rejection_context_days,
+                    "max_final_body_chars": cfg.max_final_body_chars,
+                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                    "eval": cfg.eval,
+                }),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some(cfg.proposal_actor.clone()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals,
             },
-            proposals,
-        })
+            staging_owner,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let sidecar_paths = write_auto_improve_sidecars(state, ws, proj, &staged.proposal_ids).await?;
@@ -1541,6 +1928,7 @@ async fn stage_auto_improve_report(
         run_id: staged.run_id,
         proposal_ids: staged.proposal_ids,
         sidecar_paths,
+        skipped: staged.skipped,
     })
 }
 
@@ -1631,7 +2019,8 @@ async fn handle_auto_improve_report(
         let operation = target_operation_for_page(&state, ws, proj, &target).await?;
         let staged = state
             .writer
-            .stage_auto_improve_run(StageAutoImproveRun {
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
                 workspace_id: ws,
                 project_id: proj,
                 session_id: None,
@@ -1667,7 +2056,9 @@ async fn handle_auto_improve_report(
                     patch_json: None,
                     expected_base_body_sha256: None,
                 }],
-            })
+                },
+                None,
+            )
             .await
             .map_err(|e| internal_err(e.to_string()))?;
         let sidecar_paths =
@@ -1683,6 +2074,7 @@ async fn handle_auto_improve_report(
                         .map(ToString::to_string)
                         .collect(),
                     sidecar_paths,
+                    skipped: staged.skipped,
                     report,
                 })
                 .unwrap_or_else(|_| serde_json::json!({})),
@@ -1697,6 +2089,7 @@ async fn handle_auto_improve_report(
 
 async fn handle_curator(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
     Json(req): Json<CuratorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -1720,13 +2113,14 @@ async fn handle_curator(
 
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
     let params = CuratorParams::default();
-    let mut report = run_curator_report(
+    let mut report = run_curator_report_with_breadth(
         &state.reader,
         ws,
         proj,
         &req.workspace,
         &req.project,
         params.clone(),
+        breadth.0,
     )
     .await
     .map_err(|e| internal_err(e.to_string()))?;
@@ -1750,43 +2144,46 @@ async fn handle_curator(
     let operation = target_operation_for_page(&state, ws, proj, &target).await?;
 
     let staged = state
-        .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: None,
-            provider: None,
-            model: None,
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::json!([]),
-            rejected_candidates_json: serde_json::json!([]),
-            config_json: serde_json::json!({
-                "mode": "stage",
-                "curator": true,
-                "params": params,
-            }),
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some("curator".into()),
-                ..ai_memory_core::ActorContext::default()
-            },
-            proposals: vec![NewAutoImproveProposal {
-                operation,
-                target_path: target,
-                kind: "curator_report".into(),
-                title: "Curator Report".into(),
-                confidence: 1.0,
-                rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
-                evidence_json: serde_json::json!({
-                    "summary": report.summary.clone(),
-                    "findings": report.findings.clone(),
-                }),
-                body_markdown,
-                artifact_sha256: None,
-                edit_mode: None,
-                patch_json: None,
-                expected_base_body_sha256: None,
-            }],
-        })
+            .writer
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: None,
+                    provider: None,
+                    model: None,
+                    summary: Some(report.summary.clone()),
+                    warnings_json: serde_json::json!([]),
+                    rejected_candidates_json: serde_json::json!([]),
+                    config_json: serde_json::json!({
+                        "mode": "stage",
+                        "curator": true,
+                        "params": params,
+                    }),
+                    proposal_actor: ai_memory_core::ActorContext {
+                        agent: Some("curator".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    },
+                    proposals: vec![NewAutoImproveProposal {
+                        operation,
+                        target_path: target,
+                        kind: "curator_report".into(),
+                        title: "Curator Report".into(),
+                        confidence: 1.0,
+                        rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
+                        evidence_json: serde_json::json!({
+                            "summary": report.summary.clone(),
+                            "findings": report.findings.clone(),
+                        }),
+                        body_markdown,
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    }],
+                },
+            None,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let sidecar_paths = write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
@@ -1801,6 +2198,7 @@ async fn handle_curator(
                     .map(ToString::to_string)
                     .collect(),
                 sidecar_paths,
+                skipped: staged.skipped,
                 report,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
@@ -1866,7 +2264,7 @@ async fn pending_detail(
     (
         WorkspaceId,
         ProjectId,
-        ai_memory_store::AutoImproveProposalDetail,
+        ai_memory_store::OwnedAutoImproveProposalDetail,
     ),
     (StatusCode, Json<serde_json::Value>),
 > {
@@ -1879,7 +2277,7 @@ async fn pending_detail(
     let (ws, proj) = lookup_ws_proj_no_create(state, &query.workspace, &query.project).await?;
     let detail = state
         .reader
-        .auto_improve_proposal_detail(ws, proj, id)
+        .auto_improve_proposal_detail_with_owner(ws, proj, id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| {
@@ -1911,7 +2309,8 @@ async fn handle_pending_write_diff(
     Query(query): Query<PendingWriteScopeQuery>,
 ) -> impl IntoResponse {
     match pending_detail(&state, &id, &query).await {
-        Ok((ws, proj, detail)) => {
+        Ok((ws, proj, owned)) => {
+            let detail = &owned.detail;
             let before = state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
@@ -2315,8 +2714,11 @@ async fn handle_lint(
         state.llm.as_ref(),
         ws,
         proj,
-        req.dry_run,
-        !req.no_llm,
+        ai_memory_consolidate::LintOptions {
+            dry_run: req.dry_run,
+            use_llm: !req.no_llm,
+            decay_lambda: state.decay_params.lambda,
+        },
     )
     .await
     .map(|report| {
@@ -2348,16 +2750,19 @@ struct ForgetSweepRequest {
 
 async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
     Json(req): Json<ForgetSweepRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep(
+    run_sweep_with_breadth(
         &state.reader,
         &state.writer,
+        Some(&state.wiki),
         ws,
         proj,
         &state.decay_params,
+        breadth.0,
         req.dry_run,
     )
     .await
@@ -2420,23 +2825,6 @@ pub struct EmbedReport {
     pub dim: u32,
 }
 
-#[derive(Default)]
-struct EmbedCounts {
-    embedded: usize,
-    skipped: usize,
-    failed: usize,
-    would_embed: usize,
-}
-
-impl EmbedCounts {
-    fn absorb(&mut self, other: Self) {
-        self.embedded += other.embedded;
-        self.skipped += other.skipped;
-        self.failed += other.failed;
-        self.would_embed += other.would_embed;
-    }
-}
-
 async fn embed_project_pages(
     state: &AdminState,
     embedder: &Arc<dyn Embedder>,
@@ -2444,87 +2832,18 @@ async fn embed_project_pages(
     proj: ProjectId,
     reembed: bool,
     dry_run: bool,
-) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
-    let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
-    let dim = embedder.dim();
-
-    let candidates = state
-        .reader
-        .decay_candidates(ws, proj)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    let already: std::collections::HashSet<_> = if reembed {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .reader
-            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?
-            .into_iter()
-            .collect()
-    };
-
-    let mut counts = EmbedCounts::default();
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-
-    for cand in candidates {
-        if !reembed && already.contains(&cand.id) {
-            counts.skipped += 1;
-            continue;
-        }
-        if dry_run {
-            counts.would_embed += 1;
-            continue;
-        }
-        let md = match state.wiki.read_page(ws, proj, &cand.path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        if md.body.trim().is_empty() {
-            counts.skipped += 1;
-            continue;
-        }
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(
-                &state.writer,
-                &mut pending,
-                &mut counts.embedded,
-                &mut counts.failed,
-            )
-            .await;
-        }
-    }
-    flush_embedding_batch(
+) -> Result<EmbedBackfillCounts, (StatusCode, Json<serde_json::Value>)> {
+    run_embedding_backfill(
+        &state.reader,
         &state.writer,
-        &mut pending,
-        &mut counts.embedded,
-        &mut counts.failed,
+        &state.wiki,
+        embedder,
+        ws,
+        proj,
+        EmbedBackfillOptions { reembed, dry_run },
     )
-    .await;
-
-    Ok(counts)
+    .await
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 async fn handle_embed(
@@ -2547,7 +2866,7 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let mut totals = EmbedCounts::default();
+    let mut totals = EmbedBackfillCounts::default();
 
     if req.all_projects {
         if let Some(ws) = state
@@ -2614,25 +2933,6 @@ async fn handle_embed(
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     ))
-}
-
-async fn flush_embedding_batch(
-    writer: &WriterHandle,
-    pending: &mut Vec<EmbeddingWrite>,
-    embedded: &mut usize,
-    failed: &mut usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
-    let count = batch.len();
-    if let Err(e) = writer.store_embeddings(batch).await {
-        *failed += count;
-        warn!(count, error = %e, "embed: store_embeddings failed");
-    } else {
-        *embedded += count;
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -2843,6 +3143,11 @@ struct PurgeProjectRequest {
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Off by default: the cascade would delete that lease row
+    /// out from under a running agent, which then cannot save its history.
+    #[serde(default)]
+    force: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -2860,6 +3165,13 @@ pub struct PurgeProjectReport {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted.
     pub embeddings_deleted: u64,
+    /// Number of managed `workstreams` rows deleted via cascade.
+    pub workstreams_deleted: u64,
+    /// Number of `managed_runs` rows deleted via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose `raw/workstreams/<id>/` segment
+    /// directories were included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
     /// Paths removed from disk (the project's UUID-namespaced directory).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
@@ -2870,6 +3182,76 @@ pub struct PurgeProjectReport {
     /// Post-purge checkpoint, if the purge changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+}
+
+async fn remove_workstream_segment_storage(
+    state: &AdminState,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let mut deleted = Vec::with_capacity(workstream_ids.len());
+    let mut failed = Vec::new();
+
+    for workstream_id in workstream_ids {
+        let path = state
+            .data_dir
+            .join("raw")
+            .join("workstreams")
+            .join(workstream_id);
+        let path_display = path.display().to_string();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => deleted.push(path_display),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    operation,
+                    path = %path_display,
+                    error = %error,
+                    "scope purge failed to remove workstream segment directory"
+                );
+                failed.push(path_display);
+            }
+        }
+    }
+
+    (deleted, failed)
+}
+
+async fn remove_purged_project_storage(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let project_root = state.wiki.project_root(workspace_id, project_id);
+    let project_root_display = project_root.display().to_string();
+    let mut deleted = Vec::with_capacity(workstream_ids.len() + 1);
+    let mut failed = Vec::new();
+
+    match state
+        .wiki
+        .remove_project_dir(workspace_id, project_id)
+        .await
+    {
+        Ok(()) => deleted.push(project_root_display.clone()),
+        Err(error) => {
+            warn!(
+                operation,
+                path = %project_root_display,
+                error = %error,
+                "project purge failed to remove wiki directory"
+            );
+            failed.push(project_root_display);
+        }
+    }
+
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, workstream_ids, operation).await;
+    deleted.extend(raw_deleted);
+    failed.extend(raw_failed);
+
+    (deleted, failed)
 }
 
 async fn handle_purge_project(
@@ -2930,32 +3312,33 @@ async fn handle_purge_project(
 
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id)
+        .purge_project(ws_id, proj_id, &label, author_id, req.force)
         .await
     {
         Ok(s) => s,
+        // A live managed run is a conflict, not a server fault: the operator
+        // can finish the session or retry with `force`. Same status the
+        // heartbeat itself returns when a lease is gone, so the two agree.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows. Directory removal remains best-effort
-    // and is reported separately, matching the pre-admission purge contract.
-    let proj_root_str = state
-        .wiki
-        .project_root(ws_id, proj_id)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(ws_id, proj_id).await {
-        Ok(()) => {
-            files_deleted.push(proj_root_str);
-        }
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // DB cascade already deleted all rows. Remove both the wiki project root
+    // and every raw managed-workstream segment directory best-effort, reporting
+    // partial failures without disguising the committed database purge.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        &state,
+        ws_id,
+        proj_id,
+        &summary.workstream_ids,
+        "purge-project",
+    )
+    .await;
     // Mirrors that track filesystem reality (a git-push mirror) want to
     // know the on-disk dir is still present even though the DB rows are
     // gone, so they can refuse to drop their own copy in violation of
@@ -2982,6 +3365,9 @@ async fn handle_purge_project(
         observations_deleted: summary.observations_deleted,
         handoffs_deleted: summary.handoffs_deleted,
         embeddings_deleted: summary.embeddings_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -3090,7 +3476,14 @@ pub struct DeleteWorkspaceResult {
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
-    /// Paths removed from disk (the workspace's UUID-namespaced directory).
+    /// Managed `workstreams` rows removed via cascade.
+    pub workstreams_deleted: u64,
+    /// `managed_runs` rows removed via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose raw segment directories were
+    /// included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
+    /// Paths removed from disk (the workspace directory and raw segments).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
@@ -3110,35 +3503,52 @@ async fn handle_delete_workspace(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<DeleteWorkspaceRequest>,
 ) -> impl IntoResponse {
-    let ws_id = match lookup_ws_no_create(&state, &req.workspace).await {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match delete_workspace_core(&state, &req.workspace, req.force, actor).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+        ),
+        Err(resp) => resp,
+    }
+}
 
-    if !req.force {
+/// Delete a workspace and, via cascade, every project/page under it — returning
+/// the summary as data (or the HTTP error a handler surfaces verbatim). Guarded:
+/// refuses a non-empty workspace unless `force`. Shared by
+/// `handle_delete_workspace` and `handle_merge_workspace` (which drains the
+/// source workspace first, then deletes the now-empty shell with `force=false`).
+async fn delete_workspace_core(
+    state: &Arc<AdminState>,
+    workspace: &str,
+    force: bool,
+    actor: ai_memory_core::ActorContext,
+) -> Result<DeleteWorkspaceResult, MoveErr> {
+    let ws_id = lookup_ws_no_create(state, workspace).await?;
+
+    if !force {
         match state
             .reader
-            .list_projects_with_stats_for_workspace(req.workspace.clone())
+            .list_projects_with_stats_for_workspace(workspace.to_string())
             .await
         {
             Ok(projects) if !projects.is_empty() => {
-                return (
+                return Err((
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
                         "error": StoreError::WorkspaceNotEmpty(projects.len() as u64).to_string()
                     })),
-                );
+                ));
             }
             Ok(_) => {}
-            Err(e) => return internal_err(e.to_string()),
+            Err(e) => return Err(internal_err(e.to_string())),
         }
     }
 
-    let actor = actor_ext
-        .map(|axum::Extension(a)| a)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let purge_ctx = AdmissionContext {
-        workspace: req.workspace.clone(),
+        workspace: workspace.to_string(),
         project: String::new(),
         op: AdmissionOp::PurgeWorkspace,
         actor,
@@ -3150,18 +3560,13 @@ async fn handle_delete_workspace(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let pre_checkpoint = match checkpoint_or_500(
-        &state.wiki,
-        format!("pre-delete-workspace {}", req.workspace),
-    ) {
-        Ok(oid) => oid,
-        Err(e) => return e,
-    };
+    let pre_checkpoint =
+        checkpoint_or_500(&state.wiki, format!("pre-delete-workspace {workspace}"))?;
 
-    let summary = match state.writer.delete_workspace(ws_id, req.force).await {
+    let summary = match state.writer.delete_workspace(ws_id, force).await {
         Ok(s) => s,
         Err(e) => {
             let status = match &e {
@@ -3169,7 +3574,7 @@ async fn handle_delete_workspace(
                 StoreError::NotFound(_) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+            return Err((status, Json(serde_json::json!({ "error": e.to_string() }))));
         }
     };
 
@@ -3179,15 +3584,19 @@ async fn handle_delete_workspace(
         .join(ws_id.to_string())
         .display()
         .to_string();
-    let mut files_deleted = Vec::new();
+    let mut files_deleted = Vec::with_capacity(summary.workstream_ids.len() + 1);
     let mut files_failed = Vec::new();
     match state.wiki.remove_workspace_dir(ws_id).await {
         Ok(()) => files_deleted.push(ws_root_str.clone()),
         Err(e) => {
-            warn!(error = %e, workspace = %req.workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
+            warn!(error = %e, workspace = %workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
             files_failed.push(ws_root_str);
         }
     }
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, &summary.workstream_ids, "delete-workspace").await;
+    files_deleted.extend(raw_deleted);
+    files_failed.extend(raw_failed);
 
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -3198,21 +3607,20 @@ async fn handle_delete_workspace(
     state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
 
     state.active_project.clear_workspace(ws_id);
-    invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    invalidate_scope_cache(state, ScopeInvalidation::Workspace(ws_id)).await;
 
-    let result = DeleteWorkspaceResult {
-        workspace: req.workspace.clone(),
+    Ok(DeleteWorkspaceResult {
+        workspace: workspace.to_string(),
         projects_deleted: summary.projects_deleted,
         pages_deleted: summary.pages_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
-        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {}", req.workspace)),
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
-    )
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {workspace}")),
+    })
 }
 
 /// JSON request body for `POST /admin/rename-project`.
@@ -3342,12 +3750,13 @@ struct MoveProjectRequest {
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
     confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409)
+    /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
     /// live session's next observation would carry a stale workspace id.
     /// `force: true` proceeds anyway (still safe: the move republishes the
     /// active pointer and the (workspace_id, project_id) trigger makes any
-    /// stale write fail cleanly rather than corrupt).
+    /// stale write fail cleanly rather than corrupt). It never overrides a
+    /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
@@ -3396,6 +3805,9 @@ pub struct MoveProjectReport {
     /// Number of latest pages copied into the destination (copy-purge) or
     /// re-stamped in place (true-move).
     pub pages_copied: u64,
+    /// Managed workstreams re-stamped in place by a lossless true move.
+    /// Copy-purge reports zero because it does not transfer managed history.
+    pub workstreams_moved: u64,
     /// Source paths whose on-disk file could not be read (copy skipped).
     /// When non-empty the source is NOT purged so a fixed re-run is safe.
     pub pages_skipped: Vec<String>,
@@ -3437,6 +3849,12 @@ pub struct PathConflict {
     pub moved_to: String,
 }
 
+/// An error response from a move: the HTTP status + JSON body a handler would
+/// have returned directly. The move core returns this as the `Err` arm so a
+/// single move can be surfaced verbatim by `handle_move_project` or aggregated
+/// by `handle_merge_workspace`.
+type MoveErr = (StatusCode, Json<serde_json::Value>);
+
 /// Lossless cross-workspace move: under the wiki mutation gate, rename the
 /// project's on-disk dir to the destination workspace, then re-stamp its
 /// `workspace_id` across every domain table (one transaction, same
@@ -3449,7 +3867,7 @@ async fn true_move_project(
     src_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Ensure the destination workspace ROW exists (FK target for the
     // re-stamp) without creating a new project — the existing project_id is
     // what we move.
@@ -3459,7 +3877,7 @@ async fn true_move_project(
         .await
     {
         Ok(ws) => ws,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // A true move targets a FRESH destination, so its dir must not already
@@ -3467,7 +3885,7 @@ async fn true_move_project(
     // exclusive mutation guard before it renames anything.
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3475,7 +3893,7 @@ async fn true_move_project(
                     dst_dir.display()
                 )
             })),
-        );
+        ));
     }
 
     let move_ctx = AdmissionContext {
@@ -3498,20 +3916,20 @@ async fn true_move_project(
     {
         Ok(s) => s,
         Err(WikiError::Store(StoreError::NotFound(msg))) => {
-            return (
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": msg })),
-            );
+            ));
         }
         Err(e @ WikiError::DestinationExists(_)) => {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({ "error": e.to_string() })),
-            );
+            ));
         }
         Err(e) => {
             warn!(error = %e, "true-move: move aborted before completion");
-            return internal_err(format!("move aborted (nothing changed): {e}"));
+            return Err(internal_err(format!("move aborted (nothing changed): {e}")));
         }
     };
 
@@ -3542,6 +3960,7 @@ async fn true_move_project(
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
+        workstreams_moved: summary.workstreams_moved,
         pages_skipped: Vec::new(),
         // Nothing is purged in a true move — the source rows ARE the
         // destination rows, just re-stamped.
@@ -3558,10 +3977,7 @@ async fn true_move_project(
         pre_checkpoint,
         checkpoint,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    Ok(report)
 }
 
 /// Token inserted between the original stem and the source-workspace
@@ -3644,34 +4060,54 @@ async fn handle_move_project(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<MoveProjectRequest>,
 ) -> impl IntoResponse {
+    // Carry the authenticated actor into both legs (move admission + the
+    // source-purge admission) so a scope-guard webhook authorizes by user.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match move_project_core(&state, &req, actor).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// Validate one move request, pick the true-move vs copy-purge path, and
+/// execute it — returning the report as data (or the HTTP error a handler
+/// surfaces verbatim). Shared by `handle_move_project` (one move) and
+/// `handle_merge_workspace` (a move per source project).
+async fn move_project_core(
+    state: &Arc<AdminState>,
+    req: &MoveProjectRequest,
+    actor: ai_memory_core::ActorContext,
+) -> Result<MoveProjectReport, MoveErr> {
     // Destructive: it purges the source after copying. Require confirm.
     if !req.confirm {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "destructive operation requires confirm=true"
             })),
-        );
+        ));
     }
 
     // A same-workspace "move" would get-or-create the SAME project as both
     // source and destination, copy it onto itself, then purge it — data
     // loss. Reject; in-workspace renames go through rename-project.
     if req.from_workspace == req.to_workspace {
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": "from_workspace and to_workspace are identical; use rename-project instead"
             })),
-        );
+        ));
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
     let (src_ws, src_proj) =
-        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
@@ -3679,7 +4115,7 @@ async fn handle_move_project(
     // make it fail, but the operator should consciously opt in). `force: true`
     // proceeds — safe because the move republishes the active pointer below.
     if !req.force && state.active_project.contains_project(src_proj) {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3688,7 +4124,7 @@ async fn handle_move_project(
                     req.from_workspace, req.project
                 )
             })),
-        );
+        ));
     }
 
     // Detect MERGE: does the destination workspace already hold a same-named
@@ -3699,19 +4135,16 @@ async fn handle_move_project(
             Ok(Some(_))
         ),
         Ok(None) => false,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let pre_checkpoint = match checkpoint_or_500(
+    let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
             req.from_workspace, req.project, req.to_workspace, req.project
         ),
-    ) {
-        Ok(oid) => oid,
-        Err(e) => return e,
-    };
+    )?;
 
     // FRESH destination (no same-named project there) → lossless TRUE MOVE.
     // Re-stamp the source project's workspace_id across every domain table in
@@ -3721,27 +4154,18 @@ async fn handle_move_project(
     // admission webhook. The copy+purge path below is reserved for the MERGE
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
-    // Carry the authenticated actor into both legs (move admission + the
-    // source-purge admission) so a scope-guard webhook authorizes by user.
-    let actor = actor_ext
-        .map(|axum::Extension(a)| a)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-
     if !merged_into_existing {
-        return true_move_project(&state, &req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = match create_ws_proj(&state, &req.to_workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
+    let (dst_ws, dst_proj) = create_ws_proj(state, &req.to_workspace, &req.project).await?;
 
     copy_purge_merge(
-        &state,
-        &req,
+        state,
+        req,
         src_ws,
         src_proj,
         dst_ws,
@@ -3750,6 +4174,829 @@ async fn handle_move_project(
         actor,
     )
     .await
+}
+
+// ---------------------------------------------------------------------
+// move-session
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/move-session`.
+///
+/// Two shapes share the route: a single move names `session_id`; a batch
+/// names `from_project` (plus optional `from_workspace`) and moves every
+/// session touching that scope (a `sessions` row there OR observations
+/// stamped into it). Exactly one of the two must be present. A session whose
+/// row already sits in the destination is re-homed: only its rows still
+/// lying elsewhere move (`session_moved: false`).
+#[derive(Deserialize)]
+struct MoveSessionRequest {
+    /// The session to move (single form).
+    #[serde(default)]
+    session_id: Option<SessionId>,
+    /// Source workspace of the batch form. Defaults to `default`.
+    #[serde(default)]
+    from_workspace: Option<String>,
+    /// Source project of the batch form: every session touching it moves.
+    #[serde(default)]
+    from_project: Option<String>,
+    /// Destination workspace. Defaults to the source workspace.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Destination project. Must already exist unless `create` is set.
+    project: String,
+    /// What happens to `sessions/<id>.md`: `move` (default) carries the page
+    /// and its history along; `regenerate` retires it in the source so the
+    /// next consolidation writes a fresh one in the destination.
+    #[serde(default)]
+    pages: PagesMode,
+    /// Without `confirm: true` the server runs the move inside a rolled-back
+    /// transaction and reports what would change (`dry_run: true`).
+    #[serde(default)]
+    confirm: bool,
+    /// Skip the live-session guards: an open session (no session end
+    /// recorded; not applied to a re-home, whose row does not move), a
+    /// `pending`/`running` consolidation job, and, for the batch form, the
+    /// hook router's active-project pointer.
+    #[serde(default)]
+    force: bool,
+    /// Create the destination workspace/project when absent instead of 404.
+    /// A dry run never creates: it reports `would_create_project: true` and
+    /// the counts computed against an absent target.
+    #[serde(default)]
+    create: bool,
+}
+
+/// `workspace/project` pair as names, for report labels.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeLabel {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+}
+
+/// Row counts of one session move; identical for the dry run.
+#[derive(Debug, Clone, Serialize)]
+pub struct MoveSessionCounts {
+    /// `observations` rows re-stamped.
+    pub observations: u64,
+    /// `handoffs` rows (produced by the session) re-stamped.
+    pub handoffs: u64,
+    /// `session_consolidation_jobs` rows re-stamped.
+    pub consolidation_jobs: u64,
+    /// `auto_improve_runs` rows re-stamped.
+    pub auto_improve_runs: u64,
+    /// `auto_improve_scheduler_claims` rows re-stamped.
+    pub auto_improve_claims: u64,
+    /// `pages` versions of `sessions/<id>.md` re-stamped (`pages: move`).
+    pub page_versions_moved: u64,
+    /// `pages` rows of `sessions/<id>.md` retired (`pages: regenerate`).
+    pub pages_regenerated: u64,
+}
+
+/// One scope a move gathers observations out of, for the operator's report.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionScopeCount {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Observations of the session currently stamped into that scope.
+    pub observations: u64,
+}
+
+/// Wire-format report for one session in `POST /admin/move-session`.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionReport {
+    /// The moved session.
+    pub session_id: String,
+    /// `true` when nothing was written (no `confirm`).
+    pub dry_run: bool,
+    /// Whether the `sessions` row changed scope. `false` for a re-home: the
+    /// row already sat in the destination and only stray rows (the counts
+    /// below) were gathered into it.
+    pub session_moved: bool,
+    /// Dry run with `create` against a destination that does not exist yet:
+    /// the confirm run will create it. Never set on a confirmed move.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
+    /// Every scope holding observations of this session other than the
+    /// destination, with counts. More than one entry — or one that is not
+    /// `from` — means the move drains a project the caller did not name.
+    /// Empty when everything already sits in the destination.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_scopes: Vec<MoveSessionScopeCount>,
+    /// Scope the session came from.
+    pub from: ScopeLabel,
+    /// Scope the session now belongs to.
+    pub to: ScopeLabel,
+    /// Row counts.
+    pub summary: MoveSessionCounts,
+    /// What happened (or would happen) to `sessions/<id>.md`: `"moved"`,
+    /// `"regenerated"`, `"already in destination"` (re-home whose page rows
+    /// all sit in the destination), or `"none"` when the session has no page
+    /// anywhere.
+    pub page: &'static str,
+    /// The session's recorded working directory, left untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Set when `basename(cwd)` differs from the destination project name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_warning: Option<String>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the move changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// Wire-format report for the batch form of `POST /admin/move-session`.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionBatchReport {
+    /// `true` when nothing was written (no `confirm`).
+    pub dry_run: bool,
+    /// Dry run with `create` against a destination that does not exist yet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
+    /// Source scope.
+    pub from: ScopeLabel,
+    /// Destination scope.
+    pub to: ScopeLabel,
+    /// Sessions touching the source scope (a `sessions` row there or at
+    /// least one observation stamped into it).
+    pub total: usize,
+    /// Sessions moved or re-homed (or, for a dry run, that would be).
+    pub moved: usize,
+    /// One report per session, oldest first (row `started_at` or first
+    /// observation in the source).
+    pub sessions: Vec<MoveSessionReport>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the batch changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// One session move, resolved and validated, before any guard runs.
+struct MoveSessionPlan {
+    session_id: SessionId,
+    /// Scope the rows are gathered from: the session row's own scope in the
+    /// single form, the batch source in the batch form (where the row may
+    /// well sit elsewhere, even in `to`).
+    from: (WorkspaceId, ProjectId),
+    from_label: ScopeLabel,
+    to: MoveTarget,
+    to_label: ScopeLabel,
+    /// Where the `sessions` row sits right now.
+    row_scope: (WorkspaceId, ProjectId),
+    cwd: Option<String>,
+}
+
+impl MoveSessionPlan {
+    /// The row already sits in the destination: only stray rows move.
+    fn is_rehome(&self) -> bool {
+        self.to.existing() == Some(self.row_scope)
+    }
+}
+
+/// The destination of a move: an existing scope, or (dry run with `create`
+/// only) a scope that does not exist yet and would be created on confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveTarget {
+    Existing((WorkspaceId, ProjectId)),
+    WouldCreate,
+}
+
+impl MoveTarget {
+    fn existing(self) -> Option<(WorkspaceId, ProjectId)> {
+        match self {
+            Self::Existing(scope) => Some(scope),
+            Self::WouldCreate => None,
+        }
+    }
+}
+
+async fn handle_move_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<MoveSessionRequest>,
+) -> Response {
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    match (req.session_id, req.from_project.as_deref()) {
+        (Some(session_id), None) => {
+            match move_single_session(&state, &req, session_id, author_id, actor).await {
+                Ok(report) => (StatusCode::OK, Json(json_or_empty(&report))).into_response(),
+                Err(resp) => resp.into_response(),
+            }
+        }
+        (None, Some(from_project)) => {
+            move_session_batch(&state, &req, from_project, author_id, actor).await
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "provide exactly one of session_id (single move) or from_project (batch)"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn json_or_empty<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Best-effort names for a scope; ids stand in when a row vanished
+/// underneath us (a concurrent purge), so a report is still produced.
+async fn scope_label(state: &AdminState, ws: WorkspaceId, proj: ProjectId) -> ScopeLabel {
+    let workspace = state
+        .reader
+        .workspace_name_by_id(ws)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ws.to_string());
+    let project = state
+        .reader
+        .project_name_by_id(ws, proj)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| proj.to_string());
+    ScopeLabel { workspace, project }
+}
+
+/// Resolve the destination scope: existing only (404) unless `create`. A
+/// dry run never writes, so with `create` and no `confirm` an absent
+/// destination resolves to [`MoveTarget::WouldCreate`] instead of a row.
+async fn resolve_move_session_target(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+    create: bool,
+    confirm: bool,
+) -> Result<MoveTarget, MoveErr> {
+    if create && confirm {
+        return create_ws_proj(state, workspace, project)
+            .await
+            .map(MoveTarget::Existing);
+    }
+    match lookup_existing_scope(&state.reader, workspace, project).await {
+        Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
+        Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
+        Err(e) => Err(scope_err(e)),
+    }
+}
+
+/// Dry-run counts of a move into a destination that does not exist yet:
+/// nothing of the session can already be there, so every row keyed to it
+/// moves, and the page rows are those of `from` (moved or retired per
+/// `pages`). Read-only; the store never sees the absent target.
+async fn preview_move_into_absent_target(
+    reader: &ReaderPool,
+    session_id: SessionId,
+    from: (WorkspaceId, ProjectId),
+    pages: PagesMode,
+) -> Result<MoveSessionCounts, StoreError> {
+    let rows = reader.session_dependent_rows(session_id, from).await?;
+    let (page_versions_moved, pages_regenerated) = match pages {
+        PagesMode::Move => (rows.page_versions, 0),
+        PagesMode::Regenerate => (0, rows.page_latest),
+    };
+    Ok(MoveSessionCounts {
+        observations: rows.observations,
+        handoffs: rows.handoffs,
+        consolidation_jobs: rows.consolidation_jobs,
+        auto_improve_runs: rows.auto_improve_runs,
+        auto_improve_claims: rows.auto_improve_claims,
+        page_versions_moved,
+        pages_regenerated,
+    })
+}
+
+/// `(session still open, consolidation job pending or running)` for the
+/// live-session guards.
+async fn session_move_blockers(
+    reader: &ReaderPool,
+    session_id: SessionId,
+) -> Result<(bool, bool), StoreError> {
+    reader
+        .with_conn(move |conn| {
+            let open: bool = conn.query_row(
+                "SELECT ended_at IS NULL FROM sessions WHERE id = ?1",
+                [session_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            let pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
+                 WHERE session_id = ?1 AND state IN ('pending', 'running'))",
+                [session_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            Ok((open, pending))
+        })
+        .await
+}
+
+/// `(session_id, row scope, cwd)` of every session touching a scope (a
+/// `sessions` row there or observations stamped into it), oldest first. The
+/// row scope may differ from the queried scope: that is the phantom-bucket
+/// case the batch re-homes.
+async fn list_scope_sessions(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> Result<Vec<(SessionId, (WorkspaceId, ProjectId), Option<String>)>, StoreError> {
+    let ids = reader
+        .session_ids_touching_scope(workspace_id, project_id)
+        .await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for sid in ids {
+        // Observations reference `sessions` (FK on), so a listed id always
+        // has a row; a concurrent purge is the only way to lose it here.
+        if let Some((ws, proj, cwd)) = reader.find_session_scope(sid).await? {
+            out.push((sid, (ws, proj), cwd));
+        }
+    }
+    Ok(out)
+}
+
+fn move_session_store_err(e: StoreError) -> MoveErr {
+    match e {
+        StoreError::NotFound(msg) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        e @ StoreError::PagePathTaken { .. } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{e}; re-run with pages=regenerate or resolve the destination page first"
+                )
+            })),
+        ),
+        other => internal_err(other.to_string()),
+    }
+}
+
+fn move_session_wiki_err(e: WikiError) -> MoveErr {
+    match e {
+        WikiError::Store(store_err) => move_session_store_err(store_err),
+        e @ WikiError::DestinationPageExists(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        other => internal_err(format!("move-session aborted: {other}")),
+    }
+}
+
+/// The session's cwd is historical truth and stays put; say so when the
+/// hook router's basename heuristic would not map it to the destination.
+fn move_session_cwd_warning(cwd: Option<&str>, to_project: &str) -> Option<String> {
+    let cwd = cwd?;
+    let base = std::path::Path::new(cwd).file_name()?.to_str()?;
+    if base == to_project {
+        return None;
+    }
+    Some(format!(
+        "session cwd '{cwd}' resolves to project '{base}' by basename, not '{to_project}'; \
+         the cwd was left as recorded. New sessions started there still land in '{base}' \
+         unless a .ai-memory.toml marker pins project = \"{to_project}\"; with \
+         [routing] mid_session = \"sticky\" the remaining events of this session follow it."
+    ))
+}
+
+fn move_session_source_scopes(
+    summary: &ai_memory_store::MoveSessionSummary,
+) -> Vec<MoveSessionScopeCount> {
+    summary
+        .source_scopes
+        .iter()
+        .map(|scope| MoveSessionScopeCount {
+            workspace: scope.workspace_name.clone(),
+            project: scope.project_name.clone(),
+            observations: scope.observations,
+        })
+        .collect()
+}
+
+fn move_session_counts(summary: &ai_memory_store::MoveSessionSummary) -> MoveSessionCounts {
+    MoveSessionCounts {
+        observations: summary.observations,
+        handoffs: summary.handoffs,
+        consolidation_jobs: summary.consolidation_jobs,
+        auto_improve_runs: summary.auto_improve_runs,
+        auto_improve_claims: summary.auto_improve_claims,
+        page_versions_moved: summary.page_versions_moved,
+        pages_regenerated: summary.pages_regenerated,
+    }
+}
+
+fn move_session_page_label(
+    pages: PagesMode,
+    touched_rows: bool,
+    touched_file: bool,
+    already_in_target: bool,
+) -> &'static str {
+    match (pages, touched_rows || touched_file) {
+        (_, false) if already_in_target => "already in destination",
+        (_, false) => "none",
+        (PagesMode::Move, true) => "moved",
+        (PagesMode::Regenerate, true) => "regenerated",
+    }
+}
+
+/// Guards, then the dry run or the real move of one planned session. The
+/// caller wraps the call in the pre/post checkpoints so a batch takes one
+/// pair, not one per session.
+async fn move_planned_session(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    plan: MoveSessionPlan,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: &ai_memory_core::ActorContext,
+) -> Result<MoveSessionReport, MoveErr> {
+    let sid = plan.session_id;
+    let rehome = plan.is_rehome();
+
+    // Live-session guards. An open session may still receive events, and a
+    // queued consolidation would write the page under the old scope; both
+    // are the operator's call with `force`. A re-home leaves the row where
+    // it is, so an open session is no reason to refuse gathering its strays.
+    let (open, pending_job) = session_move_blockers(&state.reader, sid)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if !req.force {
+        if open && !rehome {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "session {sid} is still open (no session end recorded); \
+                         finish it or force the move (--force / force: true)"
+                    )
+                })),
+            ));
+        }
+        if pending_job {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "session {sid} has a pending or running consolidation job; \
+                         wait for it or force the move (--force / force: true)"
+                    )
+                })),
+            ));
+        }
+    }
+
+    let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
+    let file_name = format!("{sid}.md");
+    let src_file = state
+        .wiki
+        .project_root(plan.from.0, plan.from.1)
+        .join("sessions")
+        .join(&file_name);
+
+    // Dry run with `create` against an absent destination: nothing exists to
+    // collide with, and the store cannot re-stamp into a scope that has no
+    // row, so the counts come from a read-only preview.
+    let to = match plan.to {
+        MoveTarget::Existing(to) => to,
+        MoveTarget::WouldCreate => {
+            debug_assert!(
+                !req.confirm,
+                "an absent target is only planned for a dry run"
+            );
+            let counts = preview_move_into_absent_target(&state.reader, sid, plan.from, req.pages)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            let touched_rows = counts.page_versions_moved > 0 || counts.pages_regenerated > 0;
+            return Ok(MoveSessionReport {
+                session_id: sid.to_string(),
+                dry_run: true,
+                session_moved: true,
+                would_create_project: true,
+                source_scopes: Vec::new(),
+                from: plan.from_label,
+                to: plan.to_label,
+                page: move_session_page_label(req.pages, touched_rows, src_file.is_file(), false),
+                summary: counts,
+                cwd: plan.cwd,
+                cwd_warning,
+                pre_checkpoint: None,
+                checkpoint: None,
+            });
+        }
+    };
+
+    // A page file already at the destination blocks a page move; checked here
+    // too so the dry run predicts what the wiki re-checks under its lock. When
+    // the source scope IS the destination (single-form re-home) there is no
+    // file to move and the wiki skips the file step too.
+    let dst_file = state
+        .wiki
+        .project_root(to.0, to.1)
+        .join("sessions")
+        .join(&file_name);
+    let file_moves = plan.from != to && src_file.is_file();
+    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
+        return Err(move_session_wiki_err(WikiError::DestinationPageExists(
+            dst_file.display().to_string(),
+        )));
+    }
+
+    if !req.confirm {
+        let summary = state
+            .writer
+            .move_session(sid, to.0, to.1, req.pages, author_id, false)
+            .await
+            .map_err(move_session_store_err)?;
+        let touched_rows = summary.page_versions_moved > 0 || summary.pages_regenerated > 0;
+        return Ok(MoveSessionReport {
+            session_id: sid.to_string(),
+            dry_run: true,
+            session_moved: summary.session_moved,
+            would_create_project: false,
+            source_scopes: move_session_source_scopes(&summary),
+            from: plan.from_label,
+            to: plan.to_label,
+            summary: move_session_counts(&summary),
+            page: move_session_page_label(
+                req.pages,
+                touched_rows,
+                file_moves,
+                summary.page_versions_in_target > 0,
+            ),
+            cwd: plan.cwd,
+            cwd_warning,
+            pre_checkpoint: None,
+            checkpoint: None,
+        });
+    }
+
+    let move_ctx = AdmissionContext {
+        workspace: plan.from_label.workspace.clone(),
+        project: plan.from_label.project.clone(),
+        destination_workspace: Some(plan.to_label.workspace.clone()),
+        destination_project: Some(plan.to_label.project.clone()),
+        op: AdmissionOp::MoveSession,
+        actor: actor.clone(),
+        ..Default::default()
+    };
+    // The wiki owns the critical section: admission, file move, SQL
+    // re-stamp, and the file rollback on SQL failure.
+    let outcome = state
+        .wiki
+        .move_session_page(sid, plan.from, to, req.pages, author_id, Some(move_ctx))
+        .await
+        .map_err(move_session_wiki_err)?;
+    let touched_rows =
+        outcome.summary.page_versions_moved > 0 || outcome.summary.pages_regenerated > 0;
+    Ok(MoveSessionReport {
+        session_id: sid.to_string(),
+        dry_run: false,
+        session_moved: outcome.summary.session_moved,
+        would_create_project: false,
+        source_scopes: move_session_source_scopes(&outcome.summary),
+        from: plan.from_label,
+        to: plan.to_label,
+        summary: move_session_counts(&outcome.summary),
+        page: move_session_page_label(
+            req.pages,
+            touched_rows,
+            outcome.file != SessionPageFile::Absent,
+            outcome.summary.page_versions_in_target > 0,
+        ),
+        cwd: plan.cwd,
+        cwd_warning,
+        pre_checkpoint: None,
+        checkpoint: None,
+    })
+}
+
+async fn move_single_session(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    session_id: SessionId,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: ai_memory_core::ActorContext,
+) -> Result<MoveSessionReport, MoveErr> {
+    let (from_ws, from_proj, cwd) = state
+        .reader
+        .find_session_scope(session_id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session {session_id} not found") })),
+            )
+        })?;
+    let from_label = scope_label(state, from_ws, from_proj).await;
+    let to_workspace = req
+        .workspace
+        .clone()
+        .unwrap_or_else(|| from_label.workspace.clone());
+    let to =
+        resolve_move_session_target(state, &to_workspace, &req.project, req.create, req.confirm)
+            .await?;
+    let plan = MoveSessionPlan {
+        session_id,
+        from: (from_ws, from_proj),
+        from_label,
+        to,
+        to_label: ScopeLabel {
+            workspace: to_workspace,
+            project: req.project.clone(),
+        },
+        row_scope: (from_ws, from_proj),
+        cwd,
+    };
+
+    if !req.confirm {
+        return move_planned_session(state, req, plan, author_id, &actor).await;
+    }
+    let label = format!(
+        "move-session {session_id} {}/{} -> {}/{}",
+        plan.from_label.workspace,
+        plan.from_label.project,
+        plan.to_label.workspace,
+        plan.to_label.project
+    );
+    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))?;
+    let mut report = move_planned_session(state, req, plan, author_id, &actor).await?;
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "move-session: scope-manifest backfill failed after move");
+    }
+    report.pre_checkpoint = pre_checkpoint;
+    report.checkpoint = checkpoint_or_warn(&state.wiki, label);
+    Ok(report)
+}
+
+async fn move_session_batch(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    from_project: &str,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: ai_memory_core::ActorContext,
+) -> Response {
+    let from_workspace = req
+        .from_workspace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_NAME.to_string());
+    let from = match lookup_ws_proj_no_create(state, &from_workspace, from_project).await {
+        Ok(ids) => ids,
+        Err(e) => return e.into_response(),
+    };
+    let to_workspace = req
+        .workspace
+        .clone()
+        .unwrap_or_else(|| from_workspace.clone());
+    let to = match resolve_move_session_target(
+        state,
+        &to_workspace,
+        &req.project,
+        req.create,
+        req.confirm,
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
+    let from_label = ScopeLabel {
+        workspace: from_workspace,
+        project: from_project.to_string(),
+    };
+    let to_label = ScopeLabel {
+        workspace: to_workspace,
+        project: req.project.clone(),
+    };
+    if to.existing() == Some(from) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "source and destination scopes are identical"
+            })),
+        )
+            .into_response();
+    }
+    // Same guard as move-project: the project the hook router is writing to
+    // is not emptied out from under it without an explicit `force`.
+    if !req.force && state.active_project.contains_project(from.1) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{}/{} is the active session's project; force the move (--force / \
+                     force: true) to move its sessions anyway",
+                    from_label.workspace, from_label.project
+                )
+            })),
+        )
+            .into_response();
+    }
+    let sessions = match list_scope_sessions(&state.reader, from.0, from.1).await {
+        Ok(v) => v,
+        Err(e) => return internal_err(e.to_string()).into_response(),
+    };
+
+    let label = format!(
+        "move-session {}/{} -> {}/{}",
+        from_label.workspace, from_label.project, to_label.workspace, to_label.project
+    );
+    let pre_checkpoint = if req.confirm && !sessions.is_empty() {
+        match checkpoint_or_500(&state.wiki, format!("pre-{label}")) {
+            Ok(oid) => oid,
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+
+    let total = sessions.len();
+    let mut reports = Vec::with_capacity(total);
+    let mut failure: Option<(SessionId, MoveErr)> = None;
+    for (session_id, row_scope, cwd) in sessions {
+        // The page file follows the page rows: a session rooted in a third
+        // scope (only some observations in the source) is moved whole from
+        // where its row sits; a session already rooted in the destination is
+        // re-homed and its stray page file, if any, is looked for in the
+        // source.
+        let (plan_from, plan_from_label) = if row_scope == from || to.existing() == Some(row_scope)
+        {
+            (from, from_label.clone())
+        } else {
+            (
+                row_scope,
+                scope_label(state, row_scope.0, row_scope.1).await,
+            )
+        };
+        let plan = MoveSessionPlan {
+            session_id,
+            from: plan_from,
+            from_label: plan_from_label,
+            to,
+            to_label: to_label.clone(),
+            row_scope,
+            cwd,
+        };
+        match move_planned_session(state, req, plan, author_id, &actor).await {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                failure = Some((session_id, e));
+                break;
+            }
+        }
+    }
+
+    let checkpoint = if req.confirm && !reports.is_empty() {
+        if let Err(e) = state.wiki.backfill_scope_manifests().await {
+            warn!(error = %e, "move-session: scope-manifest backfill failed after batch");
+        }
+        checkpoint_or_warn(&state.wiki, label)
+    } else {
+        None
+    };
+
+    // Stop at the first error, but say how far the batch got: the sessions
+    // already moved stay moved (each was its own transaction).
+    if let Some((session_id, (status, Json(mut body)))) = failure {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "session_id".into(),
+                serde_json::json!(session_id.to_string()),
+            );
+            obj.insert("dry_run".into(), serde_json::json!(!req.confirm));
+            obj.insert("total".into(), serde_json::json!(total));
+            obj.insert("moved".into(), serde_json::json!(reports.len()));
+            obj.insert("sessions".into(), json_or_empty(&reports));
+            if let Some(oid) = checkpoint {
+                obj.insert("checkpoint".into(), serde_json::json!(oid));
+            }
+        }
+        return (status, Json(body)).into_response();
+    }
+    let report = MoveSessionBatchReport {
+        dry_run: !req.confirm,
+        would_create_project: to == MoveTarget::WouldCreate,
+        from: from_label,
+        to: to_label,
+        total,
+        moved: reports.len(),
+        sessions: reports,
+        pre_checkpoint,
+        checkpoint,
+    };
+    (StatusCode::OK, Json(json_or_empty(&report))).into_response()
 }
 
 /// One source page, with everything the copy loop and the block
@@ -3861,7 +5108,7 @@ async fn copy_purge_merge(
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
@@ -3869,7 +5116,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // Single pass over the source: load each page's metadata + body
@@ -3890,14 +5137,14 @@ async fn copy_purge_merge(
             .map(|p| p.path_str.clone())
             .collect();
         if !blocking.is_empty() {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "destination already has pages at these paths with different content; \
                               resolve them or re-run with on_conflict=overwrite or on_conflict=duplicate",
                     "conflicts": blocking,
                 })),
-            );
+            ));
         }
     }
 
@@ -4040,7 +5287,7 @@ async fn copy_purge_merge(
         {
             Ok(pid) => pid,
             // ANY copy failure aborts BEFORE the purge — the source survives.
-            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
+            Err(e) => return Err(internal_err(format!("copy of {} failed: {e}", p.path_str))),
         };
         // Carry the source embedding over (skip the re-embed) when the source
         // had one for the current model.
@@ -4081,6 +5328,7 @@ async fn copy_purge_merge(
             merged_into_existing: true,
             moved_via: "copy-purge",
             pages_copied,
+            workstreams_moved: 0,
             pages_skipped,
             source_purged: false,
             source_pages_deleted: 0,
@@ -4094,10 +5342,7 @@ async fn copy_purge_merge(
             pre_checkpoint,
             checkpoint,
         };
-        return (
-            StatusCode::OK,
-            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-        );
+        return Ok(report);
     }
 
     // PURGE the source — only reached when every page copied successfully.
@@ -4120,7 +5365,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // The source purge is an internal step of move-project (a distinct op that
@@ -4128,31 +5373,44 @@ async fn copy_purge_merge(
     // `purge_project` here, so the audit author is left NULL.
     let summary = match state
         .writer
-        .purge_project(src_ws, src_proj, &label, None)
+        .purge_project(src_ws, src_proj, &label, None, false)
         .await
     {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        // A live managed run under the source always blocks the destructive
+        // second leg. `force` only overrides the active-project guard; unlike
+        // a true move, copy-purge would delete the lease and strand the raw
+        // transcript. The pages are already copied, so a later retry is
+        // idempotent and leaves the source intact meanwhile.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{pages_copied} page(s) were copied to {}/{}, but the source \
+                         {label} could not be purged: {e}. The source is intact. \
+                         move-project --force cannot delete a live managed \
+                         workstream during a copy-purge merge; finish or cancel \
+                         the managed run, then retry.",
+                        req.to_workspace, req.project,
+                    )
+                })),
+            ));
+        }
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    // Remove the source's on-disk dir, then dispatch the non-blocking
-    // purge webhook. Pass the workspace/project NAMES we cached in
-    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
-    // name-resolution lookup at dispatch time would find nothing.
-    let proj_root_str = state
-        .wiki
-        .project_root(src_ws, src_proj)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(src_ws, src_proj).await {
-        Ok(()) => files_deleted.push(proj_root_str),
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // Remove the source's wiki and raw-workstream directories, then dispatch
+    // the non-blocking purge webhook. Pass the workspace/project names cached
+    // in `resolved_purge_ctx`; the DB rows no longer exist for lookup.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        state,
+        src_ws,
+        src_proj,
+        &summary.workstream_ids,
+        "move-project",
+    )
+    .await;
     // See `handle_purge_project` for the rationale on `partial_failure`.
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -4188,6 +5446,7 @@ async fn copy_purge_merge(
         merged_into_existing: true,
         moved_via: "copy-purge",
         pages_copied,
+        workstreams_moved: 0,
         pages_skipped: Vec::new(),
         source_purged: true,
         source_pages_deleted: summary.pages_deleted,
@@ -4201,9 +5460,165 @@ async fn copy_purge_merge(
         pre_checkpoint,
         checkpoint,
     };
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------
+// merge-workspace
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/merge-workspace`.
+#[derive(Deserialize)]
+struct MergeWorkspaceRequest {
+    /// Source workspace to drain and delete. Must exist; 404 on a typo.
+    from: String,
+    /// Destination workspace. Auto-created if absent (each per-project move
+    /// get-or-creates it).
+    to: String,
+    /// Mandatory confirmation. The merge moves every source project (each a
+    /// destructive move that purges the source project) and deletes the emptied
+    /// source workspace, so without `confirm: true` the server returns 400.
+    /// Defaulted so an omitted flag hits that explicit guard rather than a
+    /// generic deserialization 422.
+    #[serde(default)]
+    confirm: bool,
+    /// Override the live-session guard on every per-project move.
+    #[serde(default)]
+    force: bool,
+    /// Conflict policy for a source project that already exists in the
+    /// destination with colliding page paths (copy-purge merge). Default
+    /// `block`. Projects with no destination twin are lossless true-moves and
+    /// ignore this.
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// Wire-format report returned by `POST /admin/merge-workspace`.
+#[derive(Debug, Serialize)]
+pub struct MergeWorkspaceReport {
+    /// Source workspace label.
+    pub from: String,
+    /// Destination workspace label.
+    pub to: String,
+    /// One move report per source project, in the order they were moved.
+    pub projects_merged: Vec<MoveProjectReport>,
+    /// Whether the now-empty source workspace was deleted at the end.
+    pub source_workspace_deleted: bool,
+}
+
+/// `POST /admin/merge-workspace` — fold every project of `from` into `to`, then
+/// delete the emptied `from`. Sugar over move-project: each source project runs
+/// the same validated path, so a project that already exists in `to` merges by
+/// content (copy-purge under `on_conflict`) while a fresh one is a lossless
+/// re-stamp. Destructive (each move purges its source project and the source
+/// workspace is removed), so `confirm=true` is required. Stops at the first
+/// failing project — the moves already committed stand, and the failing project
+/// plus the source workspace are left intact for the operator to resolve and
+/// re-run (moves are idempotent).
+async fn handle_merge_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<MergeWorkspaceRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+    if req.from == req.to {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "from and to are identical; nothing to merge"
+            })),
+        );
+    }
+
+    // Resolve the SOURCE without auto-creating — 404 on a typo, so a mistyped
+    // source can't create then immediately delete a phantom workspace.
+    if let Err(e) = lookup_ws_no_create(&state, &req.from).await {
+        return e;
+    }
+
+    let projects = match state
+        .reader
+        .list_projects_with_stats_for_workspace(req.from.clone())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+
+    let mut merged: Vec<MoveProjectReport> = Vec::with_capacity(projects.len());
+    for p in &projects {
+        let move_req = MoveProjectRequest {
+            from_workspace: req.from.clone(),
+            project: p.project_name.clone(),
+            to_workspace: req.to.clone(),
+            confirm: true,
+            force: req.force,
+            on_conflict: req.on_conflict,
+        };
+        match move_project_core(&state, &move_req, actor.clone()).await {
+            Ok(report) => merged.push(report),
+            Err((status, body)) => {
+                let reason = body
+                    .0
+                    .get("error")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "merge stopped at project '{}' in workspace '{}'",
+                            p.project_name, req.from
+                        ),
+                        "failed_project": p.project_name,
+                        "reason": reason,
+                        "projects_merged": merged,
+                        "source_workspace_deleted": false,
+                    })),
+                );
+            }
+        }
+    }
+
+    // Every project moved → the source workspace is now empty. Delete the shell
+    // with force=false: it must be empty, so a race that repopulated it aborts
+    // safely without wiping fresh data.
+    let source_workspace_deleted =
+        match delete_workspace_core(&state, &req.from, false, actor).await {
+            Ok(_) => true,
+            Err((_status, body)) => {
+                // The moves succeeded; only the final empty-shell delete failed
+                // (e.g. a concurrent write recreated a project). No data was
+                // lost, so report success-with-caveat instead of a hard error.
+                warn!(
+                    workspace = %req.from,
+                    "merge-workspace: source drained but shell delete failed: {:?}",
+                    body
+                );
+                false
+            }
+        };
+
+    let report = MergeWorkspaceReport {
+        from: req.from,
+        to: req.to,
+        projects_merged: merged,
+        source_workspace_deleted,
+    };
     (
         StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        Json(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null)),
     )
 }
 
@@ -4411,6 +5826,7 @@ async fn handle_delete_page(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     headers: HeaderMap,
     Json(req): Json<DeletePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -4451,9 +5867,10 @@ async fn handle_delete_page(
         None
     };
 
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     state
         .wiki
-        .delete_page(ws, proj, &path, admission_ctx)
+        .delete_page(ws, proj, &path, admission_ctx, author_id)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let checkpoint = checkpoint_or_warn(
@@ -4757,7 +6174,10 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_core::{
+        ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
+    };
+    use ai_memory_core::{Sanitized, Sanitizer};
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
@@ -4844,6 +6264,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         let resp = router
@@ -4861,6 +6282,749 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    /// The MCP-only complement: per-client tool-call counters served
+    /// back with the same window semantics as by-agent.
+    #[tokio::test]
+    async fn activity_by_client_aggregates_and_bounds_the_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let today = jiff::Timestamp::now()
+            .as_microsecond()
+            .div_euclid(US_PER_DAY);
+        store
+            .writer
+            .bump_client_activity(vec![
+                ("vscode".into(), today, 4, 1),
+                ("vscode".into(), today - 40, 7, 0),
+                ("claude-desktop".into(), today, 1, 0),
+            ])
+            .await
+            .unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49376".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Whole history: the 40-day-old bucket counts.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"],
+            serde_json::json!([
+                { "client": "vscode", "reads": 11, "writes": 1 },
+                { "client": "claude-desktop", "reads": 1, "writes": 0 },
+            ]),
+            "volume-desc across all history: {json}"
+        );
+
+        // A 7-day window drops the old bucket.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"][0],
+            serde_json::json!({ "client": "vscode", "reads": 4, "writes": 1 }),
+            "{json}"
+        );
+    }
+
+    /// The dashboard read: session counts grouped per agent CLI, with the
+    /// scope failing closed and never auto-created.
+    #[tokio::test]
+    async fn sessions_by_agent_counts_per_agent_and_fails_closed_on_unknown_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        for (project_id, agent) in [
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::Cursor),
+            // A different scope must not leak into the target's totals.
+            (other_project, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        for (agent, owner) in [(AgentKind::ClaudeCode, "alice"), (AgentKind::Codex, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49375".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 2 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "counts are per agent, scoped, count-desc: {json}"
+        );
+
+        // A named operator sees their rows plus shared legacy rows, but not a
+        // colleague's. The recovery switch deliberately includes all owners.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "named callers see own plus shared sessions only: {json}"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent?workspace=default&project=target&all_owners=true",
+                    )
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "codex", "sessions": 1 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "all_owners includes every operator: {json}"
+        );
+
+        // Zero is the explicit all-history spelling and must not become an
+        // empty time window.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target&since_days=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "since_days=0 means the whole history, not an empty window: {json}"
+        );
+
+        // A window wider than the epoch saturates into "all history" rather
+        // than overflowing: `u32::MAX` days times a day of microseconds does
+        // not fit in the i64 the cutoff is computed in.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent\
+                         ?workspace=default&project=target&since_days=4294967295",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "a saturating window counts everything, it does not panic or empty: {json}"
+        );
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sessions_filters_by_scope_and_agent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_agent = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        let alice = SessionId::new();
+        let bob = SessionId::new();
+        for (id, project_id, agent) in [
+            (older, target, AgentKind::Codex),
+            (other_agent, target, AgentKind::ClaudeCode),
+            (other_scope, other_project, AgentKind::Codex),
+            (ended, target, AgentKind::Codex),
+            (latest, target, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+        for (id, user) in [(alice, "alice"), (bob, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: AgentKind::Codex,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Default: only the newest open session for the scope + agent.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], latest.to_string());
+        assert_eq!(sessions[0]["cwd"], "/tmp/target");
+
+        // `all=true`: every open codex session in the scope, ended and
+        // other-scope/other-agent sessions excluded.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+
+        // A named operator gets their own open sessions plus shared legacy
+        // sessions, never a colleague's. This is the exact route consumed by
+        // the destructive `finalize-session` command.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&alice.to_string().as_str()));
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+        assert!(!ids.contains(&bob.to_string().as_str()));
+
+        // Unknown agent kind fails closed with a 400.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=ghost&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
+    }
+
+    /// Regression for the race a naive wrapper hits with several concurrent
+    /// Kiro CLI tabs against one repo: two open sessions for the same
+    /// agent+scope exist (`older`, `latest`), and `?session_id=` must return
+    /// exactly the one requested — never falling back to "newest open" —
+    /// while still composing with the owner filter (a session_id belonging
+    /// to another operator must not be reachable just by knowing its id,
+    /// same invariant `all_owners` already protects for the default query).
+    #[tokio::test]
+    async fn open_sessions_session_id_targets_exact_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        let bobs_session = SessionId::new();
+        let wrong_agent = SessionId::new();
+        for (id, project_id, agent_kind, actor_user) in [
+            (older, target, AgentKind::KiroCli, None),
+            (latest, target, AgentKind::KiroCli, None),
+            (other_scope, other_project, AgentKind::KiroCli, None),
+            (ended, target, AgentKind::KiroCli, None),
+            (wrong_agent, target, AgentKind::Codex, None),
+            (
+                bobs_session,
+                target,
+                AgentKind::KiroCli,
+                Some(IdentityKey::User("bob".into()).storage_key()),
+            ),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Targeting `older` by id must return only `older`, not `latest`.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "must not fall back to newest-open");
+        assert_eq!(sessions[0]["session_id"], older.to_string());
+
+        // A session id that belongs to a different project must not be
+        // reachable just by knowing the id — scope is still enforced.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={other_scope}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "a session from another project must not be reachable by id"
+        );
+
+        // An already-ended session id is not "open" and must not match.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={ended}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // An exact id from another agent remains outside the requested
+        // agent boundary even when its scope matches.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={wrong_agent}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // A colleague's session id is not reachable without all_owners, even
+        // when the exact id is known — session_id composes with the owner
+        // filter (AND), it doesn't bypass it.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "session_id must not bypass the owner filter"
+        );
+
+        // ...but composes correctly WITH all_owners set.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}&all_owners=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+
+        // Selection modes are mutually exclusive instead of silently giving
+        // one of them precedence.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&all=true&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A malformed session_id fails closed with a 400, not a silent
+        // empty/ignored filter.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id=not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     fn read_page_test_router() -> (TempDir, Router) {
@@ -4887,6 +7051,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         (tmp, router)
     }
@@ -4919,6 +7084,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         }
     }
 
@@ -5190,22 +7356,26 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "focus changed and durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
 
@@ -5291,6 +7461,387 @@ mod tests {
         );
     }
 
+    /// The V42 staging bucket is keyed on
+    /// [`ai_memory_core::ActorContext::identity_key`] through
+    /// [`ai_memory_core::owner_identity`], not on `actor.user`, so an operator
+    /// identified by a complete OIDC issuer/subject pair lands in an
+    /// issuer-qualified bucket rather than the unattributed one. The
+    /// `memory_auto_improve` MCP tool computes the same bucket, and the V42
+    /// one-pending-per-target promise is what breaks when it does.
+    #[tokio::test]
+    async fn auto_improve_buckets_an_oidc_operator_by_qualified_identity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // A trusted proxy is configured, so the deployment distinguishes its
+        // operators even with no `users` rows — which is exactly the case where
+        // reaching for `actor.user` sees nobody.
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.trusted_proxy_identity = true;
+        let router = admin_router(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/admin/auto-improve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": session_id.to_string(),
+                    "min_observations": 1,
+                    "min_session_duration_secs": 0,
+                    "min_confidence": 0.75,
+                    "max_proposals_per_run": 5
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ai_memory_core::ActorContext {
+            issuer: Some("https://issuer.example".into()),
+            sub: Some("subject-42".into()),
+            ..ai_memory_core::ActorContext::anonymous()
+        });
+        req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The bucket the contract stamps, built through the API rather than
+        // hand-written, so this test follows the encoding if it ever moves.
+        let expected_bucket = ai_memory_core::IdentityKey::Subject {
+            issuer: "https://issuer.example".into(),
+            subject: "subject-42".into(),
+        }
+        .storage_key();
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        assert!(!staged.is_empty(), "the fake LLM proposes two pages");
+        for proposal in &staged {
+            let detail = store
+                .reader
+                .auto_improve_proposal_detail_with_owner(ws, proj, proposal.id)
+                .await
+                .unwrap()
+                .expect("staged proposal readable in its own scope");
+            assert_eq!(
+                detail.staged_by_actor_user.as_deref(),
+                Some(expected_bucket.as_str()),
+                "the subject claim is the operator, not `None`: {}",
+                detail.detail.summary.target_path.as_str()
+            );
+            let json = serde_json::to_value(&detail).unwrap();
+            assert_eq!(json["staged_by_actor_user"], expected_bucket);
+            assert!(json.get("summary").is_some(), "detail fields stay flat");
+            assert!(
+                json.get("detail").is_none(),
+                "no nested compatibility wrapper"
+            );
+        }
+    }
+
+    /// The admin report must name the proposals the store refused to stage.
+    /// Returning only the staged ids hands the operator a successful run of
+    /// N-1 proposals with no trace of the Nth — the silent drop the
+    /// per-proposal skip was introduced to end.
+    #[tokio::test]
+    async fn auto_improve_report_names_the_proposal_a_collision_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["proposals"].as_array().unwrap().len(),
+            1,
+            "the sibling proposal still stages",
+        );
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1, "the collided proposal must be reported");
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "a skipped proposal must say why: {}",
+            skipped[0]
+        );
+    }
+
+    /// `[auth].root_username` alone does not make a server multi-operator: the
+    /// scheduler and the report handlers stage unattributed, so bucketing this
+    /// call by its actor would leave TWO pending proposals for one page on a
+    /// single-operator server — the collision V42 promises cannot happen.
+    #[tokio::test]
+    async fn single_operator_admin_auto_improve_shares_the_unattributed_bucket() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // The root actor `[auth].root_username` produces, as the auth
+        // middleware would stamp it.
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ))
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(ai_memory_core::ActorContext {
+                    user: Some("the-operator".into()),
+                    ..ai_memory_core::ActorContext::default()
+                });
+                next.run(req).await
+            },
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a named root operator must not open a second pending bucket for the same page"
+        );
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
+    }
+
     #[tokio::test]
     async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
         let tmp = TempDir::new().unwrap();
@@ -5317,22 +7868,26 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "focus changed and durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
         let mut state =
@@ -5412,22 +7967,26 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
         let mut state =
@@ -5968,6 +8527,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6076,6 +8636,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6177,6 +8738,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6284,6 +8846,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page_with_actor(
@@ -6478,6 +9041,196 @@ mod tests {
         assert!(!active.contains_workspace(ws));
     }
 
+    #[tokio::test]
+    async fn merge_workspace_folds_projects_and_deletes_empty_source() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // Two fresh projects in the source; the destination has neither.
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+        post_write_page(&router, "src", "beta", "notes/b.md", "beta body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        // A fresh destination → each project is a lossless true-move.
+        assert!(merged.iter().all(|r| r["moved_via"] == "true-move"));
+
+        // The source workspace is gone; both projects now live under dst.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let dst_ws = store
+            .reader
+            .find_workspace("dst".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "alpha".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "beta".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_requires_confirm() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Nothing moved: the source workspace + project are untouched.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_merges_colliding_project_by_content() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // `shared` exists in BOTH workspaces (different page paths) → the move
+        // for that project takes the copy-purge merge path, not a true-move.
+        // `solo` exists only in the source → lossless true-move.
+        post_write_page(&router, "dst", "shared", "notes/dst.md", "dst body").await;
+        post_write_page(&router, "src", "shared", "notes/src.md", "src body").await;
+        post_write_page(&router, "src", "solo", "notes/solo.md", "solo body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        let vias: std::collections::HashSet<&str> = merged
+            .iter()
+            .filter_map(|r| r["moved_via"].as_str())
+            .collect();
+        assert!(
+            vias.contains("copy-purge"),
+            "the colliding project merged by copy-purge"
+        );
+        assert!(
+            vias.contains("true-move"),
+            "the solo project was a true-move"
+        );
+
+        // Source is gone; the merged `shared` project holds BOTH pages.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pages = store.reader.list_pages("dst", "shared").await.unwrap();
+        let paths: std::collections::HashSet<String> = pages.into_iter().map(|p| p.path).collect();
+        assert!(paths.contains("notes/dst.md"));
+        assert!(paths.contains("notes/src.md"));
+    }
+
     fn recording_scope_invalidator(
         seen: Arc<std::sync::Mutex<Vec<ScopeInvalidation>>>,
     ) -> ScopeInvalidator {
@@ -6640,6 +9393,7 @@ mod tests {
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -6716,6 +9470,16 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/sessions/by-agent?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/activity/by-client?since_days=7",
+                serde_json::Value::Null,
+            ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
@@ -6853,6 +9617,12 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_db_user_tier() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
 
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder()
@@ -6881,6 +9651,12 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder().method(method).uri(uri);
             let body = if payload.is_null() {
@@ -6906,6 +9682,7 @@ mod tests {
     async fn multiuser_operational_admin_routes_allow_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin/status")
@@ -6916,6 +9693,214 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The scope does not exist in this fixture, so reaching the handler
+        // produces 404. A rejected root request would instead be 401/403.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=scratch")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_topology_gates_admin_without_db_users() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: true,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match req
+                    .headers()
+                    .get("x-test-auth-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => ai_memory_core::AuthLevel::Root,
+                    Some("user") => ai_memory_core::AuthLevel::User,
+                    _ => ai_memory_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        for (level, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("user"), StatusCode::FORBIDDEN),
+            (Some("root"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(level) = level {
+                request = request.header("x-test-auth-level", level);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "level={level:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_mode_switches_after_first_user_without_restart() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+
+        let anonymous_before = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_before.status(), StatusCode::OK);
+
+        let create = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("db-user-token"), StatusCode::FORBIDDEN),
+            (Some("root-token"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "token {token:?}");
+        }
+
+        let expire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/expire")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expire.status(), StatusCode::OK);
+
+        let anonymous_after_expire = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_after_expire.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_mode_store_read_failure_fails_closed() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let missing_db_reader =
+            ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: missing_db_reader,
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(ai_memory_core::AuthLevel::Anonymous);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("could not verify user configuration"));
     }
 
     #[tokio::test]
@@ -7199,6 +10184,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         // Inject a Root level so we're past the require_root gate;
         // the 503 must come from require_pepper.

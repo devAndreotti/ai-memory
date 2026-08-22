@@ -9,10 +9,12 @@
 //! M7b extends this to multi-page atomic fan-out.
 
 pub mod auto_improve;
+pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
+pub mod embed;
 pub mod lint;
 pub mod projection;
 pub mod sweep;
@@ -33,6 +35,10 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
     run_auto_improve_review,
 };
+pub use auto_improve_schedule::{
+    ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
+    initialize_auto_improve_scheduler_scopes, run_auto_improve_scheduler_tick,
+};
 pub use auto_improve_telemetry::{
     AutoImproveTelemetryFinding, AutoImproveTelemetryParams, AutoImproveTelemetryReport,
     AutoImproveTerminalRates, DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS,
@@ -46,14 +52,19 @@ pub use bootstrap::{
     plan_bootstrap_chunks, prune_sources_to_budget,
 };
 pub use consolidator::{
-    BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
+    BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
+    DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+    MIN_CONSOLIDATION_MAX_INPUT_TOKENS, MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
-    run_curator_report,
+    run_curator_report, run_curator_report_with_breadth,
 };
-pub use lint::{LintError, LintFinding, LintReport, run_lint};
-pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};
+pub use embed::{
+    EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
+};
+pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
+pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep, run_sweep_with_breadth};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
     SlotKind,
