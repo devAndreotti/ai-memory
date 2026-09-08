@@ -2795,3 +2795,228 @@ mark {
   .sk-block::after { animation: none; }
   .view-swap { animation: none; }
 }
+
+/* ==========================================================================
+   ai-plans Force-Directed Obsidian Graph View & Glass HUD Styling
+   ========================================================================== */
+
+.graph-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.graph-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: rgba(18, 21, 19, 0.85);
+  backdrop-filter: blur(14px);
+  flex-wrap: wrap;
+}
+
+.graph-toolbar-left,
+.graph-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.graph-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+
+.graph-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.graph-tool-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+
+.graph-tool-btn.active,
+.graph-tool-btn.is-active {
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--cyan);
+  font-weight: 600;
+}
+
+.graph-search-input {
+  width: 150px;
+  padding: 5px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+  transition: all 0.2s ease;
+}
+
+.graph-search-input:focus {
+  width: 180px;
+  border-color: var(--cyan);
+  outline: none;
+}
+
+/* Floating Glass Dock (Bottom-Right HUD) */
+.graph-floating-dock {
+  position: absolute;
+  bottom: 14px;
+  right: 175px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(18, 21, 19, 0.88);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+  backdrop-filter: blur(16px);
+}
+
+.graph-dock-zoom,
+.graph-dock-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.graph-dock-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--line-soft);
+}
+
+.graph-dock-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.graph-dock-btn:hover {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.graph-zoom-label {
+  min-width: 38px;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: monospace;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* Minimap Viewport Radar */
+.graph-minimap {
+  position: absolute;
+  bottom: 14px;
+  right: 14px;
+  z-index: 20;
+  width: 148px;
+  height: 98px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: rgba(18, 21, 19, 0.88);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(14px);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.graph-minimap:hover {
+  border-color: var(--cyan);
+}
+
+.graph-minimap-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.graph-minimap-label {
+  position: absolute;
+  top: 3px;
+  left: 6px;
+  color: var(--dim);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+}
+
+/* Node Tooltip */
+.graph-node-tooltip {
+  position: absolute;
+  z-index: 50;
+  max-width: 280px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(23, 27, 24, 0.94);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(14px);
+  color: var(--text);
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.graph-node-tooltip .gtt-id {
+  margin-bottom: 2px;
+  color: var(--cyan);
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.graph-node-tooltip .gtt-title {
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.graph-node-tooltip .gtt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}

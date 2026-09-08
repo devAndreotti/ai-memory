@@ -32,8 +32,9 @@ perf.data*
 # Sandbox marker (not project content).
 .ai-jail
 .claude/
-.slim/deepwork/
-evals/runs/
+# Worktrees
+.worktrees/
+.claude/worktrees/
 
 # ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
 *.bak-*

@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ai-memory Architecture",
+    "subtitle": "Cross-Harness Long-Term Memory, Sanitized Lifecycle Capture & Git-Backed Wiki",
+    "output": "docs/spec-kit/ai-memory.architecture.html",
+    "visual_preset": "blueprint",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "capture-flow",
+        "label": "Lifecycle Ingestion Path",
+        "focus": ["agents", "hooks", "sanitizer", "server", "ledger"],
+        "note": "Trace telemetry from 15+ agents through sanitization and secret scrubbing into the event ledger."
+      },
+      {
+        "id": "mcp-and-state",
+        "label": "MCP Query & Wiki Handoffs",
+        "focus": ["agents", "mcp", "server", "wiki"],
+        "note": "Inspect bidirectional MCP tool execution, handoff delivery, and Git-backed Markdown wiki updates."
+      },
+      {
+        "id": "intelligence-index",
+        "label": "Ledger, Vectors & Consolidation",
+        "focus": ["server", "ledger", "embeddings", "wiki"],
+        "note": "Examine visible-event causality, SQLite WAL indexing, Ollama/Gemini vector embeddings, and LLM auto-improvement."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "agents",
+      "type": "frontend",
+      "label": "AI Agent Harnesses",
+      "sublabel": "15+ CLIs: Claude, Codex, Agy...",
+      "pos": [40, 230],
+      "size": [130, 60],
+      "tag": "clients"
+    },
+    {
+      "id": "hooks",
+      "type": "security",
+      "label": "Hook Bridge & Spool",
+      "sublabel": "native CLI / POST /hook",
+      "pos": [230, 130],
+      "size": [130, 60],
+      "tag": "ingest"
+    },
+    {
+      "id": "sanitizer",
+      "type": "security",
+      "label": "Sanitizer & Policy",
+      "sublabel": "scrub & ignore_paths",
+      "pos": [430, 130],
+      "size": [130, 60],
+      "tag": "filter"
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "MCP Server",
+      "sublabel": "stdio & Streamable HTTP / SSE",
+      "pos": [230, 330],
+      "size": [130, 60],
+      "tag": "rpc"
+    },
+    {
+      "id": "server",
+      "type": "backend",
+      "label": "Core Engine",
+      "sublabel": "Axum 0.8 / Tokio / Writer Actor",
+      "pos": [630, 230],
+      "size": [140, 60],
+      "tag": "core"
+    },
+    {
+      "id": "ledger",
+      "type": "database",
+      "label": "SQLite Ledger & Index",
+      "sublabel": "WAL / FTS5 / Event Causality",
+      "pos": [850, 110],
+      "size": [140, 60],
+      "tag": "audit"
+    },
+    {
+      "id": "wiki",
+      "type": "database",
+      "label": "Git Markdown Wiki",
+      "sublabel": "git2 / _briefs / _slots",
+      "pos": [850, 230],
+      "size": [140, 60],
+      "tag": "storage"
+    },
+    {
+      "id": "embeddings",
+      "type": "cloud",
+      "label": "LLM & Embeddings",
+      "sublabel": "Ollama / Gemini / OpenAI",
+      "pos": [850, 350],
+      "size": [140, 60],
+      "tag": "ai"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "ai-memory Runtime Environment",
+      "wraps": ["hooks", "sanitizer", "mcp", "server", "ledger", "wiki", "embeddings"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Rust Core Engine & Ingest Pipeline",
+      "wraps": ["hooks", "sanitizer", "mcp", "server"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "agents-to-hooks",
+      "from": "agents",
+      "to": "hooks",
+      "label": "lifecycle events",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "agents-to-mcp",
+      "from": "agents",
+      "to": "mcp",
+      "label": "MCP tools",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "hooks-to-sanitizer",
+      "from": "hooks",
+      "to": "sanitizer",
+      "label": "raw telemetry",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "sanitizer-to-server",
+      "from": "sanitizer",
+      "to": "server",
+      "label": "scrubbed ingest",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "mcp-to-server",
+      "from": "mcp",
+      "to": "server",
+      "label": "RPC dispatch",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "server-to-ledger",
+      "from": "server",
+      "to": "ledger",
+      "label": "append turns",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "server-to-wiki",
+      "from": "server",
+      "to": "wiki",
+      "label": "sync Markdown",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "server-to-embeddings",
+      "from": "server",
+      "to": "embeddings",
+      "label": "vectorize & review",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "embeddings-to-wiki",
+      "from": "embeddings",
+      "to": "wiki",
+      "label": "enrich wiki",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Capture & Ingestion",
+      "items": [
+        "Hooks capture lifecycle events asynchronously across 15+ agent CLIs",
+        "Sanitizer enforces [capture] ignore_paths, token budgets, and secret redaction"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Core & Persistence",
+      "items": [
+        "Axum / Tokio core engine coordinates single-writer actor and reader pool",
+        "Git-backed Markdown wiki stores structured _briefs, _slots, and decisions"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Intelligence & Search",
+      "items": [
+        "SQLite WAL ledger retains turn causality, visible events, and FTS5 index",
+        "Embeddings (Ollama/Gemini/OpenAI) power hybrid RRF recall and auto-improvement"
+      ]
+    }
+  ]
+}
