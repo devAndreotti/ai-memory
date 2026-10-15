@@ -16,11 +16,18 @@
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
 //! * **OpenAI OAuth/Codex**: ChatGPT/Codex Responses API with
 //!   `text.format = { type: "json_schema", strict: true }`.
+//! * **OpenCode Zen/Go**: model-published Responses, Anthropic Messages, or
+//!   OpenAI-compatible Chat Completions transport.
 //! * **GitHub Copilot**: GitHub token exchange to a short-lived Copilot API
 //!   token, then OpenAI-style Chat Completions with JSON schema format.
 //! * **Gemini**: `generationConfig.responseMimeType = "application/json"`
 //!   plus `responseSchema` (OpenAPI 3 subset; `$ref`s inlined,
 //!   Draft-2020-12 keywords stripped before send).
+//! * **Cursor**: the logged-in `agent` CLI in `--mode ask`. No HTTP client
+//!   and no copied token; `--yolo` is never passed and the child gets an
+//!   allowlisted environment because the prompt is captured session text.
+//!   The CLI has no schema mode: the schema rides in the prompt, the answer
+//!   is parsed leniently, and serde deserialisation is the only validation.
 //! * **OpenAI-compat** (Ollama, vLLM, LM Studio): we ask for
 //!   `response_format: { type: "json_object" }` when supported,
 //!   otherwise parse the first balanced `{…}` from the text body.
@@ -36,15 +43,49 @@
 /// (read once by `Config::load`, applied to every chat provider).
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// `User-Agent` ai-memory sends on provider requests.
+///
+/// `reqwest` sends no `User-Agent` at all unless one is configured, so every
+/// ai-memory provider request used to arrive anonymous. Gateways increasingly
+/// require callers to identify themselves — OpenCode asks for a
+/// specific agent ("no broad user agents") and reports traffic without one as
+/// an unknown client — and an unattributable request is the one a rate
+/// limiter throttles first.
+///
+/// Layered *under* `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`], so an operator can still override it. The
+/// Copilot provider keeps [`copilot::COPILOT_USER_AGENT`] instead: GitHub's
+/// Copilot API expects the editor-plugin agent and rejects requests without
+/// it.
+pub const DEFAULT_USER_AGENT: &str = concat!("ai-memory/", env!("CARGO_PKG_VERSION"));
+
+/// `HTTP-Referer` ai-memory sends to OpenRouter.
+///
+/// OpenRouter attributes usage to an app on its public leaderboard by
+/// `HTTP-Referer` and [`OPENROUTER_X_TITLE`]; without them, ai-memory's
+/// requests show up unattributed. Layered under `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`] only when the `openai-compat` base URL points
+/// at `openrouter.ai`, so a non-OpenRouter compat endpoint (Ollama, vLLM,
+/// LM Studio) never receives these.
+pub const OPENROUTER_HTTP_REFERER: &str = "https://github.com/akitaonrails/ai-memory";
+
+/// `X-Title` ai-memory sends to OpenRouter. See [`OPENROUTER_HTTP_REFERER`].
+pub const OPENROUTER_X_TITLE: &str = "ai-memory";
+
 pub mod anthropic;
 pub mod auth;
+pub mod codex;
 pub mod copilot;
+pub mod cursor_agent;
 pub mod embedding;
 pub mod error;
 pub mod factory;
+pub mod fallback;
 pub mod gemini;
 pub mod google;
 pub mod health;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
@@ -55,30 +96,43 @@ pub mod reranker;
 pub mod types;
 
 mod auth_file;
+mod codex_responses;
 mod response;
 mod stored_token;
 mod text;
 
 pub use anthropic::AnthropicProvider;
-pub use auth::{AuthRequirement, CopilotAuth, Credential, CredentialSource, ProviderAuth};
+pub use auth::{
+    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, CursorAuth, ProviderAuth,
+};
+pub use codex::CodexProvider;
 pub use copilot::{
-    COPILOT_INTEGRATION_ID, CopilotProvider, CopilotToken, DEFAULT_COPILOT_API_BASE_URL,
+    COPILOT_DEFAULT_EMBED_DIM, COPILOT_DEFAULT_EMBED_MODEL, COPILOT_INTEGRATION_ID,
+    CopilotEmbedder, CopilotProvider, CopilotToken, DEFAULT_COPILOT_API_BASE_URL,
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,
     GITHUB_DEVICE_CODE_URL,
 };
+pub use cursor_agent::{
+    CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_child_env, cursor_executable,
+};
 pub use embedding::{
-    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
+    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
+    cosine, embed_search_query,
 };
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
+pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
-    ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
+    CandidateHealth, ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus,
+    ProviderRoleHealthSnapshot,
 };
+#[cfg(feature = "local-embeddings")]
+pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
@@ -91,8 +145,23 @@ pub use openai_oauth::{
     OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
     OpenAiOAuthTokenResponse,
 };
-pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
-pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
+pub use opencode::{
+    OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OPENCODE_SESSION_HEADER, OpenCodeProvider,
+};
+pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
+pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};
+pub use types::{
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,
+    Usage,
+};
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_llm;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

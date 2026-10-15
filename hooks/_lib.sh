@@ -3,7 +3,16 @@
 # no bash-isms, no non-standard deps (no jq, no toml crate). Keep changes
 # byte-trivial because every supported agent (claude-code, codex,
 # cursor, gemini-cli, kimi-code, kiro-cli, antigravity-cli, opencode,
-# omp) sources this same file.
+# omp, pool) sources this same file.
+
+# Set `_amhome` to $HOME without trailing slashes ("/" stays "/"), so the
+# string patterns below treat `HOME=/home/u/` as the native walk does.
+ai_memory_home() {
+    _amhome="${HOME:-}"
+    while [ "${_amhome%/}" != "$_amhome" ] && [ -n "${_amhome%/}" ]; do
+        _amhome="${_amhome%/}"
+    done
+}
 
 # Walk up from "$1" toward $HOME (or /) looking for `.ai-memory.toml`.
 # Prints the absolute path of the first marker found, or nothing.
@@ -15,9 +24,10 @@ ai_memory_find_marker() {
     dir="$1"
     [ -z "$dir" ] && return 0
     boundary=""
-    if [ -n "${HOME:-}" ]; then
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
         case "$dir" in
-            "$HOME"|"$HOME"/*) boundary="$HOME" ;;
+            "$_amhome"|"${_amhome%/}"/*) boundary="$_amhome" ;;
             *)
                 probe="$dir"
                 while [ -n "$probe" ] && [ "$probe" != "/" ]; do
@@ -70,11 +80,144 @@ ai_memory_parse_toml_flag() {
         "$file" | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# A resolved marker's `[profile]` flag as the explicit value the hook sends:
+# 0 for a falsy value (0/false/no/off, any case), 1 for anything else, an
+# absent key included. Parity with `profile_flag_value` in hook_capture.rs.
+ai_memory_profile_flag() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        0 | false | no | off) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+# Whether "$1" (a marker file) declares anything beyond a `[capture]`
+# section: any root-level scope key (workspace/project/project_strategy), or
+# any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
+# forward (drop_subagent_captures, default_global, [briefing] and [profile]
+# keys). Mirrors
+# `declares_more_than_capture` in marker.rs. A marker with any of these is a
+# resolution boundary; only a marker whose only content is `[capture]` (e.g.
+# ignore_paths) is scope/settings-transparent (#668).
+ai_memory_marker_declares_settings() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
+        [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
+    done
+    LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' "$file" && return 0
+    ai_memory_marker_declares_server "$file" && return 0
+    for key in default_global inject_on_session_start max_chars contribute consume; do
+        [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
+    done
+    return 1
+}
+
+# Whether marker "$1" declares a `server = ...` profile selection (#992), in
+# any value shape. Line-based and section-blind like marker.rs
+# `server_selection_in`; the leading class also skips a UTF-8 BOM, which is
+# not whitespace to grep. An unreadable marker counts as declaring one.
+ai_memory_marker_declares_server() {
+    [ -r "$1" ] || return 0
+    LC_ALL=C grep -Eq '^[^A-Za-z0-9_#"]*server[[:space:]]*=' "$1"
+}
+
+# Whether any marker on the walk from "$1" (default: the process cwd)
+# selects a server profile (#992). These script hooks cannot route profiles
+# — only native `ai-memory hook` commands can — so a routed repository must
+# emit nothing rather than reach the install-default server. Mirrors the
+# native walk: inside $HOME it stops at $HOME; outside it continues past the
+# checkout root, so an organisation-level marker above a repository counts.
+ai_memory_server_routed() {
+    _amsr_dir="${1:-${PWD:-}}"
+    [ -z "$_amsr_dir" ] && return 1
+    _amsr_boundary=""
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
+        case "$_amsr_dir" in
+            "$_amhome"|"${_amhome%/}"/*) _amsr_boundary="$_amhome" ;;
+        esac
+    fi
+    while [ -n "$_amsr_dir" ]; do
+        if [ -f "$_amsr_dir/.ai-memory.toml" ] \
+            && ai_memory_marker_declares_server "$_amsr_dir/.ai-memory.toml"; then
+            return 0
+        fi
+        [ "$_amsr_dir" = "$_amsr_boundary" ] && return 1
+        [ "$_amsr_dir" = "/" ] && return 1
+        # Parameter expansion, not `dirname`: this walk runs on every hook
+        # event, and a fork per directory level adds up.
+        _amsr_parent="${_amsr_dir%/*}"
+        [ "$_amsr_parent" = "$_amsr_dir" ] && return 1
+        _amsr_dir="${_amsr_parent:-/}"
+    done
+    return 1
+}
+
+# Query-string flag `ai_memory_marker_qs` appends for a profile-routed
+# repository. `ai_memory_post_hook` and `ai_memory_get_handoff` refuse any URL
+# carrying it, so every script that builds its URL from the marker query —
+# all of them — fails closed without a per-script check.
+AI_MEMORY_SERVER_ROUTED_QS="&server_routed=1"
+
+# Like ai_memory_find_marker, but skips a marker that declares nothing beyond
+# `[capture]` (see ai_memory_marker_declares_settings) and continues the walk
+# to the next ancestor. Resolves workspace/project/project_strategy and the
+# other root-level settings ai_memory_marker_qs / ai_memory_briefing_qs
+# forward, so a nested capture-only marker no longer resets them to their
+# fallback (#668). [capture]/ignore_paths itself keeps using
+# ai_memory_find_marker (the nearest marker, unchanged). Boundary logic is
+# duplicated rather than shared with ai_memory_find_marker on purpose: this
+# file is sourced by every supported agent's hook scripts, so the existing,
+# well-exercised walk stays untouched.
+ai_memory_find_settings_marker() {
+    dir="$1"
+    [ -z "$dir" ] && return 0
+    boundary=""
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
+        case "$dir" in
+            "$_amhome"|"${_amhome%/}"/*) boundary="$_amhome" ;;
+            *)
+                probe="$dir"
+                while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+                    if [ -e "$probe/.git" ]; then
+                        boundary="$probe"
+                        break
+                    fi
+                    parent=$(dirname "$probe")
+                    [ "$parent" = "$probe" ] && break
+                    probe="$parent"
+                done
+                [ -n "$boundary" ] || boundary="$dir"
+                ;;
+        esac
+    fi
+    while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+        if [ -f "$dir/.ai-memory.toml" ]; then
+            if [ -n "$_amhome" ] && [ "$dir" = "$_amhome" ]; then
+                printf '%s\n' "$dir/.ai-memory.toml"
+                return 0
+            fi
+            if ai_memory_marker_declares_settings "$dir/.ai-memory.toml"; then
+                printf '%s\n' "$dir/.ai-memory.toml"
+                return 0
+            fi
+        fi
+        if [ -n "$boundary" ] && [ "$dir" = "$boundary" ]; then
+            return 0
+        fi
+        parent=$(dirname "$dir")
+        [ "$parent" = "$dir" ] && return 0
+        dir="$parent"
+    done
+}
+
 # Extract the first cwd-like path from a JSON payload on stdin or in $1.
 # Returns the value or nothing. This is intentionally a tiny shell fallback,
 # not a JSON parser; taking the first match preserves the top-level cwd when
 # tool payloads contain nested `cwd` fields later in the object. Antigravity
-# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`.
+# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`; Cursor sends
+# `workspace_roots: ["/repo", ...]`.
 # Undo the JSON string escapes that can appear in a path value: \\ -> \
 # and \/ -> /. Windows payloads carry cwd as "C:\\dev\\proj"; without this
 # the doubled backslashes leak into the query string (#188).
@@ -82,22 +225,42 @@ ai_memory_json_unescape_path() {
     printf '%s' "$1" | sed 's/\\\\/\\/g; s/\\\//\//g'
 }
 
+# Print the payload text after the first `"$1"` (a JSON key, quotes added
+# here) and succeed, or fail when the key is absent. Same result as
+# `${payload#*"key"}`, which is quadratic in the payload size under dash and
+# bash and pinned a CPU for minutes on a large tool result (#870).
+ai_memory_after_key() {
+    LC_ALL=C awk -v k="\"$1\"" '
+        found { print; next }
+        { i = index($0, k); if (i) { found = 1; print substr($0, i + length(k)) } }
+        END { exit !found }'
+}
+
 ai_memory_extract_cwd() {
     payload="${1:-$(cat)}"
-    rest=${payload#*\"cwd\"}
-    if [ "$rest" != "$payload" ]; then
+    if rest=$(printf '%s' "$payload" | ai_memory_after_key cwd); then
         raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
             | head -n 1)
-        ai_memory_json_unescape_path "$raw"
-        return 0
+        if [ -n "$raw" ]; then
+            ai_memory_json_unescape_path "$raw"
+            return 0
+        fi
     fi
-    rest=${payload#*\"workspacePaths\"}
-    [ "$rest" = "$payload" ] && return 0
-    raw=$(printf '%s' "$rest" \
-        | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
-        | head -n 1)
-    ai_memory_json_unescape_path "$raw"
+    # Antigravity CLI sends `workspacePaths`, Cursor `workspace_roots`.
+    # Cursor never sends a usable `cwd`: `sessionStart` / `sessionEnd` omit it
+    # and its tool events send `cwd: ""`, so an empty match above must fall
+    # through to here rather than returning the empty string.
+    for key in workspacePaths workspace_roots; do
+        rest=$(printf '%s' "$payload" | ai_memory_after_key "$key") || continue
+        raw=$(printf '%s' "$rest" \
+            | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
+            | head -n 1)
+        if [ -n "$raw" ]; then
+            ai_memory_json_unescape_path "$raw"
+            return 0
+        fi
+    done
 }
 
 # Extract a harness-native session id from the common hook payload spellings.
@@ -106,8 +269,7 @@ ai_memory_extract_cwd() {
 ai_memory_extract_session_id() {
     payload="${1:-$(cat)}"
     for key in session_id sessionId sessionID session conversationId; do
-        rest=${payload#*\"$key\"}
-        if [ "$rest" != "$payload" ]; then
+        if rest=$(printf '%s' "$payload" | ai_memory_after_key "$key"); then
             printf '%s' "$rest" \
                 | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
                 | head -n 1
@@ -122,8 +284,7 @@ ai_memory_extract_session_id() {
 # a repeated invocation cannot consume a next-session handoff.
 ai_memory_antigravity_is_initial_invocation() {
     payload="${1:-$(cat)}"
-    rest=${payload#*\"invocationNum\"}
-    [ "$rest" != "$payload" ] || return 1
+    rest=$(printf '%s' "$payload" | ai_memory_after_key invocationNum) || return 1
     value=$(printf '%s' "$rest" \
         | sed -n -E 's/^[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*([,}]).*/\1/p' \
         | head -n 1)
@@ -170,7 +331,12 @@ ai_memory_url_encode() {
         s="$rest"
         case $c in
             [A-Za-z0-9._~-]) out="$out$c" ;;
-            *) out="$out$(printf '%%%02X' "'$c")" ;;
+            *)
+                # bash 3.2 (macOS /bin/sh) sign-extends bytes >= 0x80, so
+                # `printf '%X' "'$c"` printed FFFFFFFFFFFFFFC3 for 0xC3.
+                b=$(printf '%d' "'$c")
+                [ "$b" -lt 0 ] && b=$((b + 256))
+                out="$out$(printf '%%%02X' "$b")" ;;
         esac
     done
     printf '%s' "$out"
@@ -204,12 +370,289 @@ ai_memory_repo_root_project() {
     basename "$root"
 }
 
+# Normalise a git remote URL ("$1") into a repository identity, or print
+# nothing when it names no network-reachable repository (a local path, a bare
+# host). Port of `normalize_remote_url` in
+# crates/ai-memory-core/src/repository_identity.rs, checked against the same
+# fixture (crates/ai-memory-core/fixtures/remote_identity_cases.json) so the
+# two cannot drift. Credentials are dropped here, on the host, so they never
+# reach the server. Variables are prefixed: POSIX functions share the
+# caller's scope.
+ai_memory_normalize_remote() {
+    _ai_rn_raw=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_ai_rn_raw" ] || return 0
+    case "$_ai_rn_raw" in
+        *://*)
+            _ai_rn_has_scheme=1
+            _ai_rn_scheme=$(printf '%s' "${_ai_rn_raw%%://*}" | tr '[:upper:]' '[:lower:]')
+            _ai_rn_rest=${_ai_rn_raw#*://}
+            ;;
+        *)
+            _ai_rn_has_scheme=""
+            _ai_rn_scheme=""
+            _ai_rn_rest=$_ai_rn_raw
+            ;;
+    esac
+    [ "$_ai_rn_scheme" = "file" ] && return 0
+    # Credentials: everything up to the LAST `@` before the path.
+    _ai_rn_auth=${_ai_rn_rest%%/*}
+    _ai_rn_tail=${_ai_rn_rest#"$_ai_rn_auth"}
+    case "$_ai_rn_auth" in *@*) _ai_rn_auth=${_ai_rn_auth##*@} ;; esac
+    _ai_rn_hp="$_ai_rn_auth$_ai_rn_tail"
+    if [ -n "$_ai_rn_has_scheme" ]; then
+        _ai_rn_host=${_ai_rn_hp%%/*}
+        case "$_ai_rn_hp" in */*) _ai_rn_path=${_ai_rn_hp#*/} ;; *) _ai_rn_path="" ;; esac
+        case "$_ai_rn_host" in
+            *:*)
+                case "${_ai_rn_host##*:}" in
+                    *[!0-9]*) ;;
+                    *) _ai_rn_host=${_ai_rn_host%:*} ;;
+                esac
+                ;;
+        esac
+        [ -n "$_ai_rn_host" ] && [ -n "$_ai_rn_path" ] || return 0
+    else
+        # scp-like `host:path`, or a filesystem path: a `:` before any `/`.
+        case "$_ai_rn_hp" in *:*) ;; *) return 0 ;; esac
+        _ai_rn_host=${_ai_rn_hp%%:*}
+        case "$_ai_rn_host" in */*) return 0 ;; esac
+        _ai_rn_path=${_ai_rn_hp#*:}
+        # A one-character host is a Windows drive letter.
+        [ "${#_ai_rn_host}" -gt 1 ] && [ -n "$_ai_rn_path" ] || return 0
+        case "$_ai_rn_path" in *\\*) return 0 ;; esac
+    fi
+    _ai_rn_id=$(printf '%s/%s' "$_ai_rn_host" "$_ai_rn_path" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's#/*$##' -e 's#\.git$##' -e 's#/*$##' -e 's#//*#/#g')
+    case "$_ai_rn_id" in */*) printf '%s' "$_ai_rn_id" ;; esac
+}
+
+# Print the Phase-5 style sent with every valid git-remote identity. Explicit
+# marker/home-route values win; omission or invalid input sends `path`. Servers
+# keep a truly omitted field as legacy `host_path` for old-client compatibility.
+ai_memory_identity_style_qs() {
+    _ai_is_value=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$_ai_is_value" in
+        host_path) printf '&identity_style=host_path' ;;
+        *) printf '&identity_style=path' ;;
+    esac
+    return 0
+}
+
+ai_memory_home_route() {
+    _ai_hr_file="$1"; _ai_hr_cwd="$2"; _ai_hr_identity="$3"
+    [ -f "$_ai_hr_file" ] || return 0
+    [ "$(wc -c <"$_ai_hr_file")" -le 65536 ] || { printf 'invalid'; return 0; }
+    LC_ALL=C awk -v cwd="$_ai_hr_cwd" -v home="$_amhome" -v identity="$_ai_hr_identity" '
+        function invalid() { bad = 1 }
+        function cleanpath(value,    n, raw, out, i, root, home_relative, rel_depth, j) {
+            gsub(/\\/, "/", value)
+            home_relative = substr(value,1,2) == "~/"
+            if (home_relative) {
+                raw = substr(value,3); n = split(raw,relative_parts,"/"); rel_depth = 0
+                for (j=1; j<=n; j++) if (relative_parts[j] != "" && relative_parts[j] != ".") {
+                    if (relative_parts[j] == "..") { if (!rel_depth) return ""; rel_depth-- }
+                    else rel_depth++
+                }
+                value = home "/" raw
+            }
+            if (substr(value,1,2) == "//") {
+                raw = substr(value,3); n = split(raw,a,"/")
+                if (n < 2 || a[1] == "" || a[2] == "") return ""
+                root = "unc:" tolower(a[1]) "/" tolower(a[2]); i = 3
+            } else if (value ~ /^[A-Za-z]:\//) {
+                root = "drive:" tolower(substr(value,1,1)); raw = substr(value,4); n = split(raw,a,"/"); i = 1
+            } else if (substr(value,1,1) == "/") {
+                root = "posix"; raw = substr(value,2); n = split(raw,a,"/"); i = 1
+            } else return ""
+            depth = 0; delete stack
+            for (; i <= n; i++) if (a[i] != "" && a[i] != ".") { if (a[i] == "..") { if (depth) depth-- } else stack[++depth] = a[i] }
+            out = root
+            for (i=1; i<=depth; i++) out = out "/" (root == "posix" ? stack[i] : tolower(stack[i]))
+            return out
+        }
+        function aliases_valid(value,    body,n,i,item) {
+            if (length(value) > 512 || value ~ /\\/ || value !~ /^\[[^]]*\][[:space:]]*$/) return 0
+            body=value; sub(/^\[/,"",body); sub(/\][[:space:]]*$/,"",body)
+            if (body ~ /^[[:space:]]*$/) return 1
+            if (body ~ /,[[:space:]]*$/) return 0
+            n=split(body,items,","); if (n > 16) return 0
+            for (i=1;i<=n;i++) {
+                item=items[i]
+                if (item !~ /^[[:space:]]*"[A-Za-z0-9][A-Za-z0-9._-]*"[[:space:]]*$/) return 0
+                sub(/^[[:space:]]*"/,"",item); sub(/"[[:space:]]*$/,"",item)
+                if (length(item) > 128) return 0
+            }
+            return 1
+        }
+        function finish(    normalized,n) {
+            if (!kind) return
+            count++
+            if (count > 64 || length(selector) > 512 || raw_seen[selector]++) invalid()
+            if (!route_workspace || !route_project || length(route_workspace) > 512 || length(route_project) > 512 || route_workspace !~ /^[a-z0-9][a-z0-9._-]*$/ || route_project !~ /^[a-z0-9][a-z0-9._-]*$/) invalid()
+            if (route_identity_style && route_identity_style != "path" && route_identity_style != "host_path") invalid()
+            if (route_aliases && !aliases_valid(route_aliases)) invalid()
+            if (kind == "identity") {
+                host=selector; sub(/\/.*/,"",host)
+                if (selector != tolower(selector) || selector !~ /^[a-z0-9.-]+(\/[a-z0-9._-]+)+$/ || host ~ /^\./ || host ~ /\.$/ || identity_seen[selector]++) invalid()
+                if (selector == identity) { identity_found = 1; identity_ws = route_workspace; identity_pr = route_project; identity_style = route_identity_style; identity_aliases = route_aliases }
+            } else {
+                normalized = cleanpath(selector)
+                if (!normalized || normalized == "posix" || normalized ~ /^drive:[^\/]+$/ || normalized ~ /^unc:[^\/]+\/[^\/]+$/ || path_seen[normalized]++) invalid()
+                target = cleanpath(cwd)
+                if (normalized == target || index(target, normalized "/") == 1) {
+                    n = split(normalized, parts, "/")
+                    if (n > best_depth) { best_depth=n; best_ws=route_workspace; best_pr=route_project; best_style=route_identity_style; best_aliases=route_aliases; tie=0 }
+                    else if (n == best_depth) tie=1
+                }
+            }
+            kind=""; selector=""; route_workspace=""; route_project=""; route_identity_style=""; route_aliases=""; delete field_seen
+        }
+        BEGIN { count=0; bad=0; best_depth=0; tie=0 }
+        {
+            line=$0; sub(/\r$/, "", line)
+            if (match(line, /^[[:space:]]*\[routes\.(identity|path)\."[^"\\]+"\][[:space:]]*$/)) {
+                saw_route=1; finish(); header=line; sub(/^[[:space:]]*\[routes\./,"",header); kind=substr(header,1,index(header,".")-1); selector=header; sub(/^[^.]+\."/,"",selector); sub(/"\][[:space:]]*$/,"",selector); next
+            }
+            if (line ~ /^[[:space:]]*\[routes/ || line ~ /^[[:space:]]*routes[[:space:]]*=/ || line ~ /^[[:space:]]*routes\./ || line ~ /^[[:space:]]*route_[A-Za-z0-9_]+[[:space:]]*=/) {
+                saw_route=1
+                if (!kind || line ~ /^[[:space:]]*\[/) { finish(); invalid(); next }
+                key=line; sub(/^[[:space:]]*/,"",key); sub(/[[:space:]]*=.*/,"",key)
+                if (field_seen[key]++) { invalid(); next }
+                value=line; sub(/^[^=]*=[[:space:]]*/,"",value)
+                if (key == "route_aliases") { if (!aliases_valid(value)) invalid(); route_aliases=value }
+                else {
+                    if (length(value) > 514 || value ~ /\\/ || value !~ /^"[^"]+"[[:space:]]*$/) { invalid(); next }
+                    sub(/^"/,"",value); sub(/"[[:space:]]*$/,"",value)
+                    if (length(value) > 512) { invalid(); next }
+                    if (key == "route_workspace") route_workspace=value
+                    else if (key == "route_project") route_project=value
+                    else if (key == "route_identity_style") route_identity_style=value
+                    else invalid()
+                }
+                next
+            }
+            if (line ~ /^[[:space:]]*\[/) { finish(); next }
+            if (kind && line !~ /^[[:space:]]*(#|$)/) invalid()
+            if (!kind && line ~ /^[[:space:]]*(workspace|project|project_strategy|drop_subagent_captures|identity|identity_style|server)[[:space:]]*=/ && line !~ /^[[:space:]]*[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/) root_bad=1
+        }
+        END { finish(); if (saw_route && (bad || root_bad || tie)) print "invalid"; else if (identity_found) print identity_ws "\034" identity_pr "\034" identity_style "\034" identity_aliases; else if (best_depth) print best_ws "\034" best_pr "\034" best_style "\034" best_aliases }
+    ' "$_ai_hr_file" | tail -n 1
+}
+
+ai_memory_aliases_json_value() {
+    _ai_alias_tmp=$(mktemp "${TMPDIR:-/tmp}/ai-memory-aliases.XXXXXX") || return 0
+    printf 'aliases = %s\n' "$1" >"$_ai_alias_tmp"
+    ai_memory_aliases_json "$_ai_alias_tmp"
+    rm -f "$_ai_alias_tmp"
+}
+
+ai_memory_aliases_json() {
+    [ -f "$1" ] || return 0
+    _ai_alias_body=$(LC_ALL=C awk '
+        BEGIN { table = 0; count = 0; bad = 0 }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            trimmed = line
+            sub(/^[ \t]*/, "", trimmed)
+            if (trimmed ~ /^\[/) table = 1
+            if (trimmed ~ /^aliases[ \t]*=/) {
+                count++
+                if (table || count > 1 || trimmed !~ /^aliases[ \t]*=[ \t]*\[[^]]*\][ \t]*$/) {
+                    bad = 1
+                } else {
+                    sub(/^aliases[ \t]*=[ \t]*\[/, "", trimmed)
+                    sub(/\][ \t]*$/, "", trimmed)
+                    body = trimmed
+                }
+            }
+        }
+        END {
+            if (bad) print "invalid"
+            else if (count == 1) print body
+        }
+    ' "$1")
+    [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
+    [ -n "$_ai_alias_body" ] || return 0
+    _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_ai_alias_trimmed" ] || return 0
+    case "$_ai_alias_trimmed" in *,) printf 'invalid'; return 0 ;; esac
+    _ai_alias_out=""
+    _ai_alias_count=0
+    _ai_alias_old_ifs=$IFS
+    IFS=,
+    for _ai_alias_raw in $_ai_alias_body; do
+        IFS=$_ai_alias_old_ifs
+        _ai_alias_count=$((_ai_alias_count + 1))
+        [ "$_ai_alias_count" -le 16 ] || { printf 'invalid'; return 0; }
+        case "$_ai_alias_raw" in *\\*) printf 'invalid'; return 0 ;; esac
+        _ai_alias=$(printf '%s' "$_ai_alias_raw" | sed -n -E 's/^[[:space:]]*"([^"]*)"[[:space:]]*$/\1/p' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$_ai_alias" in
+            ""|*[!A-Za-z0-9._-]*) printf 'invalid'; return 0 ;;
+        esac
+        [ "${#_ai_alias}" -le 128 ] || { printf 'invalid'; return 0; }
+        case "$_ai_alias" in [A-Za-z0-9]*) ;; *) printf 'invalid'; return 0 ;; esac
+        case "|$_ai_alias_out|" in *"|$_ai_alias|"*) ;; *)
+            _ai_alias_out="${_ai_alias_out}|${_ai_alias}"
+        esac
+        IFS=,
+    done
+    IFS=$_ai_alias_old_ifs
+    _ai_alias_json="["
+    _ai_alias_sep=""
+    _ai_alias_rest=${_ai_alias_out#|}
+    IFS='|'
+    for _ai_alias in $_ai_alias_rest; do
+        _ai_alias_json="${_ai_alias_json}${_ai_alias_sep}\"${_ai_alias}\""
+        _ai_alias_sep=,
+    done
+    IFS=$_ai_alias_old_ifs
+    printf '%s]' "$_ai_alias_json"
+}
+
+ai_memory_git_remote_identity() {
+    [ -n "$1" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    for _ai_gri_remote in upstream origin; do
+        _ai_gri_url=$(git -C "$1" config --get "remote.$_ai_gri_remote.url" 2>/dev/null) || continue
+        _ai_gri_value=$(ai_memory_normalize_remote "$_ai_gri_url")
+        [ -n "$_ai_gri_value" ] && { printf '%s' "$_ai_gri_value"; return 0; }
+    done
+}
+
+# Print `&identity=<v>&identity_src=<rung>` for the checkout at "$1", or
+# nothing. "$2" is the marker's `identity`, "$3" its declared `project`, "$4"
+# its `identity_style`, forwarded only with a remote identity.
+# Mirrors `repository_identity` in hook_capture.rs: an explicit identity is
+# sent; a declared project outranks the remote and routes by name, so git is
+# not consulted; otherwise the `upstream` remote, else `origin`.
+ai_memory_identity_qs() {
+    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"; _ai_id_style="$4"; _ai_id_aliases="$5"
+    _ai_id_explicit=$(printf '%s' "$_ai_id_explicit" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$_ai_id_aliases" ] && [ -n "$_ai_id_explicit" ]; then
+        _ai_id_value=$(printf '%s' "$_ai_id_explicit" | tr '[:upper:]' '[:lower:]')
+        printf '&identity=%s&identity_src=explicit' "$(ai_memory_url_encode "$_ai_id_value")"
+        return 0
+    fi
+    [ -z "$_ai_id_aliases" ] && [ -n "$(printf '%s' "$_ai_id_project" | tr -d '[:space:]')" ] && return 0
+    _ai_id_value=$(ai_memory_git_remote_identity "$_ai_id_cwd")
+    if [ -n "$_ai_id_value" ]; then
+        printf '&identity=%s&identity_src=git_remote' "$(ai_memory_url_encode "$_ai_id_value")"
+        ai_memory_identity_style_qs "$_ai_id_style"
+    fi
+}
+
 # Build a query-string suffix from "$1" plus any marker file walked up from
 # it. Returns the suffix with the leading `&`, or nothing when cwd is absent.
 # `cwd` is always included so `GET /handoff` resolves the same basename project
 # as the prior hook events even when no marker file exists.
 ai_memory_marker_qs() {
     cwd="$1"
+    if ai_memory_server_routed "$cwd"; then
+        printf '%s' "$AI_MEMORY_SERVER_ROUTED_QS"
+        return 0
+    fi
     if [ -z "$cwd" ]; then
         ai_memory_managed_qs
         return 0
@@ -219,21 +662,67 @@ ai_memory_marker_qs() {
     pr=""
     st=""
     ds=""
+    dg=""
     # Provenance of `pr`, forwarded as `project_src` so the server can tell a
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     ps=""
-    marker=$(ai_memory_find_marker "$cwd")
+    idn=""
+    isty=""
+    pcon=""
+    pcons=""
+    aliases=""
+    routed=""
+    # The nearest marker that declares more than `[capture]` (#668): a nested
+    # capture-only marker (e.g. one that only sets ignore_paths) must not
+    # shadow an outer marker's workspace/project/etc.
+    marker=$(ai_memory_find_settings_marker "$cwd")
+    ai_memory_home
+    home_marker=""
+    [ -n "$_amhome" ] && [ -f "$_amhome/.ai-memory.toml" ] && home_marker="$_amhome/.ai-memory.toml"
+    if [ -z "$marker" ] || [ "$marker" = "$home_marker" ]; then
+        route_identity=$(ai_memory_git_remote_identity "$cwd")
+        route=$(ai_memory_home_route "$home_marker" "$cwd" "$route_identity")
+        if [ "$route" = "invalid" ]; then
+            printf '%s' '&ai_memory_invalid_home_routes=1'
+            return 0
+        fi
+        if [ -n "$route" ]; then
+            old_ifs=$IFS; IFS=$(printf '\034')
+            set -- $route
+            IFS=$old_ifs
+            ws=$1; pr=$2; isty=${3:-}; route_aliases=${4:-}; ps=marker; routed=1
+            [ -n "$route_aliases" ] && aliases=$(ai_memory_aliases_json_value "$route_aliases")
+            marker="$home_marker"
+            if [ -n "$route_identity" ]; then
+                iq="&identity=$(ai_memory_url_encode "$route_identity")&identity_src=git_remote$(ai_memory_identity_style_qs "$isty")"
+            fi
+        fi
+    fi
     if [ -n "$marker" ]; then
-        ws=$(ai_memory_parse_toml_key "$marker" workspace)
-        pr=$(ai_memory_parse_toml_key "$marker" project)
-        st=$(ai_memory_parse_toml_key "$marker" project_strategy)
+        [ -n "$routed" ] || ws=$(ai_memory_parse_toml_key "$marker" workspace)
+        [ -n "$routed" ] || pr=$(ai_memory_parse_toml_key "$marker" project)
+        [ -n "$routed" ] || st=$(ai_memory_parse_toml_key "$marker" project_strategy)
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
+        dg=$(ai_memory_parse_toml_flag "$marker" default_global)
+        [ -n "$routed" ] || idn=$(ai_memory_parse_toml_key "$marker" identity)
+        [ -n "$routed" ] || isty=$(ai_memory_parse_toml_key "$marker" identity_style)
+        [ -n "$routed" ] || aliases=$(ai_memory_aliases_json "$marker")
+        # `[profile] contribute` / `consume`, quoted or bare, always sent
+        # explicitly once a marker resolved (0 when falsy, else 1): removing
+        # the key re-enables; no marker sends nothing and the server keeps
+        # what it stored.
+        pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
+        pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
         [ -n "$pr" ] && ps="marker"
     fi
+    # Before repo-root can fill `pr`: a repo-root name is an inference, while
+    # the identity chain's declared-project rung means a name in the marker.
+    [ -n "${iq:-}" ] || iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty" "$aliases")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
-    # pinned one. A marker's explicit project / project_strategy still win.
+    # pins one. Explicit project/identity and home routing win; otherwise a
+    # valid remote identity wins and repo-root is the remote-less fallback.
     if [ -z "$st" ] && [ -n "${AI_MEMORY_PROJECT_STRATEGY:-}" ]; then
         st="$AI_MEMORY_PROJECT_STRATEGY"
     fi
@@ -255,9 +744,21 @@ ai_memory_marker_qs() {
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
     [ -n "$ps" ] && qs="${qs}&project_src=$(ai_memory_url_encode "$ps")"
     [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"
+    qs="${qs}${iq}"
+    if [ -n "$aliases" ]; then
+        case "$iq" in *'identity_src=git_remote'*)
+            [ -n "$pr" ] || aliases=invalid
+            ;;
+            *) [ -n "$routed" ] && aliases="" || aliases=invalid ;;
+        esac
+        [ -n "$aliases" ] && qs="${qs}&aliases=$(ai_memory_url_encode "$aliases")"
+    fi
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"
+    [ -n "$dg" ] && qs="${qs}&default_global=$(ai_memory_url_encode "$dg")"
+    [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
+    [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }
@@ -273,7 +774,9 @@ ai_memory_marker_qs() {
 ai_memory_briefing_qs() {
     cwd="$1"
     [ -z "$cwd" ] && return 0
-    marker=$(ai_memory_find_marker "$cwd")
+    # Settings walk (#668): a nested capture-only marker must not shadow an
+    # outer marker's [briefing] opt-in.
+    marker=$(ai_memory_find_settings_marker "$cwd")
     [ -n "$marker" ] || return 0
     qs=""
     briefing=$(ai_memory_parse_toml_flag "$marker" inject_on_session_start)
@@ -362,22 +865,91 @@ ai_memory_clear_session_id() {
     rm -f "$(ai_memory_session_id_file "$agent")" 2>/dev/null || true
 }
 
-# POST stdin to "$1" as JSON, fire-and-forget. Adds an
+# POST stdin to "$1" as JSON. Adds an
 # `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
-# The 0.5s timeout matches the project-wide hook latency budget
+# The 0.2s timeout is invariant 5's budget for a script hook
 # (never block the agent), and the trailing `|| true` makes the
-# function safe to call from `set -e` scripts.
+# function safe to call from `set -e` scripts. An undelivered event
+# (unreachable server or 5xx) is spooled for a later drain instead of
+# being dropped; a 4xx is a permanent rejection and is not retried.
+# Stdout is the HTTP status code, not the response body — every caller
+# in this bundle discards it.
+# Path of the `Authorization:` header file `install-hooks --apply` writes
+# (0600, inside the 0700 data dir). Printed only when readable.
+ai_memory_auth_header_file() {
+    _amhf="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-memory}/auth-header"
+    [ -r "$_amhf" ] && printf '%s' "$_amhf"
+}
+
+# Mint the key before the first POST so an ambiguous delivery and its spool
+# replay carry the same identity. The server can then discard a replay whose
+# original response was lost after the observation committed.
+ai_memory_ingest_key() {
+    _amrnd=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$_amrnd" ] || _amrnd=$(printf '%s%s' "$(date +%s 2>/dev/null || printf '0')" "$$")
+    printf 'sh%s' "$_amrnd"
+}
+
+ai_memory_url_with_ingest_key() {
+    case "$1" in
+        *\?ingest_key=* | *\&ingest_key=*) printf '%s' "$1" ;;
+        *\?*) printf '%s&ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+        *) printf '%s?ingest_key=%s' "$1" "$(ai_memory_ingest_key)" ;;
+    esac
+}
+
+# AI_MEMORY_CAPTURE_OWNER names an external producer of this session's capture
+# events. Non-blank claims ownership; unset, empty and whitespace-only keep
+# capture on. The value is only ever tested, never printed or sent.
+ai_memory_capture_owned_externally() {
+    case "${AI_MEMORY_CAPTURE_OWNER:-}" in
+        *[![:space:]]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ai_memory_post_hook() {
+    # Every shell hook produces its event here, and the spool and piggyback
+    # drain hang off the result below, so this one check suppresses all three.
+    # Delivery is untouched: an explicit ai_memory_drain_spool still ships the
+    # backlog. Stdin is drained so the caller's pipe does not take an EPIPE.
+    if ai_memory_capture_owned_externally; then
+        cat >/dev/null 2>&1 || true
+        return 0
+    fi
+    case "$1" in
+        *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) cat >/dev/null; return 0 ;;
+    esac
+    _amurl=$(ai_memory_url_with_ingest_key "$1")
+    _ambody=$(cat)
+    _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 0.5 -X POST "$1" \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
-            --data-binary @-
-    else
-        curl -s --max-time 0.5 -X POST "$1" \
+            --data-binary @- 2>/dev/null) || _amcode=000
+    elif [ -n "$_amhdr" ]; then
+        # `-H @file`: curl reads the header from disk, so the bearer never
+        # appears in curl's argv the way an inline `-H` would (#552).
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
-            --data-binary @-
+            -H @"$_amhdr" \
+            --data-binary @- 2>/dev/null) || _amcode=000
+    else
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            -w '%{http_code}' -X POST "$_amurl" \
+            -H "Content-Type: application/json" \
+            --data-binary @- 2>/dev/null) || _amcode=000
     fi
+    case "$_amcode" in
+        2*) ai_memory_kick_drain ;;
+        408|425|429) ai_memory_spool_event "$_amurl" "$_ambody" ;;
+        4*) ;;
+        *) ai_memory_spool_event "$_amurl" "$_ambody" ;;
+    esac
+    return 0
 }
 
 # GET "$1" with the same auth-header rules as `ai_memory_post_hook`.
@@ -386,12 +958,21 @@ ai_memory_post_hook() {
 # generous than POST because the result is *synchronously* fed to
 # stdout (and prepended to the agent's context), so we want to avoid
 # truncating a handoff that was almost ready.
+# Every request in this bundle sends `X-AI-Memory-Client`: an unauthenticated
+# server reached through a non-loopback host name refuses a handoff fetch
+# without it, because a web page cannot add that header to a request it makes.
 ai_memory_get_handoff() {
+    case "$1" in
+        *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+    esac
+    _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 1.0 "$1" \
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+    elif [ -n "$_amhdr" ]; then
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
     else
-        curl -s --max-time 1.0 "$1"
+        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
     fi
 }
 
@@ -401,15 +982,243 @@ ai_memory_get_handoff() {
 # handoff in hookSpecificOutput.additionalContext).
 ai_memory_json_string() {
     awk '
-        BEGIN { printf "\"" }
+        # BusyBox awk applies backslash processing to a gsub REPLACEMENT
+        # string; gawk, mawk and one-true-awk pass it through literally. Every
+        # replacement below carries a backslash, so on BusyBox all four escapes
+        # were silently no-ops (#733): a backslash stayed bare, a quote stayed
+        # bare, and -- not in the report, but the same root cause -- \t and \r
+        # collapsed to the letters "t" and "r", corrupting content rather than
+        # only breaking the framing.
+        #
+        # Detect the behaviour once instead of guessing at it, and pre-double
+        # the replacements where they will be halved. Done with gsub rather
+        # than a split/concat loop on purpose: concatenating per occurrence is
+        # quadratic in the value length, which is the cost #727 was about.
+        BEGIN {
+            probe = "X"; gsub(/X/, "\\\\", probe)
+            if (length(probe) == 1) {
+                busybox = 1
+                BS = "\\\\\\\\"; QT = "\\\\\""; TB = "\\\\t"; CR = "\\\\r"
+                UP = "\\\\u"
+            } else {
+                busybox = 0
+                BS = "\\\\"; QT = "\\\""; TB = "\\t"; CR = "\\r"
+                UP = "\\u"
+            }
+            # JSON forbids a raw control character (U+0000..U+001F) inside a
+            # string, but the four gsubs above only cover backslash, quote, tab
+            # and CR — so a replayed tool result carrying e.g. an ANSI colour
+            # escape (0x1b) reached stdout unescaped and Claude Code rejected
+            # the whole SessionStart packet as invalid JSON (#732). Build a
+            # \u00XX escape for every other control byte once; newline (0x0a) is
+            # never inside a record, it is the record separator handled below.
+            nc = 0
+            for (c = 1; c < 32; c++) {
+                if (c == 9 || c == 10 || c == 13) continue
+                cc[++nc] = sprintf("%c", c)
+                cr[nc] = sprintf("%s%04x", UP, c)
+            }
+            printf "\""
+        }
         {
-            gsub(/\\/, "\\\\")
-            gsub(/"/, "\\\"")
-            gsub(/\t/, "\\t")
-            gsub(/\r/, "\\r")
+            gsub(/\\/, BS)
+            gsub(/"/, QT)
+            gsub(/\t/, TB)
+            gsub(/\r/, CR)
+            # After the backslash gsub, so the backslashes these introduce are
+            # not doubled. Each control byte is a literal (none is a regex
+            # metacharacter), and the pass is linear, not the per-char loop #727
+            # replaced.
+            for (k = 1; k <= nc; k++) gsub(cc[k], cr[k])
             printf "%s%s", sep, $0
             sep = "\\n"
         }
         END { printf "\"" }
     '
+}
+
+# --- offline spool -----------------------------------------------------
+# A failed delivery is written to `<data_dir>/hook-spool/` in the same
+# on-disk contract `ai-memory hook-drain` reads (same filenames, same
+# `SpoolEntry` JSON, same 0600/0700 modes, tmp+rename), so an unreachable
+# or erroring server costs latency instead of the event. The generated
+# TypeScript integrations gained this in #580; the script bundle is the
+# remaining capture path that POSTs and forgets.
+#
+# The backlog is drained at session boundaries and, after any successful
+# 2xx POST, by the detached piggyback drain in ai_memory_kick_drain —
+# never synchronously on the per-tool-call hot path, which must not block
+# the agent.
+
+ai_memory_spool_dir() {
+    printf '%s/hook-spool' "$(ai_memory_state_dir)"
+}
+
+# Unix milliseconds. `date +%s%N` gives nanoseconds on GNU (and the width
+# modifier `%3N` is not honoured everywhere, so it is not used); BSD/macOS
+# date leaves a literal `N`. Anything that is not a long enough run of digits
+# falls back to whole seconds, which keeps filenames ordered and parseable.
+ai_memory_now_ms() {
+    _amnow=$(date +%s%N 2>/dev/null || printf '')
+    case "$_amnow" in
+        '' | *[!0-9]*) _amnow='' ;;
+    esac
+    if [ -n "$_amnow" ] && [ "${#_amnow}" -ge 13 ]; then
+        _amnow=$(printf '%s' "$_amnow" | cut -c1-13)
+    else
+        _amnow="$(date +%s 2>/dev/null || printf '0')000"
+    fi
+    printf '%s' "$_amnow"
+}
+
+# The bearer a drain should replay this event with, or empty for none.
+ai_memory_spool_token() {
+    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
+        printf '%s' "$AI_MEMORY_AUTH_TOKEN"
+        return 0
+    fi
+    _amtf=$(ai_memory_auth_header_file || printf '')
+    [ -n "$_amtf" ] || return 0
+    sed -n 's/^[Aa]uthorization:[[:space:]]*[Bb]earer[[:space:]]*//p' "$_amtf" \
+        | head -n 1 | tr -d '\r\n'
+}
+
+# Persist one undelivered event. Best-effort on top of best-effort capture:
+# every failure path returns 0 so a hook never fails because of the spool.
+ai_memory_spool_event() {
+    _amsurl=$(ai_memory_url_with_ingest_key "$1")
+    _amsbody="$2"
+    _amsdir=$(ai_memory_spool_dir)
+    mkdir -p "$_amsdir" 2>/dev/null || return 0
+    chmod 700 "$_amsdir" 2>/dev/null || true
+    _amstok=$(ai_memory_spool_token)
+    _amsnow=$(ai_memory_now_ms)
+    AI_MEMORY_SPOOL_SEQ=$((${AI_MEMORY_SPOOL_SEQ:-0} + 1))
+    _amsname=$(printf '%013d-%s-%016x.json' "$_amsnow" "$$" "$AI_MEMORY_SPOOL_SEQ")
+    (
+        umask 077
+        {
+            printf '{"url":'
+            printf '%s' "$_amsurl" | ai_memory_json_string
+            printf ',"body":'
+            printf '%s' "$_amsbody" | ai_memory_json_string
+            printf ',"created_ms":%s' "$_amsnow"
+            if [ -n "$_amstok" ]; then
+                printf ',"auth_mode":"static","token":'
+                printf '%s' "$_amstok" | ai_memory_json_string
+            else
+                printf ',"auth_mode":"none"'
+            fi
+            printf ',"attempts":0}'
+        } >"$_amsdir/$_amsname.tmp" 2>/dev/null
+    ) || return 0
+    mv -f "$_amsdir/$_amsname.tmp" "$_amsdir/$_amsname" 2>/dev/null \
+        || rm -f "$_amsdir/$_amsname.tmp" 2>/dev/null
+    return 0
+}
+
+# Read one top-level string field out of a spool entry, undoing the escapes
+# `ai_memory_json_string` produces. The regex is the JSON string grammar, so
+# the match ends at the first quote that is not escaped, which is the only
+# correct way to find the end. `match` itself cannot fail — the pattern accepts
+# the empty string — so the terminator check on the line after it is what
+# rejects an unterminated value, and dropping that line drops the check. An
+# entry carrying a `\uXXXX` escape was written by a richer serializer (the
+# native binary); this prints nothing for it so the caller leaves it to
+# `ai-memory hook-drain`.
+#
+# Nothing accumulates: each segment goes straight to stdout. Appending into a
+# string that grows to the whole value costs time quadratic in the number of
+# appends, and that holds whether the step is one character or one
+# escaped-backslash pair — a 2.2 MB entry of `grep` output over source, where
+# every literal backslash is a pair, cost 36 s a pass that way under
+# one-true-awk. A drain pass reads every entry three times and one detached
+# pass starts behind every delivery that succeeds, so the cost is paid over
+# and over.
+#
+# Splitting on the escaped-backslash pairs first is what makes the unescaping
+# safe: no segment can contain one, so inside a segment every backslash starts
+# a real escape and no placeholder byte is needed, which keeps a raw control
+# byte in the value (`ai_memory_json_string` does not escape those)
+# round-tripping untouched. Validation is a pass of its own so that a declined
+# value prints nothing at all — a partial read must never look like a whole
+# one to `ai_memory_drain_spool`, which reads the field through `|| continue`.
+ai_memory_json_field() {
+    awk -v key="$1" '
+        { text = text (NR > 1 ? "\n" : "") $0 }
+        END {
+            needle = "\"" key "\":\""
+            start = index(text, needle)
+            if (start == 0) exit 1
+            rest = substr(text, start + length(needle))
+            match(rest, /^(\\.|[^"\\])*/)
+            if (substr(rest, RSTART + RLENGTH, 1) != "\"") exit 1
+            parts = split(substr(rest, RSTART, RLENGTH), seg, /\\\\/)
+            for (i = 1; i <= parts; i++)
+                if (seg[i] ~ /\\[^ntr"\/]/) exit 1
+            for (i = 1; i <= parts; i++) {
+                gsub(/\\n/, "\n", seg[i])
+                gsub(/\\t/, "\t", seg[i])
+                gsub(/\\r/, "\r", seg[i])
+                gsub(/\\"/, "\"", seg[i])
+                gsub(/\\\//, "/", seg[i])
+                printf "%s%s", (i == 1 ? "" : "\\"), seg[i]
+            }
+            exit 0
+        }
+    ' "$2"
+}
+
+# Deliver the queued backlog, oldest first. Bounded by count so a drain never
+# becomes an unbounded upload. A 2xx or terminal 4xx retires the entry (delivered,
+# or permanently rejected); transient 408/425/429 or anything else stops the pass
+# and keeps the remainder for the next one. The bearer goes through a 0600 header file
+# rather than curl's argv, for the reason #552 moved it off the command line.
+ai_memory_drain_spool() {
+    _amdmax=${1:-64}
+    _amddir=$(ai_memory_spool_dir)
+    [ -d "$_amddir" ] || return 0
+    _amdn=0
+    for _amdf in "$_amddir"/*.json; do
+        [ -f "$_amdf" ] || break
+        [ "$_amdn" -lt "$_amdmax" ] || break
+        _amdn=$((_amdn + 1))
+        _amdurl=$(ai_memory_json_field url "$_amdf" 2>/dev/null) || continue
+        [ -n "$_amdurl" ] || continue
+        _amdbody=$(ai_memory_json_field body "$_amdf" 2>/dev/null) || continue
+        _amdtok=$(ai_memory_json_field token "$_amdf" 2>/dev/null) || _amdtok=''
+        if [ -n "$_amdtok" ]; then
+            _amdhdr="$_amddir/.drain-header.$$"
+            (umask 077; printf 'Authorization: Bearer %s\n' "$_amdtok" >"$_amdhdr") 2>/dev/null || continue
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+                -w '%{http_code}' -X POST "$_amdurl" \
+                -H "Content-Type: application/json" -H @"$_amdhdr" \
+                --data-binary @- 2>/dev/null) || _amdcode=000
+            rm -f "$_amdhdr" 2>/dev/null || true
+        else
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+                -w '%{http_code}' -X POST "$_amdurl" \
+                -H "Content-Type: application/json" \
+                --data-binary @- 2>/dev/null) || _amdcode=000
+        fi
+        case "$_amdcode" in
+            408|425|429) return 0 ;;
+            2*|4*) rm -f "$_amdf" 2>/dev/null || true ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# Piggyback drain: a delivery that just succeeded proves the server is
+# reachable, so flush the backlog behind it. Detached from the hook's own
+# process so the agent never waits, and a no-op when nothing is queued —
+# which is every call on a healthy install.
+ai_memory_kick_drain() {
+    _amkdir=$(ai_memory_spool_dir)
+    [ -d "$_amkdir" ] || return 0
+    set -- "$_amkdir"/*.json
+    [ -f "$1" ] || return 0
+    (ai_memory_drain_spool 64 >/dev/null 2>&1 &) 2>/dev/null || true
+    return 0
 }

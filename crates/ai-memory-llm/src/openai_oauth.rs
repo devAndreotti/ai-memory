@@ -13,16 +13,16 @@ use base64::Engine as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::auth_file::now_ms;
+use crate::codex_responses::{CodexResponsesAuth, post_codex_responses};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
 /// OpenAI OAuth issuer used by Codex/OpenCode.
 pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
@@ -33,8 +33,7 @@ pub const OPENAI_OAUTH_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize
 /// OpenAI OAuth token endpoint.
 pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// ChatGPT/Codex Responses backend.
-pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub use crate::codex_responses::CODEX_RESPONSES_URL;
 
 /// Public Codex/OpenCode OAuth client id.
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -139,6 +138,8 @@ pub struct OpenAiOAuthProvider {
     token_path: PathBuf,
     token: Mutex<OpenAiOAuthToken>,
     timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
 }
 
 impl OpenAiOAuthProvider {
@@ -160,6 +161,8 @@ impl OpenAiOAuthProvider {
             token_path,
             token: Mutex::new(token),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -168,6 +171,22 @@ impl OpenAiOAuthProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Set Responses API `reasoning.effort`. `None` omits the field so the
+    /// model default applies.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -184,45 +203,18 @@ impl OpenAiOAuthProvider {
 
     async fn post(&self, body: &CodexResponsesRequest<'_>) -> LlmResult<CodexResponsesResponse> {
         let token = self.current_token().await?;
-        debug!(
-            url = CODEX_RESPONSES_URL,
-            "POST openai-oauth codex responses"
-        );
-        let mut request = self
-            .client
-            .post(CODEX_RESPONSES_URL)
-            .timeout(self.timeout)
-            .bearer_auth(token.access.expose_secret())
-            .header("content-type", "application/json")
-            .header(
-                "accept",
-                if body.stream {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
-            .header("openai-beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("session_id", uuid::Uuid::new_v4().to_string())
-            .json(body);
-        if let Some(account_id) = token.extra.account_id.as_deref() {
-            request = request.header("chatgpt-account-id", account_id);
-        }
-        let resp = request.send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        if body.stream {
-            parse_sse_response(&response_text_limited(resp).await?)
-        } else {
-            response_json_limited::<CodexResponsesResponse>(resp).await
-        }
+        post_codex_responses(
+            &self.client,
+            CODEX_RESPONSES_URL,
+            self.timeout,
+            &CodexResponsesAuth {
+                access_token: &token.access,
+                account_id: token.extra.account_id.as_deref(),
+            },
+            &self.extra_headers,
+            body,
+        )
+        .await
     }
 }
 
@@ -238,7 +230,12 @@ impl LlmProvider for OpenAiOAuthProvider {
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let response = self
-            .post(&build_request(&self.model, &request, None))
+            .post(&build_request(
+                &self.model,
+                &request,
+                None,
+                self.reasoning_effort,
+            ))
             .await?;
         Ok(into_chat_response(response))
     }
@@ -257,7 +254,12 @@ impl LlmProvider for OpenAiOAuthProvider {
             },
         };
         let response = self
-            .post(&build_request(&self.model, &request, Some(response_format)))
+            .post(&build_request(
+                &self.model,
+                &request,
+                Some(response_format),
+                self.reasoning_effort,
+            ))
             .await?;
         let text = extract_output_text(&response).unwrap_or_default();
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -288,19 +290,17 @@ async fn refresh_access_token(
     ))
 }
 
-fn build_request<'a>(
+pub(crate) fn build_request<'a>(
     model: &'a str,
     request: &'a ChatRequest,
     text: Option<CodexText>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> CodexResponsesRequest<'a> {
     let input = request
         .messages
         .iter()
         .map(|msg| CodexInputMessage {
-            role: match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: msg.role.as_str(),
             content: vec![CodexInputContent {
                 kind: "input_text",
                 text: &msg.content,
@@ -322,10 +322,13 @@ fn build_request<'a>(
         store: false,
         stream: true,
         text,
+        reasoning: reasoning_effort.map(|effort| CodexReasoning {
+            effort: effort.openai_wire_effort(),
+        }),
     }
 }
 
-fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
+pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
     let mut current_event: Option<String> = None;
     let mut data_lines: Vec<&str> = Vec::new();
     let mut output_text = String::new();
@@ -425,13 +428,16 @@ fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
     Ok(response)
 }
 
-fn model_uses_default_temperature(model: &str) -> bool {
+/// Models on the ChatGPT/Codex and Copilot backends that reject a
+/// caller-supplied `temperature`. Shared by the `openai-oauth`, `codex`
+/// and `copilot` providers.
+pub(crate) fn model_uses_default_temperature(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with('o')
+    m.starts_with("gpt-5") || m.starts_with("gpt-6") || m.starts_with('o')
 }
 
 #[derive(Debug, Serialize)]
-struct CodexResponsesRequest<'a> {
+pub(crate) struct CodexResponsesRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<&'a str>,
@@ -441,9 +447,16 @@ struct CodexResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     store: bool,
-    stream: bool,
+    pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<CodexText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<CodexReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,13 +473,13 @@ struct CodexInputContent<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexText {
-    format: CodexTextFormat,
+pub(crate) struct CodexText {
+    pub(crate) format: CodexTextFormat,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum CodexTextFormat {
+pub(crate) enum CodexTextFormat {
     JsonSchema {
         name: String,
         schema: serde_json::Value,
@@ -475,7 +488,7 @@ enum CodexTextFormat {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexResponsesResponse {
+pub(crate) struct CodexResponsesResponse {
     #[serde(default)]
     output_text: Option<String>,
     #[serde(default)]
@@ -506,7 +519,7 @@ struct CodexUsage {
     output_tokens: u32,
 }
 
-fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
+pub(crate) fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
     let model = response
         .model
         .clone()
@@ -521,7 +534,7 @@ fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
     }
 }
 
-fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
+pub(crate) fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
     if let Some(text) = response
         .output_text
         .as_deref()
@@ -566,7 +579,7 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
+    use rstest::rstest;
     use serde_json::json;
 
     use super::*;
@@ -697,23 +710,50 @@ mod tests {
     }
 
     #[test]
-    fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
+    fn codex_request_omits_gpt6_temperature() {
         let request = ChatRequest {
-            system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, None)).unwrap();
+        let value =
+            serde_json::to_value(build_request("gpt-6-luna", &request, None, None)).unwrap();
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
+    fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
+        let request = ChatRequest {
+            system: Some("sys".into()),
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, None)).unwrap();
         assert_eq!(value["instructions"], "sys");
         assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
         assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("temperature").is_none());
+        assert!(value.get("reasoning").is_none());
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+    }
+
+    #[rstest]
+    #[case::omitted(None, None)]
+    #[case::low(Some(ReasoningEffort::Low), Some("low"))]
+    #[case::persistent_clamps_max(Some(ReasoningEffort::Persistent), Some("max"))]
+    fn codex_request_reasoning_effort(
+        #[case] effort: Option<ReasoningEffort>,
+        #[case] expected: Option<&str>,
+    ) {
+        let request = ChatRequest::user_prompt("hello");
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, effort)).unwrap();
+        match expected {
+            Some(effort) => assert_eq!(value["reasoning"]["effort"], effort),
+            None => assert!(value.get("reasoning").is_none()),
+        }
     }
 
     #[test]
@@ -862,7 +902,8 @@ mod tests {
                 strict: true,
             },
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, Some(text))).unwrap();
+        let value =
+            serde_json::to_value(build_request("gpt-5.5", &request, Some(text), None)).unwrap();
         assert_eq!(value["text"]["format"]["type"], "json_schema");
         assert_eq!(value["text"]["format"]["name"], "Result");
         assert_eq!(value["text"]["format"]["strict"], true);

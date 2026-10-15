@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,11 +46,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi) ;;
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
+    open-code) AGENT="opencode" ;;
+    opencode-v2|open-code2) AGENT="opencode2" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
 
@@ -66,7 +68,14 @@ fi
 if [[ "$AGENT" == "opencode" ]]; then
     echo "OpenCode uses a generated TypeScript plugin, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent opencode --apply"
-    echo "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts."
+    echo "Then restart OpenCode; ai-memory detects V1/V2 and prints the installed plugin path."
+    exit 0
+fi
+
+if [[ "$AGENT" == "opencode2" ]]; then
+    echo "OpenCode 2 uses a generated TypeScript plugin, not shell hook scripts."
+    echo "Run: ai-memory install-hooks --agent opencode2 --apply"
+    echo "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts."
     exit 0
 fi
 
@@ -80,14 +89,16 @@ fi
 if [[ "$AGENT" == "omp" || "$AGENT" == "oh-my-pi" ]]; then
     echo "OMP uses a generated TypeScript extension, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent omp --apply"
-    echo "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts."
+    echo "Then restart OMP so it loads the extension install-hooks reports"
+    echo "(default ~/.omp/agent/extensions/ai-memory-omp.ts)."
     exit 0
 fi
 
 if [[ "$AGENT" == "pi" ]]; then
     echo "Pi uses a generated TypeScript extension, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent pi --apply"
-    echo "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts."
+    echo "Then restart Pi so it loads the extension install-hooks reports"
+    echo "(default ~/.pi/agent/extensions/ai-memory-pi.ts)."
     echo "MCP tools come through the same generated bridge extension."
     exit 0
 fi
@@ -102,9 +113,10 @@ SCRIPTS=(
     "session-end"
 )
 
-# kimi-code also captures the subagent lifecycle (its bundle mirrors
-# hooks/claude-code/, which ships them); the default list omits them.
-if [[ "$AGENT" == "kimi-code" ]]; then
+# claude-code, grok and kimi-code also capture the subagent lifecycle: their
+# bundles ship subagent-start/stop and their hook config points at them. The
+# default list omits them.
+if [[ "$AGENT" == "claude-code" || "$AGENT" == "grok" || "$AGENT" == "kimi-code" ]]; then
     SCRIPTS+=("subagent-start" "subagent-stop")
 fi
 
@@ -124,6 +136,17 @@ fi
 # Command Code's stable hook API exposes exactly these four events. Additional
 # lifecycle boundaries belong to its experimental Mod API and are not shipped.
 if [[ "$AGENT" == "command-code" ]]; then
+    SCRIPTS=(
+        "session-start"
+        "pre-tool-use"
+        "post-tool-use"
+        "stop"
+    )
+fi
+
+# Antigravity CLI wires only PreInvocation (session-start), PreToolUse,
+# PostToolUse and Stop, and its bundle ships exactly those four scripts.
+if [[ "$AGENT" == "antigravity-cli" ]]; then
     SCRIPTS=(
         "session-start"
         "pre-tool-use"
@@ -161,6 +184,18 @@ if [[ -z "$expected_sum" || "$actual_sum" != "$expected_sum" ]]; then
     exit 1
 fi
 echo "Installing ai-memory hooks for $AGENT into $DEST"
+# Every event script sources _lib.sh from its own directory or the one above
+# it, so the helper goes beside the agent directories, where `install-hooks`
+# also looks when it stages a bundle. A script installed without it stops at
+# the line that sources it.
+source="$TMP/_lib.sh"
+if tar -xOf "$TMP/$ARCHIVE" "hooks/_lib.sh" > "$source" && [[ -s "$source" ]]; then
+    install -m 0644 "$source" "$TO/_lib.sh"
+    echo "  ✓ _lib"
+else
+    echo "  ✗ _lib (missing from verified release bundle)" >&2
+    exit 1
+fi
 for name in "${SCRIPTS[@]}"; do
     member="hooks/$AGENT/${name}.sh"
     source="$TMP/${name}.sh"

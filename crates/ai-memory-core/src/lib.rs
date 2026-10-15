@@ -7,12 +7,28 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod agent_backup;
 pub mod error;
+pub mod fix_lines;
 pub mod handoff;
+pub mod ingest_metrics;
+pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod latency;
+pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
+pub mod log_ledger;
+pub mod message;
 pub mod observation;
+pub mod okf;
 pub mod page;
+pub mod profile;
+pub mod repository_identity;
+pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
+pub mod scaffolding;
+pub use scaffolding::{
+    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+};
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
@@ -36,39 +52,62 @@ pub const DEFAULT_PROJECT_NAME: &str = "scratch";
 pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
 pub use active_project::{
-    ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
-    MidSessionRouting,
+    ActiveProject, ActiveProjectLookup, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES,
+    DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
+    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
     SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
     skip_admission_chain_for,
 };
+pub use agent_backup::{
+    AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
+    AgentBackupManifest, HostInfo,
+};
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
+pub use handoff::{
+    Handoff, HandoffAcceptance, HandoffContent, HandoffLifecycle, HandoffOrigin, HandoffScope,
+    HandoffState, NewHandoff,
+};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
-    ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
-    WorkstreamId,
+    AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
+    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
+    UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
+    portable_page_key,
+};
+pub use message::{
+    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
+    UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
-    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, Tier,
-    normalize_entities, normalize_entity,
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
+    PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
+    normalize_entity, parse_expires_at_instant,
 };
-pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
+pub use routing_snippet::{
+    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
+    full_block,
+};
 pub use sanitize::{
-    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
-    truncate_utf8_bytes_head_tail,
+    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_for_title,
+    truncate_utf8_bytes, truncate_utf8_bytes_head_tail,
 };
 pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
     slot_placement,
 };
-pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
+pub use user::{
+    ApiCredential, EXTERNAL_API_KEY_PREFIX, MAX_EMAIL_LEN, MAX_HUMAN_PASSWORD_BYTES,
+    MAX_USERNAME_LEN, MIN_HUMAN_PASSWORD_BYTES, NATIVE_API_KEY_PREFIX, NewUser,
+    SESSION_SECRET_PREFIX, User, UserRole, validate_email, validate_human_password,
+    validate_username,
+};
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse, ManagedRunStatus,
-    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
-    UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
+    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
+    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
+    RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent,
+    WorkstreamEventKind, scrub_workstream_provenance,
 };

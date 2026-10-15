@@ -9,14 +9,16 @@
 //!
 //! `setup-agent` bundles the extract + render into one command:
 //!
-//!     docker run --rm \
-//!       -v "$HOME/.ai-memory:/host" \
-//!       akitaonrails/ai-memory:latest \
-//!       setup-agent \
-//!         --agent claude-code \
-//!         --to /host/hooks \
-//!         --host-prefix "$HOME/.ai-memory/hooks" \
-//!         --auth-token "$TOKEN"
+//! ```text
+//! docker run --rm \
+//!   -v "$HOME/.ai-memory:/host" \
+//!   akitaonrails/ai-memory:latest \
+//!   setup-agent \
+//!     --agent claude-code \
+//!     --to /host/hooks \
+//!     --host-prefix "$HOME/.ai-memory/hooks" \
+//!     --auth-token "$TOKEN"
+//! ```
 //!
 //! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.{sh,ps1}` into
 //!    `/host/hooks/claude-code/` (which on the host is
@@ -34,14 +36,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::cli::{AgentChoice, SetupAgentArgs};
-use crate::commands::install_mcp;
+use crate::cli::{
+    AgentChoice, HookInstallScope, InstallHooksArgs, InstallMcpArgs, McpClient, SetupAgentArgs,
+};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload,
-    hook_script_for_current_platform,
+    COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
+    build_pool_settings_yaml, hook_script_for_current_platform,
 };
+use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
 /// Run the `setup-agent` subcommand.
@@ -50,7 +54,25 @@ use crate::config::{Config, DEFAULT_SERVER_URL};
 /// Returns an error if the source bundle can't be located, the
 /// destination directory can't be created, any script copy fails,
 /// or the JSON config can't be serialised.
-pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
+pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
+    args.agent = match (args.agent, args.opencode_dialect) {
+        (AgentChoice::OpenCode, Some(choice)) => match choice.dialect() {
+            ai_memory_workstream::OpenCodeDialect::V1 => AgentChoice::OpenCode,
+            ai_memory_workstream::OpenCodeDialect::V2 => AgentChoice::OpenCode2,
+        },
+        (AgentChoice::OpenCode, None) => bail!(
+            "setup-agent --agent opencode requires --opencode-dialect v1|v2 because a container cannot inspect the host executable"
+        ),
+        (AgentChoice::OpenCode2, None) => AgentChoice::OpenCode2,
+        (AgentChoice::OpenCode2, Some(_)) => bail!(
+            "--opencode-dialect cannot be combined with the force-V2 opencode2 compatibility alias"
+        ),
+        (agent, None) => agent,
+        (agent, Some(_)) => bail!(
+            "--opencode-dialect is valid only with --agent opencode, not {}",
+            agent.kind().as_str()
+        ),
+    };
     let server_url = if args.server_url == DEFAULT_SERVER_URL && config.server_url_configured() {
         normalise_hook_server_url(&config.server_url)
     } else {
@@ -58,20 +80,49 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     };
     let args = SetupAgentArgs {
         server_url,
-        auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
+        // Only an inline token may be printed into snippets; one read from
+        // `[auth].bearer_token_file` stays out of rendered configs (#552).
+        auth_token: args
+            .auth_token
+            .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned)),
         ..args
     };
     if matches!(
         args.agent,
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw
+        AgentChoice::OpenCode
+            | AgentChoice::OpenCode2
+            | AgentChoice::Pi
+            | AgentChoice::Omp
+            | AgentChoice::Openclaw
     ) {
-        emit_extension_setup_hint(&args)?;
+        emit_extension_setup_hint(config, &args)?;
         return Ok(());
     }
-    // Zero runs ai-memory's native `hook` command directly (exec form,
-    // no scripts to stage) — setup-agent just prints the hooks.json.
+    // Zero and ZCode run ai-memory's native `hook` command directly (exec
+    // form, no scripts to stage) — setup-agent just prints their config.
     if matches!(args.agent, AgentChoice::Zero) {
         emit_zero(&args)?;
+        return Ok(());
+    }
+    if matches!(args.agent, AgentChoice::Zcode) {
+        emit_zcode(&args)?;
+        return Ok(());
+    }
+    // Hermes also runs the native `hook` command directly (no shell), so there
+    // are no scripts to stage — setup-agent prints the YAML block instead.
+    if matches!(args.agent, AgentChoice::Hermes) {
+        emit_hermes(&args)?;
+        return Ok(());
+    }
+    // Droid has no script bundle either: its hooks.json runs the native
+    // `hook` command.
+    if matches!(args.agent, AgentChoice::Droid) {
+        emit_droid(&args)?;
+        return Ok(());
+    }
+    // Muse too: its settings.json hooks run the native `hook` command.
+    if matches!(args.agent, AgentChoice::Muse) {
+        emit_muse(&args)?;
         return Ok(());
     }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
@@ -159,11 +210,20 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::KiroCliV3 => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
+        AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::CopilotCli => {
+            emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
+        }
         AgentChoice::OpenCode
+        | AgentChoice::OpenCode2
         | AgentChoice::Pi
         | AgentChoice::Omp
         | AgentChoice::Openclaw
-        | AgentChoice::Zero => {
+        | AgentChoice::Zero
+        | AgentChoice::Zcode
+        | AgentChoice::Hermes
+        | AgentChoice::Droid
+        | AgentChoice::Muse => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -193,9 +253,121 @@ fn emit_zero(args: &SetupAgentArgs) -> Result<()> {
     if args.auth_token.is_some() {
         println!("#       Treat hooks.json as sensitive (chmod 600).");
     }
-    println!("# NOTE: Zero discards sessionStart stdout, so this config captures");
-    println!("#       but does not inject handoffs; recover them via the MCP");
-    println!("#       `memory_handoff_accept` tool.");
+    print!(
+        "{}",
+        super::install_hooks::zero_install_notes("<ai-memory data dir>")
+    );
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print ZCode's `hooks` block (#512). No scripts are staged: ZCode
+/// spawns the ai-memory binary exec-form (`type: "process"`) with the
+/// event JSON on stdin, so the only artifact is the config block. The
+/// binary must be reachable on the host that runs ZCode — for
+/// docker-wrapper setups install the native binary or point `command`
+/// at the wrapper.
+fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_zcode_hooks_config(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing ZCode hook config")?;
+    println!("# ZCode (z.ai) — merge the `hooks` block into ~/.zcode/cli/config.json");
+    println!("# The `command` must be an ai-memory binary reachable on the host");
+    println!("# that runs ZCode; prefer `ai-memory install-hooks --agent zcode --apply`");
+    println!("# from that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat the config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
+    println!("#       prior session's handoff is delivered automatically.");
+    println!("# NOTE: ZCode fires `Stop` per turn and has no SessionEnd — close");
+    println!("#       sessions with `ai-memory finalize-session --agent zcode`.");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks:` block for `~/.hermes/config.yaml` (the follow-up to
+/// #623, where Hermes was accepted for capture/storage but had no installer).
+/// No scripts are staged: Hermes splits the configured `command` itself and
+/// runs the ai-memory binary directly with the JSON payload on stdin. The
+/// binary must be reachable on the host that runs Hermes — for docker-wrapper
+/// setups install the native binary or point `command` at the wrapper.
+fn emit_hermes(args: &SetupAgentArgs) -> Result<()> {
+    let block = crate::commands::render_shared::build_hermes_hooks_yaml(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    println!("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml");
+    println!("# The `command` must be an ai-memory binary reachable on the host that");
+    println!("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from");
+    println!("# that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat the config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Hermes splits each `command` with shlex.split and runs it with");
+    println!("#       no shell, so the generated line is argv, not a shell command.");
+    println!("# NOTE: tool observations only — session lifecycle stays with the");
+    println!("#       ai-memory memory-provider plugin.");
+    println!();
+    println!("{block}");
+    Ok(())
+}
+
+/// Print the event map for `~/.factory/hooks.json` (#1240). No scripts are
+/// staged: each entry runs the ai-memory binary's native `hook` command with
+/// Droid's event JSON on stdin, so the binary must be reachable on the host
+/// that runs Droid.
+fn emit_droid(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_droid_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload["hooks"]).context("serializing Droid hook config")?;
+    println!("# Factory Droid — merge into ~/.factory/hooks.json (the file is the");
+    println!("# event map itself). The `command` must be an ai-memory binary reachable");
+    println!("# on the host that runs Droid; prefer `ai-memory install-hooks --agent");
+    println!("# droid --apply` from that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat hooks.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks` block for Muse's `settings.json`. No scripts are staged:
+/// each entry runs the ai-memory binary's native `hook` command with Muse's
+/// event JSON on stdin, so the binary must be reachable on the host that runs
+/// Muse.
+fn emit_muse(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_muse_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload["hooks"]).context("serializing Muse hook config")?;
+    println!("# Meta Muse Code — merge under the `hooks` key of");
+    println!("# ${{XDG_CONFIG_HOME:-~/.config}}/muse/settings.json, keeping its");
+    println!("# \"schema_version\": 1. The `command` must be an ai-memory binary reachable");
+    println!("# on the host that runs Muse; prefer `ai-memory install-hooks --agent muse");
+    println!("# --apply` from that host so the path and data dir are resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
     println!();
     println!("{serialized}");
     Ok(())
@@ -205,13 +377,19 @@ fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
+fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<()> {
     let (label, agent, restart_note, mcp_client) = match args.agent {
         AgentChoice::OpenCode => (
             "OpenCode",
             "opencode",
             "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts.",
             "opencode",
+        ),
+        AgentChoice::OpenCode2 => (
+            "OpenCode 2",
+            "opencode2",
+            "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts.",
+            "opencode2",
         ),
         AgentChoice::Omp => (
             "OMP",
@@ -241,6 +419,53 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
         "# Legacy shell/PowerShell and remote-only paths are unsupported compatibility modes."
     );
     println!("# Install it directly instead:");
+    if matches!(args.agent, AgentChoice::OpenCode | AgentChoice::OpenCode2) {
+        let dialect = if args.agent == AgentChoice::OpenCode {
+            ai_memory_workstream::OpenCodeDialect::V1
+        } else {
+            ai_memory_workstream::OpenCodeDialect::V2
+        };
+        install_hooks::run_with_opencode_dialect(
+            config,
+            InstallHooksArgs {
+                agent: AgentChoice::OpenCode,
+                hooks_dir: None,
+                server_url: Some(args.server_url.clone()),
+                auth_token: args.auth_token.clone(),
+                as_user: None,
+                apply: false,
+                config_file: None,
+                scope: HookInstallScope::Global,
+                project_strategy: None,
+                capture_assistant: false,
+                capture_mode: None,
+                no_capture_prompts: false,
+                capture_prompts: false,
+                profile: None,
+            },
+            Some(dialect),
+        )?;
+        install_mcp::run_with_opencode_dialect(
+            config,
+            InstallMcpArgs {
+                client: McpClient::OpenCode,
+                server_url: Some(args.server_url.clone()),
+                name: "ai-memory".to_string(),
+                auth_token: args.auth_token.clone(),
+                apply: false,
+                config_file: None,
+                session_aware: false,
+                flavor: None,
+                token_env_var: false,
+                stdio_bridge: false,
+                bridge_data_dir: None,
+            },
+            Some(dialect),
+        )?;
+        println!();
+        println!("{restart_note}");
+        return Ok(());
+    }
     println!("ai-memory install-hooks --agent {agent} --apply \\");
     if args.auth_token.is_some() {
         println!("  --server-url {} \\", args.server_url);
@@ -303,8 +528,10 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
         );
     }
     println!("# NOTE: Grok ignores SessionStart stdout, so this config captures");
-    println!("#       lifecycle events but does not inject handoffs automatically.");
-    println!("#       Recover handoffs via the MCP memory_handoff_accept tool.");
+    println!("#       lifecycle events but does not inject handoffs on that event.");
+    println!("#       `install-hooks --agent grok --apply` also writes");
+    println!("#       $GROK_HOME/rules/ai-memory-handoff.md so the first turn");
+    println!("#       calls memory_handoff_list (PostToolUse then claims it).");
     println!("# Tip: also run `ai-memory install-mcp --client grok --auth-token <…>`");
     println!(
         "#      to register the MCP endpoint in {}.",
@@ -313,6 +540,29 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     println!();
     println!("{serialized}");
     Ok(())
+}
+
+/// Print Pool's `.poolside/settings.yaml` `hooks:` block. The staged `.sh`
+/// scripts are the artifact — Pool's hook config is a project-scoped YAML
+/// file at the repo root, so the snippet is pasted into each repository
+/// rather than written by ai-memory.
+fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
+    let snippet = build_pool_settings_yaml(emit_root, &args.server_url, args.auth_token.as_deref());
+    println!("# Pool (Poolside Agent CLI) — merge into the repo-root .poolside/settings.yaml");
+    println!("# of each project Pool runs in; ai-memory does not write committed project files.");
+    println!("# Hook scripts (must be reachable from the host that runs Pool):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat .poolside/settings.yaml as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Pool's SessionStart stdout injection is not demonstrated — capture");
+    println!("#       works, but handoff injection does not. Recover handoffs via the");
+    println!("#       MCP memory_handoff_accept tool, and close finished sessions with");
+    println!("#       `ai-memory finalize-session --agent pool` (no true session-end event).");
+    println!();
+    print!("{snippet}");
 }
 
 fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
@@ -474,12 +724,12 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
     if let Some(exe) = exe {
         // Release tarball: `hooks/` sits in the same dir as the binary.
         if let Some(dir) = exe.parent() {
-            v.push(dir.join("hooks").join(sub));
+            v.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
         // Repo-local fallback for `cargo run setup-agent` during dev:
         // target/<profile>/<bin> → repo root.
         if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-            v.push(root.join("hooks").join(sub));
+            v.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
     }
     v
@@ -533,6 +783,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = SetupAgentArgs {
             agent: AgentChoice::Pi,
+            opencode_dialect: None,
             to: tmp.path().join("hooks"),
             host_prefix: None,
             server_url: "http://127.0.0.1:49374".into(),
@@ -549,6 +800,7 @@ mod tests {
     fn devin_setup_emits_script_hook_config() {
         let args = SetupAgentArgs {
             agent: AgentChoice::Devin,
+            opencode_dialect: None,
             to: PathBuf::from("/container/hooks"),
             host_prefix: Some(PathBuf::from("/host/hooks")),
             server_url: "http://127.0.0.1:49374".into(),
@@ -611,6 +863,7 @@ mod tests {
         let dest = tmp.path().join("dest");
         let args = SetupAgentArgs {
             agent: AgentChoice::Devin,
+            opencode_dialect: None,
             to: dest.clone(),
             host_prefix: None,
             server_url: "http://127.0.0.1:49374".into(),

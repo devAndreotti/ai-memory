@@ -11,13 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId, NewHandoff, NewObservation,
-    NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
-    Sanitized, SessionId, UserId, WorkspaceId,
+    AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
+    ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
+    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
+    SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
+use crate::api_credentials;
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
@@ -26,13 +29,16 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, PagesMode,
-    PurgeSummary, ReorgSummary,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
+use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
+    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -56,6 +62,71 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<ProjectId>>,
     },
+    GetOrCreateProjectAs {
+        workspace_id: WorkspaceId,
+        name: String,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<(ProjectId, bool)>>,
+    },
+    SetNewProjectMode {
+        mode: crate::AccessMode,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SetAccessMode {
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+        reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
+    },
+    SetProjectProfileFlags {
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    RecordProfileHarvest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    ClearProfileHarvestMarks {
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    RecordProfileEntries {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ResolveProjectByIdentity {
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
+        name: String,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<(ProjectId, ops::IdentityResolution)>>,
+    },
+    ResolveProjectNameForWrite {
+        workspace_id: WorkspaceId,
+        name: String,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+        reply: oneshot::Sender<StoreResult<ops::ProjectNameWriteResolution>>,
+    },
+    ResolveProjectAliasesForWrite {
+        workspace_id: WorkspaceId,
+        canonical: String,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        reply: oneshot::Sender<StoreResult<Option<ops::ProjectAliasWriteResolution>>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -71,11 +142,42 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         name: String,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ScopeIsPurged {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    PurgedSessionIds {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<Vec<SessionId>>>,
+    },
+    RecordBootstrapChunk {
+        fingerprint: String,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    LoadBootstrapProgress {
+        fingerprint: String,
+        reply: oneshot::Sender<StoreResult<Vec<ops::BootstrapChunkRecord>>>,
+    },
+    ClearBootstrapProgress {
+        fingerprint: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
+    },
+    UpsertPageIf {
+        page: NewPage,
+        precondition: ops::PagePrecondition,
+        reply: oneshot::Sender<StoreResult<ops::ConditionalUpsert>>,
     },
     UpsertPageBatch {
         pages: Vec<NewPage>,
@@ -95,6 +197,7 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         path: PagePath,
         expected_latest_id: PageId,
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     BeginSession {
@@ -134,21 +237,25 @@ pub(crate) enum WriteCmd {
         obs: NewObservation,
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     EndAdmittedSessionWithHandoff {
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
     EndAdmittedLifecycleOnlySession {
         admitted: AdmittedSession,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
     CompleteObservationIngest {
@@ -162,6 +269,12 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     EnqueueSessionConsolidation {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    EnqueueSessionCheckpoint {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         session_id: SessionId,
@@ -186,13 +299,39 @@ pub(crate) enum WriteCmd {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ReconcileSessionConsolidationCompleted {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
+    CheckpointSessionHandoff {
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<Option<HandoffId>>>,
+    },
     AcceptHandoff {
         acceptance: HandoffAcceptance,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    /// Expire every open handoff in one scope (#513). See
+    /// [`ops::expire_open_handoffs`] for why this ignores the automatic
+    /// sweep's exemptions.
+    ExpireOpenHandoffs {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
+    /// Record that an embed attempt produced no embedding (#528).
+    RecordEmbedFailure {
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     CancelHandoff {
         handoff_id: HandoffId,
@@ -200,6 +339,24 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    InsertMessage {
+        message: NewAgentMessage,
+        reply: oneshot::Sender<StoreResult<MessageId>>,
+    },
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    PopMessage {
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Retract still-pending outbox messages a project has sent.
+    CancelMessages {
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
     /// mash-up pages. Executed in one transaction for atomicity.
@@ -237,6 +394,13 @@ pub(crate) enum WriteCmd {
         expected_latest_id: PageId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    SoftDeleteForReconcileIfLatest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     HardDeleteDecayedPageChain {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -245,6 +409,13 @@ pub(crate) enum WriteCmd {
         expected_latest_id: Option<PageId>,
         cutoff_us: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    PruneConsolidatedObservations {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+        reply: oneshot::Sender<StoreResult<ObservationPruneOutcome>>,
     },
     HealCatchAllRepoPaths {
         home: Option<String>,
@@ -262,6 +433,14 @@ pub(crate) enum WriteCmd {
         embeddings: Vec<EmbeddingWrite>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    StoreAbstractEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    DeleteAbstractEmbedding {
+        page_id: PageId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     DeleteStalePageEmbeddings {
         workspace_id: WorkspaceId,
         project_id: Option<ProjectId>,
@@ -270,9 +449,12 @@ pub(crate) enum WriteCmd {
         dim: u32,
         reply: oneshot::Sender<StoreResult<u64>>,
     },
-    /// Delete a project and all its data (pages, sessions, observations,
-    /// handoffs, embeddings) in one transaction. Returns the paths of
-    /// every page file that must be removed from disk by the caller.
+    /// Delete a project's rows (pages, sessions, observations, handoffs,
+    /// embeddings) in one transaction. Returns the paths of every page file
+    /// that must be removed from disk by the caller.
+    ///
+    /// A logical delete unless `compaction` is [`ops::Compaction::Reclaim`]:
+    /// freed bytes stay in the file until it is rewritten.
     PurgeProject {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -283,13 +465,58 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Purge even when a managed workstream still holds a live run lease.
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — unlike [`WriteCmd::MoveSession`]'s dry
+        /// run, which runs the real write and rolls it back. See
+        /// [`crate::ops::PurgeMode`]'s doc for why: a rolled-back delete on a
+        /// large project would still hold the writer actor for as long as a
+        /// real purge does.
+        mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
+    },
+    /// Delete one session and everything derived from it, inside a single
+    /// `(workspace, project)` scope. See [`ops::purge_session`].
+    PurgeSession {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        /// Authenticated operator recorded in the `audit_log` row.
+        author_id: Option<ai_memory_core::UserId>,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
+        mode: crate::ops::PurgeMode,
+        reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
+    },
+    /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
+    /// deleting nothing. See [`ops::compact`].
+    Compact {
+        reply: oneshot::Sender<StoreResult<crate::ops::CompactSummary>>,
+    },
+    /// Delete the superseded ledger page versions the pre-#660 indexer left
+    /// behind, and nothing else. See [`ops::reclaim_ledger_versions`].
+    ReclaimLedgerVersions {
+        /// Report what would go without deleting it.
+        dry_run: bool,
+        /// Also drop each ledger's live row, not just its superseded versions.
+        drop_latest: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        reply: oneshot::Sender<StoreResult<crate::ops::ReclaimLedgerVersionsSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
+        mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
@@ -321,6 +548,19 @@ pub(crate) enum WriteCmd {
         commit: bool,
         reply: oneshot::Sender<StoreResult<MoveSessionSummary>>,
     },
+    /// Validate and, when `commit`, apply a batch of session-time
+    /// corrections scoped to `(workspace_id, project_id)`, in one
+    /// transaction (`ai-memory repair-backfill-timestamps`). `commit = false`
+    /// rolls back after validating, so the reply is an exact dry run.
+    RepairSessionTimes {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<ops::SessionTimesCandidate>,
+        now_us: i64,
+        author_id: Option<UserId>,
+        commit: bool,
+        reply: oneshot::Sender<StoreResult<ops::RepairSessionTimesSummary>>,
+    },
     /// Rename a project's `name` column without moving any files (the wiki
     /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
     /// when `new_name` is already used in the same workspace.
@@ -333,6 +573,24 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    /// One-shot in-place OKF conformance of every latest page row.
+    OkfMigrateLatestPages {
+        reply: oneshot::Sender<StoreResult<Vec<ops::OkfMigratedPage>>>,
+    },
+    /// Idempotent in-place repair of date-only OKF `stale_after` values.
+    RepairDateOnlyStaleAfter {
+        reply: oneshot::Sender<StoreResult<ops::StaleAfterRepair>>,
+    },
+    /// Read-only count of latest rows still lacking OKF conformance.
+    OkfNonconformantCount {
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
+    /// Record a completed cross-session ("experience") pass for a scope.
+    MarkExperiencePassRun {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Record a successfully-applied wiki-structure migration.
     InsertWikiMigration {
         name: String,
@@ -340,22 +598,105 @@ pub(crate) enum WriteCmd {
         applied_at: i64,
         reply: oneshot::Sender<StoreResult<()>>,
     },
-    CreateUser {
-        new_user: NewUser,
-        token_hash: [u8; TOKEN_HASH_LEN],
+    BootstrapRoot {
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
         reply: oneshot::Sender<StoreResult<UserId>>,
     },
-    RotateUserToken {
+    RecoverRoot {
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    GrantMemory {
         user_id: UserId,
+        repository_id: ProjectId,
+        role: crate::GrantLevel,
+        granted_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<crate::grants::GrantOutcome>>,
+    },
+    RevokeMemory {
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    CreateHumanUser {
+        new_user: NewUser,
+        role: UserRole,
+        password_hash: Option<String>,
+        must_change_password: bool,
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    ResetHumanPassword {
+        user_id: UserId,
+        password_hash: String,
+        must_change_password: bool,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    SetUserDisabled {
+        user_id: UserId,
+        disabled: bool,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    PatchUser {
+        user_id: UserId,
+        name: Option<Option<String>>,
+        email: Option<Option<String>>,
+        role: Option<UserRole>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ChangePassword {
+        user_id: UserId,
+        expected_password_hash: String,
+        new_password_hash: String,
+        session_id: Uuid,
+        new_session_hash: [u8; TOKEN_HASH_LEN],
+        new_csrf_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    IssueWebSession {
+        user_id: UserId,
+        expected_password_hash: String,
+        expected_role: UserRole,
+        expected_must_change: bool,
+        session_hash: [u8; TOKEN_HASH_LEN],
+        csrf_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<WebSession>>,
+    },
+    RevokeWebSession {
+        session_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    TouchWebSession {
+        session_id: Uuid,
+        last_used_at: i64,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    CreateApiCredential {
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        reply: oneshot::Sender<StoreResult<ApiCredentialId>>,
+    },
+    RotateApiCredential {
+        id: ApiCredentialId,
         new_token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    ExpireUserToken {
-        user_id: UserId,
+    RevokeApiCredential {
+        id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    ReviveUserToken {
-        user_id: UserId,
+    TouchApiCredential {
+        id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     TouchUserLastSeen {
@@ -395,12 +736,21 @@ pub(crate) enum WriteCmd {
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    RecordAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -417,6 +767,14 @@ pub(crate) enum WriteCmd {
         native_session_id: String,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    LinkOrAdoptManagedRunSession {
+        input: LinkOrAdoptManagedRunSession,
+        reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
+    },
+    LinkManagedRunSessionInScope {
+        input: LinkManagedRunSessionInScope,
+        reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
+    },
     AcceptManagedRunContext {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -425,11 +783,26 @@ pub(crate) enum WriteCmd {
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
+        recover_expired: bool,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
+    },
+    RenameWorkstream {
+        input: RenameWorkstream,
+        reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
+    },
+    AuthorizeProject {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+        need: crate::ProjectAccess,
+        reply: oneshot::Sender<StoreResult<Result<(), ai_memory_core::AuthzError>>>,
     },
     Shutdown,
 }
@@ -480,6 +853,41 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// The per-project authorization choke point (#708), evaluated on the
+    /// **writer** connection as defense in depth for writes: a write decision
+    /// is made against the same connection that will perform the write, so it
+    /// cannot race a concurrent grant/access-mode change between a read-pool
+    /// check and the write.
+    ///
+    /// Returns `Ok(Ok(()))` when admitted, `Ok(Err(Forbidden))` when a
+    /// restricted project refuses the caller, and `Err(_)` only on an
+    /// infrastructure failure. In slice 2 every project is `open`, so this is a
+    /// pass-through.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the authz resolver.
+    pub async fn authorize_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+        need: crate::ProjectAccess,
+    ) -> StoreResult<Result<(), ai_memory_core::AuthzError>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AuthorizeProject {
+            workspace_id,
+            project_id,
+            principal,
+            distinguishes_operators,
+            need,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Resolve a project by `(workspace_id, name)`, creating it atomically
     /// if missing.
     ///
@@ -497,6 +905,313 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// [`Self::get_or_create_project`] on behalf of `creator`, who is recorded
+    /// as the project's `created_by` in the same transaction when this call
+    /// creates the row. Returns whether it did — see
+    /// [`ops::get_or_create_project_as`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn get_or_create_project_as(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, bool)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GetOrCreateProjectAs {
+            workspace_id,
+            name: name.into(),
+            repo_path,
+            creator,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Set the access mode newly created projects start in — the server's
+    /// `[auth] new_projects_restricted`. Called once at startup; until then,
+    /// and on every install that never calls it, new projects are open.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn set_new_project_mode(&self, mode: crate::AccessMode) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetNewProjectMode { mode, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Set one project's access mode, returning the mode it had, or `None` when
+    /// there is no such project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_access_mode(
+        &self,
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+    ) -> StoreResult<Option<crate::AccessMode>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetAccessMode {
+            project_id,
+            mode,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist a project's `[profile]` flags (forwarded from its marker at
+    /// session start). A no-op when they already match.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_profile_flags(
+        &self,
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectProfileFlags {
+            project_id,
+            flags,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one project's profile candidates and advance its harvest marks
+    /// in one transaction. Re-recording a candidate is a no-op; returns how
+    /// many were new.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_harvest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileHarvest {
+            workspace_id,
+            project_id,
+            candidates,
+            mark,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record the profile entries the harvester wrote into a profile scope,
+    /// in one transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileEntries {
+            workspace_id,
+            project_id,
+            entries,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Forget every profile harvest mark (`ai-memory profile rebuild`).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn clear_profile_harvest_marks(&self) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearProfileHarvestMarks { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve the project a repository identity routes to, creating it when
+    /// needed — see [`ops::resolve_project_by_identity`] for the rules.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_project_by_identity(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            false,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_project_by_identity_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectByIdentity {
+            workspace_id,
+            identity,
+            style,
+            promote,
+            name: name.into(),
+            repo_path,
+            candidate,
+            creator,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve repository identity for capture and allow transactional
+    /// canonical-name promotion after authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_project_by_identity_for_capture(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            true,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
+    }
+
+    /// Resolve marker aliases inside one workspace and atomically authorize any
+    /// Phase 1 canonical-name promotion. Returns `None` when no alias exists.
+    pub async fn resolve_project_aliases_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical: impl Into<String>,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<Option<ops::ProjectAliasWriteResolution>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectAliasesForWrite {
+            workspace_id,
+            canonical: canonical.into(),
+            aliases,
+            repository,
+            principal,
+            distinguishes_operators,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    pub(crate) async fn resolve_project_name_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_project_name_for_write_without_promotion(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            false,
+        )
+        .await
+    }
+
+    async fn resolve_project_name_for_write_mode(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectNameForWrite {
+            workspace_id,
+            name: name.into(),
+            principal,
+            distinguishes_operators,
+            promote,
             reply: tx,
         })
         .await?;
@@ -556,6 +1271,7 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         name: impl Into<String>,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EnsureProjectWithId {
@@ -563,6 +1279,108 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            identity,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Whether the scope was purged by `purge_project` / `delete_workspace` and
+    /// tombstoned. `reindex` consults this before recreating a scope from
+    /// on-disk `_meta.md` so a purge that crashed before its files were removed
+    /// cannot be silently undone (#607). Routed through the writer actor
+    /// because it owns the connection and is always present.
+    pub async fn scope_is_purged(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Session ids tombstoned by `purge_session` in this scope. The wiki
+    /// reindex consults these so a purge whose page-file removal did not
+    /// complete cannot be undone by the next pass (#701). Loaded once per
+    /// directory per pass, not once per page. Routed through the writer actor
+    /// for the same reason [`Self::scope_is_purged`] is.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn purged_session_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgedSessionIds {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Durably record one completed bootstrap chunk's output, keyed by a
+    /// fingerprint of the run's inputs (#621). See
+    /// [`crate::ops::record_bootstrap_chunk`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_bootstrap_chunk(
+        &self,
+        fingerprint: String,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordBootstrapChunk {
+            fingerprint,
+            chunk_index,
+            pages_json,
+            rationale,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Load every recorded chunk for `fingerprint`, ordered by chunk index.
+    /// See [`crate::ops::load_bootstrap_progress`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn load_bootstrap_progress(
+        &self,
+        fingerprint: String,
+    ) -> StoreResult<Vec<ops::BootstrapChunkRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LoadBootstrapProgress {
+            fingerprint,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete every recorded chunk for `fingerprint`. Call once a bootstrap
+    /// run completes successfully. See [`crate::ops::clear_bootstrap_progress`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn clear_bootstrap_progress(&self, fingerprint: String) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearBootstrapProgress {
+            fingerprint,
             reply: tx,
         })
         .await?;
@@ -702,12 +1520,15 @@ impl WriterHandle {
     }
 
     /// Atomically validate/admit a hook session and insert its observation.
+    /// `moved_from_cwd` marks an explicit native relocation; see
+    /// `ops::admit_hook_session_event`.
     pub async fn admit_hook_session_event(
         &self,
         session: NewSession,
         obs: Sanitized<NewObservation>,
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
@@ -715,6 +1536,7 @@ impl WriterHandle {
             obs: obs.into_inner(),
             owner_filter,
             ingest_key,
+            moved_from_cwd,
             reply: tx,
         })
         .await?;
@@ -722,15 +1544,20 @@ impl WriterHandle {
     }
 
     /// Guarded hook end.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_session(
         &self,
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
+        occurred_at: Option<i64>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSession {
             admitted,
             summary_page_id,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -738,17 +1565,22 @@ impl WriterHandle {
     }
 
     /// Guarded hook end plus automatic handoff.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_session_with_handoff(
         &self,
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
+        occurred_at: Option<i64>,
     ) -> StoreResult<HandoffId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSessionWithHandoff {
             admitted,
             summary_page_id,
             handoff,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -756,13 +1588,18 @@ impl WriterHandle {
     }
 
     /// Guarded hook lifecycle-only end.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_lifecycle_only_session(
         &self,
         admitted: AdmittedSession,
+        occurred_at: Option<i64>,
     ) -> StoreResult<LifecycleOnlyEndOutcome> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedLifecycleOnlySession {
             admitted,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -825,7 +1662,29 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Atomically claim the oldest due SessionEnd consolidation job.
+    /// Persist one checkpoint job (PreCompact / PostCompaction) for the
+    /// current observation generation. Duplicate generations are idempotent.
+    /// The session may already have ended: a resumed session keeps
+    /// `ended_at` while it captures again.
+    pub async fn enqueue_session_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnqueueSessionCheckpoint {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically claim the oldest due session consolidation job (SessionEnd
+    /// or checkpoint).
     pub async fn claim_session_consolidation(
         &self,
         now: i64,
@@ -881,6 +1740,22 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Reconcile a session's durable consolidation job row to `completed` after
+    /// a manual `memory_consolidate` produced the page out-of-band. Never
+    /// touches a `running` lease. Returns the number of rows updated.
+    pub async fn reconcile_session_consolidation_completed(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReconcileSessionConsolidationCompleted {
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new handoff in `open` state.
     ///
     /// # Errors
@@ -888,6 +1763,21 @@ impl WriterHandle {
     pub async fn insert_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::InsertHandoff { handoff, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Publish a live session's turn-checkpoint baton; `None` when the session
+    /// already ended or is gone. See `ops::checkpoint_session_handoff`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn checkpoint_session_handoff(
+        &self,
+        handoff: NewHandoff,
+    ) -> StoreResult<Option<HandoffId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CheckpointSessionHandoff { handoff, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -906,6 +1796,63 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             acceptance,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Expire every open handoff in one scope, optionally only those older
+    /// than `older_than_us`. Returns how many changed.
+    ///
+    /// Unlike the automatic sweep this does not spare manual or
+    /// different-directory handoffs: those are precisely what a leftover
+    /// backlog is made of. It is a state change, not a delete — the summary
+    /// and provenance survive.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn expire_open_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireOpenHandoffs {
+            workspace_id,
+            project_id,
+            owner_filter,
+            older_than_us,
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record that an embed attempt on `page_id` did not produce an
+    /// embedding, so a failed or skipped page is attributable afterwards
+    /// rather than only in container logs (#528).
+    ///
+    /// Success records nothing — that is already implied by a
+    /// `page_embeddings` row — so the common path pays no extra write.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn record_embed_failure(
+        &self,
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordEmbedFailure {
+            page_id,
+            outcome,
+            detail,
             reply: tx,
         })
         .await?;
@@ -933,6 +1880,66 @@ impl WriterHandle {
             workspace_id,
             project_id,
             owner_filter,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Send a cross-project message into a recipient project's inbox (V64).
+    ///
+    /// Fails when the recipient inbox is already at
+    /// [`crate::ops::MAX_PENDING_INBOX_MESSAGES`] pending.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_message(&self, message: NewAgentMessage) -> StoreResult<MessageId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertMessage { message, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Pop (claim exactly once) a message from a recipient project's inbox.
+    ///
+    /// With `specific_id`, pops that message; otherwise the oldest pending one.
+    /// Returns `None` when nothing matched or another session claimed it first —
+    /// the body must not reach the agent on `None`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn pop_message(
+        &self,
+        claim: MessageClaim,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<Option<AgentMessage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PopMessage {
+            claim,
+            specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Retract still-pending outbox messages a project has sent. With
+    /// `specific_id`, cancels just that one; otherwise every pending message
+    /// this project sent. Returns how many were cancelled.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn cancel_messages(
+        &self,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        specific_id: Option<MessageId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CancelMessages {
+            from_workspace_id,
+            from_project_id,
+            specific_id,
             reply: tx,
         })
         .await?;
@@ -975,6 +1982,38 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Store or replace a batch of L0 abstract embeddings
+    /// (`page_abstract_embeddings`) in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_abstract_embeddings(
+        &self,
+        embeddings: Vec<EmbeddingWrite>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreAbstractEmbeddingBatch {
+            embeddings,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Remove a page's L0 abstract embedding row (`page_abstract_embeddings`),
+    /// if any. Called when a page is rewritten without its frontmatter
+    /// `abstract:` so the abstract stream never ranks a line the page no
+    /// longer carries.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn delete_abstract_embedding(&self, page_id: PageId) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteAbstractEmbedding { page_id, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1106,6 +2145,30 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Tombstone the expected latest page whose file the watcher's reconcile
+    /// pass found missing on two consecutive passes (opt-in, see #929).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn soft_delete_for_reconcile_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SoftDeleteForReconcileIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Permanently delete one eligible decay tombstone and its ancestry chain.
     /// The expected latest-page state is checked in the same transaction so a
     /// page recreated at the same path cannot be removed accidentally.
@@ -1136,6 +2199,35 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete one bounded batch of raw observations whose session was already
+    /// consolidated into a live summary page, repairing the session end
+    /// watermark in the same transaction.
+    ///
+    /// One batch is one transaction and one mailbox message, so a multi-million
+    /// row prune never holds the write lock across the whole run — every other
+    /// pending write interleaves between batches.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn prune_consolidated_observations(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+    ) -> StoreResult<ObservationPruneOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PruneConsolidatedObservations {
+            workspace_id,
+            project_id,
+            cutoff_us,
+            batch,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// NULL out catch-all project `repo_path` rows so existing installs
     /// self-heal on upgrade: the broad sentinels (`$HOME` and the filesystem
     /// root) plus any path that exists locally but is not a git work-tree
@@ -1150,16 +2242,23 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Delete a project and all its data in one atomic transaction.
+    /// Delete a project's rows in one atomic transaction. Logical unless
+    /// `compaction` is [`ops::Compaction::Reclaim`].
     ///
     /// ON DELETE CASCADE propagates the delete through pages, sessions,
     /// observations, handoffs, and page_embeddings automatically. The
     /// returned [`PurgeSummary`] includes pre-delete row counts and
     /// the distinct page paths that the caller must remove from disk.
     ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::purge_project`] for why, and for
+    /// the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
     /// propagates the SQL error from the purge transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn purge_project(
         &self,
         workspace_id: WorkspaceId,
@@ -1167,6 +2266,8 @@ impl WriterHandle {
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
+        compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -1175,6 +2276,52 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
+            compaction,
+            mode,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete one session by id, with everything derived from it, inside a
+    /// single `(workspace, project)` scope.
+    ///
+    /// Scope is enforced in the store: a session that does not belong to the
+    /// named workspace and project is [`StoreError::NotFound`] and nothing is
+    /// deleted. See [`ops::purge_session`] for what is and is not removed —
+    /// in particular, handoffs this session *accepted* are left alone.
+    ///
+    /// Server callers must go through `Wiki::purge_session` instead, which
+    /// holds the wiki mutation guard across this deletion and the page-file
+    /// cleanup. Calling this directly commits the rows with no guard, so a
+    /// watcher reindex can reinsert the page before the file is removed (#653).
+    ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::purge_session`] for why, and for
+    /// the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the session is absent from that scope,
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<ai_memory_core::UserId>,
+        compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeSession {
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            mode,
             reply: tx,
         })
         .await?;
@@ -1184,6 +2331,11 @@ impl WriterHandle {
     /// Delete a workspace and, via the `workspace_id` cascade, every project /
     /// page / session under it. Refuses a non-empty workspace unless `force`.
     ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::delete_workspace`] for why, and
+    /// for the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
     /// # Errors
     /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and
     /// `force` is false; [`StoreError::NotFound`] when the workspace is absent;
@@ -1192,11 +2344,53 @@ impl WriterHandle {
         &self,
         workspace_id: WorkspaceId,
         force: bool,
+        compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
+            compaction,
+            mode,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reclaim free pages on demand, deleting nothing.
+    ///
+    /// Runs through the writer actor like every other exclusive operation, so
+    /// it cannot overlap a write: `VACUUM` takes an exclusive lock and would
+    /// otherwise contend with one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the rebuild or `VACUUM`.
+    pub async fn compact(&self) -> StoreResult<crate::ops::CompactSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::Compact { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete the superseded ledger page versions the pre-#660 indexer left
+    /// behind. See [`ops::reclaim_ledger_versions`].
+    ///
+    /// # Errors
+    /// Propagates the store error from the scan, delete, FTS rebuild or
+    /// `VACUUM`, plus [`StoreError::WriterClosed`].
+    pub async fn reclaim_ledger_versions(
+        &self,
+        dry_run: bool,
+        drop_latest: bool,
+        compaction: crate::ops::Compaction,
+    ) -> StoreResult<crate::ops::ReclaimLedgerVersionsSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReclaimLedgerVersions {
+            dry_run,
+            drop_latest,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -1293,6 +2487,39 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Validate and, when `commit`, apply a batch of session-time
+    /// corrections scoped to `(workspace_id, project_id)`, in one
+    /// transaction. `commit = false` performs the same validation and writes
+    /// then rolls back, so the reply is an exact dry run. See
+    /// [`ops::repair_session_times`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error. Per-candidate scope/validation problems are
+    /// reported in the returned summary, not as an `Err`.
+    pub async fn repair_session_times(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<ops::SessionTimesCandidate>,
+        now_us: i64,
+        author_id: Option<UserId>,
+        commit: bool,
+    ) -> StoreResult<ops::RepairSessionTimesSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RepairSessionTimes {
+            workspace_id,
+            project_id,
+            candidates,
+            now_us,
+            author_id,
+            commit,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Rename a project within its workspace (column-only; no file moves).
     ///
     /// # Errors
@@ -1316,6 +2543,74 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Conform every latest page row to OKF in place (docs/okf.md);
+    /// returns the rewritten pages so the wiki layer can align files.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn okf_migrate_latest_pages(&self) -> StoreResult<Vec<ops::OkfMigratedPage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::OkfMigrateLatestPages { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Instantaneous write-queue depth as `(queued, capacity)`. A queue
+    /// pinned near capacity means writers are being backpressured — the
+    /// wedged-writer signal `status` surfaces (2.0 item 7).
+    #[must_use]
+    pub fn queue_depth(&self) -> (usize, usize) {
+        let max = self.inner.tx.max_capacity();
+        (max.saturating_sub(self.inner.tx.capacity()), max)
+    }
+
+    /// Record a completed cross-session ("experience") pass for a scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn mark_experience_pass_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MarkExperiencePassRun {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Repair, in place, the OKF `stale_after` that older builds copied
+    /// verbatim from a date-only `expires_at`; returns every date-only page
+    /// so the wiki layer can align the files.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn repair_date_only_stale_after(&self) -> StoreResult<ops::StaleAfterRepair> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RepairDateOnlyStaleAfter { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Count latest page rows still lacking OKF conformance (read-only).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn okf_nonconformant_count(&self) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::OkfNonconformantCount { reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1386,6 +2681,27 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// [`Self::upsert_page`] only when `precondition` holds for the latest
+    /// version at the page's path, checked in the write's own transaction.
+    ///
+    /// # Errors
+    /// As [`Self::upsert_page`]. A precondition that does not hold is not an
+    /// error: it returns [`ops::ConditionalUpsert::Mismatch`] and writes nothing.
+    pub async fn upsert_page_if(
+        &self,
+        page: NewPage,
+        precondition: ops::PagePrecondition,
+    ) -> StoreResult<ops::ConditionalUpsert> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertPageIf {
+            page,
+            precondition,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Delete every version of a page (by path) from the index. The wiki file
     /// removal is the caller's concern; this drops the derived rows so the
     /// page stops appearing in search/recent (the watcher does NOT reconcile
@@ -1426,6 +2742,7 @@ impl WriterHandle {
         project_id: ProjectId,
         path: PagePath,
         expected_latest_id: PageId,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeletePageIfLatest {
@@ -1433,81 +2750,347 @@ impl WriterHandle {
             project_id,
             path,
             expected_latest_id,
+            author_id,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Insert a new user. `new_user` MUST already have been validated by
-    /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
-    /// caller (CLI or admin handler) generates the plaintext token,
-    /// hashes it with the per-server pepper via
-    /// [`crate::users::hash_token`], and passes only the digest in.
+    /// One-shot root bootstrap. `password_hash` is already Argon2id PHC.
     ///
     /// # Errors
-    /// - [`StoreError::WriterClosed`] if the writer has shut down.
-    /// - [`StoreError::Duplicate`] when the username or email collides.
-    /// - [`StoreError::Sqlite`] for any other SQL failure.
-    pub async fn create_user(
+    /// Writer closed, duplicate identity, already completed, SQL.
+    pub async fn bootstrap_root(
         &self,
-        new_user: NewUser,
-        token_hash: [u8; TOKEN_HASH_LEN],
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
     ) -> StoreResult<UserId> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::CreateUser {
-            new_user,
-            token_hash,
+        self.send(WriteCmd::BootstrapRoot {
+            username,
+            name,
+            email,
+            password_hash,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Replace a user's token hash with a freshly-generated digest.
-    /// Implicitly clears `token_expired_at` — rotating an expired
-    /// token only makes sense to make it usable again. Returns `false`
-    /// when the user id doesn't exist; `true` on successful update.
+    /// Break-glass root reset. Does not touch API credentials.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`]
-    /// per the usual writer-actor flow.
-    pub async fn rotate_user_token(
+    /// Writer closed, duplicate, SQL.
+    pub async fn recover_root(
+        &self,
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecoverRoot {
+            username,
+            name,
+            email,
+            password_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Grant `user_id` `role` on `repository_id` (#708).
+    ///
+    /// `granted_by` is the operator making the change, or `None` when they
+    /// act through the root bearer token (no `users` row).
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn grant_memory(
         &self,
         user_id: UserId,
-        new_token_hash: [u8; TOKEN_HASH_LEN],
-    ) -> StoreResult<bool> {
+        repository_id: ProjectId,
+        role: crate::GrantLevel,
+        granted_by: Option<UserId>,
+    ) -> StoreResult<crate::grants::GrantOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::RotateUserToken {
+        self.send(WriteCmd::GrantMemory {
             user_id,
-            new_token_hash,
+            repository_id,
+            role,
+            granted_by,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Stamp `token_expired_at = now()` so the user's current token stops
-    /// authenticating. Idempotent — repeating the call leaves the original
-    /// expiry timestamp untouched. Returns `false` when the user doesn't exist.
+    /// Revoke whatever `user_id` actively holds on `repository_id`.
+    ///
+    /// Returns whether anything was in force to revoke, so calling it twice is
+    /// harmless and still reports honestly.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
-    pub async fn expire_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+    /// Writer closed or SQL.
+    pub async fn revoke_memory(
+        &self,
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::ExpireUserToken { user_id, reply: tx })
+        self.send(WriteCmd::RevokeMemory {
+            user_id,
+            repository_id,
+            revoked_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a human identity. `new_user` MUST already have been validated.
+    /// No API credential is created.
+    ///
+    /// # Errors
+    /// Writer closed, duplicate username/email, SQL.
+    pub async fn create_human_user(
+        &self,
+        new_user: NewUser,
+        role: UserRole,
+        password_hash: Option<String>,
+        must_change_password: bool,
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateHumanUser {
+            new_user,
+            role,
+            password_hash,
+            must_change_password,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Admin password reset. Revokes web sessions.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn reset_human_password(
+        &self,
+        user_id: UserId,
+        password_hash: String,
+        must_change_password: bool,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResetHumanPassword {
+            user_id,
+            password_hash,
+            must_change_password,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Enable or disable human login. Disable revokes sessions.
+    ///
+    /// # Errors
+    /// Last recoverable root, writer closed, SQL.
+    pub async fn set_user_disabled(&self, user_id: UserId, disabled: bool) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetUserDisabled {
+            user_id,
+            disabled,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Patch name/email/role. `Some(None)` clears an optional field.
+    ///
+    /// # Errors
+    /// Last recoverable root, duplicate email, writer closed, SQL.
+    pub async fn patch_user(
+        &self,
+        user_id: UserId,
+        name: Option<Option<String>>,
+        email: Option<Option<String>>,
+        role: Option<UserRole>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PatchUser {
+            user_id,
+            name,
+            email,
+            role,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Change password for the current session and rotate its cookies.
+    ///
+    /// # Errors
+    /// Concurrent password change, writer closed, SQL.
+    pub async fn change_password(
+        &self,
+        user_id: UserId,
+        expected_password_hash: String,
+        new_password_hash: String,
+        session_id: Uuid,
+        new_session_hash: [u8; TOKEN_HASH_LEN],
+        new_csrf_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ChangePassword {
+            user_id,
+            expected_password_hash,
+            new_password_hash,
+            session_id,
+            new_session_hash,
+            new_csrf_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Recheck PHC, role, disabled state, and must-change state, then insert
+    /// a web session.
+    ///
+    /// # Errors
+    /// Credentials no longer valid, writer closed, SQL.
+    pub async fn issue_web_session(
+        &self,
+        user_id: UserId,
+        expected_password_hash: String,
+        expected_role: UserRole,
+        expected_must_change: bool,
+        session_hash: [u8; TOKEN_HASH_LEN],
+        csrf_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<WebSession> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::IssueWebSession {
+            user_id,
+            expected_password_hash,
+            expected_role,
+            expected_must_change,
+            session_hash,
+            csrf_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Logout: revoke one session by secret hash.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn revoke_web_session(
+        &self,
+        session_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeWebSession {
+            session_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Touch `web_sessions.last_used_at` at most once per minute.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn touch_web_session(
+        &self,
+        session_id: Uuid,
+        last_used_at: i64,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::TouchWebSession {
+            session_id,
+            last_used_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a native API credential. `id` is caller-chosen.
+    ///
+    /// # Errors
+    /// Duplicate hash, writer closed, SQL.
+    pub async fn create_api_credential(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+    ) -> StoreResult<ApiCredentialId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateApiCredential {
+            id,
+            user_id,
+            label,
+            token_hash,
+            preview,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Rotate a native API credential hash and un-revoke it.
+    ///
+    /// # Errors
+    /// Duplicate hash, writer closed, SQL.
+    pub async fn rotate_api_credential(
+        &self,
+        id: ApiCredentialId,
+        new_token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RotateApiCredential {
+            id,
+            new_token_hash,
+            preview,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke a native API credential. Idempotent.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn revoke_api_credential(&self, id: ApiCredentialId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeApiCredential { id, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Clear `token_expired_at`, re-activating the user's existing token.
-    /// Idempotent. Returns `false` when the user doesn't exist.
+    /// Touch `api_credentials.last_used_at`.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
-    pub async fn revive_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+    /// Writer closed / SQL.
+    pub async fn touch_api_credential(&self, id: ApiCredentialId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::ReviveUserToken { user_id, reply: tx })
+        self.send(WriteCmd::TouchApiCredential { id, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -1627,6 +3210,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a failed scheduled review, releasing the session's claim for
+    /// another attempt and returning the new attempt count. Returns `0` when the
+    /// session holds no claim, which is the manual path.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn record_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -1643,9 +3251,35 @@ impl WriterHandle {
         &self,
         input: PrepareWorkstreamRun,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned(input, None).await
+    }
+
+    /// Select a workstream and stamp the operator bucket used by safe recovery.
+    pub async fn prepare_workstream_run_owned(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+    ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned_with_unlock(input, owner_user, false)
+            .await
+    }
+
+    /// Select a workstream, optionally replacing this same operator's active
+    /// lease in the same writer transaction.
+    pub async fn prepare_workstream_run_owned_with_unlock(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::PrepareWorkstreamRun { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::PrepareWorkstreamRun {
+            input,
+            owner_user,
+            force_unlock,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1683,6 +3317,29 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Link an exact run or safely recover a stale Codex daemon run id.
+    pub async fn link_or_adopt_managed_run_session(
+        &self,
+        input: LinkOrAdoptManagedRunSession,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Link the native session a later hook event of a managed run reported,
+    /// within the run's own project and operator boundary.
+    pub async fn link_managed_run_session_in_scope(
+        &self,
+        input: LinkManagedRunSessionInScope,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkManagedRunSessionInScope { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Acknowledge successful SessionStart delivery for a managed run.
     pub async fn accept_managed_run_context(&self, run_id: ManagedRunId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
@@ -1695,18 +3352,24 @@ impl WriterHandle {
     /// SessionStart response.
     ///
     /// When a managed run was requested but is no longer claimable, the
-    /// handoff remains open and both result fields are false.
+    /// handoff remains open and both result fields are false. `busy_since` is
+    /// the same cutoff the selection used
+    /// ([`crate::ReaderPool::startup_handoff`]), re-applied in the claim's
+    /// transaction: a baton whose open source captured anything after it stays
+    /// open.
     pub async fn accept_startup_context(
         &self,
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff,
             managed_run_id,
             receiving_session,
+            busy_since,
             reply: tx,
         })
         .await?;
@@ -1716,10 +3379,48 @@ impl WriterHandle {
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
     ) -> StoreResult<FinishedWorkstreamRun> {
+        self.finish_workstream_run_inner(authority, input, false)
+            .await
+    }
+
+    /// Finish an expired run for its original owner when it was not superseded.
+    pub async fn recover_expired_workstream_run(
+        &self,
+        authority: crate::ManagedRunAuthority,
+        input: FinishWorkstreamRun,
+    ) -> StoreResult<FinishedWorkstreamRun> {
+        self.finish_workstream_run_inner(authority, input, true)
+            .await
+    }
+
+    async fn finish_workstream_run_inner(
+        &self,
+        authority: crate::ManagedRunAuthority,
+        input: FinishWorkstreamRun,
+        recover_expired: bool,
+    ) -> StoreResult<FinishedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::FinishWorkstreamRun { input, reply: tx })
+        self.send(WriteCmd::FinishWorkstreamRun {
+            authority,
+            input,
+            recover_expired,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Retitle one checkout-local workstream, leaving its selection and
+    /// activity timestamps untouched.
+    pub async fn rename_workstream(
+        &self,
+        input: RenameWorkstream,
+    ) -> StoreResult<RenamedWorkstream> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -1758,9 +3459,96 @@ fn send_or_warn<T>(reply: oneshot::Sender<T>, result: T, op: &'static str) {
 }
 
 fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
+    // The mode a newly created project starts in — the server's
+    // `[auth] new_projects_restricted`, set once at startup. Held here because
+    // this actor performs every project insert, so no creation path can
+    // forget to apply it.
+    let mut new_project_mode = crate::AccessMode::Open;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            WriteCmd::Shutdown => break,
+            WriteCmd::SetNewProjectMode { mode, reply } => {
+                new_project_mode = mode;
+                send_or_warn(reply, Ok(()), "set_new_project_mode");
+            }
+            WriteCmd::SetAccessMode {
+                project_id,
+                mode,
+                reply,
+            } => {
+                let result = crate::grants::set_access_mode(&conn, project_id, mode);
+                send_or_warn(reply, result, "set_access_mode");
+            }
+            WriteCmd::SetProjectProfileFlags {
+                project_id,
+                flags,
+                reply,
+            } => {
+                let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
+                send_or_warn(reply, result, "set_project_profile_flags");
+            }
+            WriteCmd::RecordProfileHarvest {
+                workspace_id,
+                project_id,
+                candidates,
+                mark,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_harvest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &candidates,
+                    mark,
+                );
+                send_or_warn(reply, result, "record_profile_harvest");
+            }
+            WriteCmd::RecordProfileEntries {
+                workspace_id,
+                project_id,
+                entries,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_entries(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &entries,
+                );
+                send_or_warn(reply, result, "record_profile_entries");
+            }
+            WriteCmd::ClearProfileHarvestMarks { reply } => {
+                let result = crate::profile::clear_profile_harvest_marks(&conn);
+                send_or_warn(reply, result, "clear_profile_harvest_marks");
+            }
+            WriteCmd::Shutdown => {
+                // Dropping the receiver drains the queue, but a sender that
+                // already holds a permit can still push afterwards; that
+                // command would never be dropped and its caller would wait
+                // forever. Closing first and receiving until `None` waits for
+                // those in-flight sends, and dropping each command drops its
+                // reply, so every caller sees `WriterClosed`.
+                rx.close();
+                while rx.blocking_recv().is_some() {}
+                break;
+            }
+            WriteCmd::AuthorizeProject {
+                workspace_id,
+                project_id,
+                principal,
+                distinguishes_operators,
+                need,
+                reply,
+            } => {
+                let result = crate::project_authz::resolve_project_authz(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    &principal,
+                    distinguishes_operators,
+                )
+                .map(|ctx| ctx.authorize(need));
+                send_or_warn(reply, result, "authorize_project");
+            }
             WriteCmd::GetOrCreateWorkspace { name, reply } => {
                 let result = ops::get_or_create_workspace(&mut conn, &name);
                 send_or_warn(reply, result, "get_or_create_workspace");
@@ -1771,13 +3559,99 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 repo_path,
                 reply,
             } => {
-                let result = ops::get_or_create_project(
+                // Through the creator-aware path with no creator, so the
+                // server's new-project mode applies here too.
+                let result = ops::get_or_create_project_as(
                     &mut conn,
                     &workspace_id,
                     &name,
                     repo_path.as_deref(),
-                );
+                    None,
+                    new_project_mode,
+                )
+                .map(|(id, _)| id);
                 send_or_warn(reply, result, "get_or_create_project");
+            }
+            WriteCmd::GetOrCreateProjectAs {
+                workspace_id,
+                name,
+                repo_path,
+                creator,
+                reply,
+            } => {
+                let result = ops::get_or_create_project_as(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    repo_path.as_deref(),
+                    creator,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "get_or_create_project_as");
+            }
+            WriteCmd::ResolveProjectByIdentity {
+                workspace_id,
+                identity,
+                style,
+                promote,
+                name,
+                repo_path,
+                candidate,
+                creator,
+                reply,
+            } => {
+                let result = ops::resolve_project_by_identity(
+                    &mut conn,
+                    &workspace_id,
+                    &identity,
+                    style,
+                    promote,
+                    &name,
+                    repo_path.as_deref(),
+                    candidate,
+                    creator,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "resolve_project_by_identity");
+            }
+            WriteCmd::ResolveProjectNameForWrite {
+                workspace_id,
+                name,
+                principal,
+                distinguishes_operators,
+                promote,
+                reply,
+            } => {
+                let result = ops::resolve_project_name_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                    promote,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "resolve_project_name_for_write");
+            }
+            WriteCmd::ResolveProjectAliasesForWrite {
+                workspace_id,
+                canonical,
+                aliases,
+                repository,
+                principal,
+                distinguishes_operators,
+                reply,
+            } => {
+                let result = ops::resolve_project_aliases_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &canonical,
+                    &aliases,
+                    &repository,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                );
+                send_or_warn(reply, result, "resolve_project_aliases_for_write");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
@@ -1796,6 +3670,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 name,
                 repo_path,
+                identity,
                 reply,
             } => {
                 let result = ops::ensure_project_with_id(
@@ -1804,12 +3679,61 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     workspace_id,
                     &name,
                     repo_path.as_deref(),
+                    identity.as_ref(),
                 );
                 send_or_warn(reply, result, "ensure_project_with_id");
+            }
+            WriteCmd::ScopeIsPurged {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "scope_is_purged");
+            }
+            WriteCmd::PurgedSessionIds {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::purged_session_ids(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "purged_session_ids");
+            }
+            WriteCmd::RecordBootstrapChunk {
+                fingerprint,
+                chunk_index,
+                pages_json,
+                rationale,
+                reply,
+            } => {
+                let result = ops::record_bootstrap_chunk(
+                    &conn,
+                    &fingerprint,
+                    chunk_index,
+                    &pages_json,
+                    &rationale,
+                );
+                send_or_warn(reply, result, "record_bootstrap_chunk");
+            }
+            WriteCmd::LoadBootstrapProgress { fingerprint, reply } => {
+                let result = ops::load_bootstrap_progress(&conn, &fingerprint);
+                send_or_warn(reply, result, "load_bootstrap_progress");
+            }
+            WriteCmd::ClearBootstrapProgress { fingerprint, reply } => {
+                let result = ops::clear_bootstrap_progress(&conn, &fingerprint);
+                send_or_warn(reply, result, "clear_bootstrap_progress");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
                 send_or_warn(reply, result, "upsert_page");
+            }
+            WriteCmd::UpsertPageIf {
+                page,
+                precondition,
+                reply,
+            } => {
+                let result = ops::upsert_page_if(&mut conn, &page, precondition);
+                send_or_warn(reply, result, "upsert_page_if");
             }
             WriteCmd::DeletePage {
                 workspace_id,
@@ -1827,6 +3751,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 project_id,
                 path,
                 expected_latest_id,
+                author_id,
                 reply,
             } => {
                 let result = ops::delete_page_if_latest(
@@ -1835,7 +3760,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     project_id,
                     &path,
                     expected_latest_id,
-                    None,
+                    author_id,
                 );
                 send_or_warn(reply, result, "delete_page_if_latest");
             }
@@ -1897,6 +3822,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 obs,
                 owner_filter,
                 ingest_key,
+                moved_from_cwd,
                 reply,
             } => {
                 let result = ops::admit_hook_session_event(
@@ -1905,22 +3831,29 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &obs,
                     &owner_filter,
                     ingest_key.as_deref(),
+                    moved_from_cwd.as_deref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }
             WriteCmd::EndAdmittedSession {
                 admitted,
                 summary_page_id,
+                occurred_at,
                 reply,
             } => {
-                let result =
-                    ops::end_admitted_session(&mut conn, &admitted, summary_page_id.as_ref());
+                let result = ops::end_admitted_session(
+                    &mut conn,
+                    &admitted,
+                    summary_page_id.as_ref(),
+                    occurred_at,
+                );
                 send_or_warn(reply, result, "end_admitted_session");
             }
             WriteCmd::EndAdmittedSessionWithHandoff {
                 admitted,
                 summary_page_id,
                 handoff,
+                occurred_at,
                 reply,
             } => {
                 let result = ops::end_admitted_session_with_handoff(
@@ -1928,11 +3861,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &admitted,
                     summary_page_id.as_ref(),
                     &handoff,
+                    occurred_at,
                 );
                 send_or_warn(reply, result, "end_admitted_session_with_handoff");
             }
-            WriteCmd::EndAdmittedLifecycleOnlySession { admitted, reply } => {
-                let result = ops::end_admitted_lifecycle_only_session(&mut conn, &admitted);
+            WriteCmd::EndAdmittedLifecycleOnlySession {
+                admitted,
+                occurred_at,
+                reply,
+            } => {
+                let result =
+                    ops::end_admitted_lifecycle_only_session(&mut conn, &admitted, occurred_at);
                 send_or_warn(reply, result, "end_admitted_lifecycle_only_session");
             }
             WriteCmd::CompleteObservationIngest {
@@ -1969,6 +3908,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "enqueue_session_consolidation");
             }
+            WriteCmd::EnqueueSessionCheckpoint {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_consolidation::enqueue_checkpoint(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "enqueue_session_checkpoint");
+            }
             WriteCmd::ClaimSessionConsolidation {
                 now,
                 stale_before,
@@ -1994,13 +3947,51 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
             }
+            WriteCmd::ReconcileSessionConsolidationCompleted { session_id, reply } => {
+                let result =
+                    crate::session_consolidation::reconcile_session_consolidation_completed(
+                        &mut conn, session_id,
+                    );
+                send_or_warn(reply, result, "reconcile_session_consolidation_completed");
+            }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
             }
+            WriteCmd::CheckpointSessionHandoff { handoff, reply } => {
+                let result = ops::checkpoint_session_handoff(&mut conn, &handoff);
+                send_or_warn(reply, result, "checkpoint_session_handoff");
+            }
             WriteCmd::AcceptHandoff { acceptance, reply } => {
                 let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
+            }
+            WriteCmd::ExpireOpenHandoffs {
+                workspace_id,
+                project_id,
+                owner_filter,
+                older_than_us,
+                author_id,
+                reply,
+            } => {
+                let result = ops::expire_open_handoffs(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                    older_than_us,
+                    author_id,
+                );
+                send_or_warn(reply, result, "expire_open_handoffs");
+            }
+            WriteCmd::RecordEmbedFailure {
+                page_id,
+                outcome,
+                detail,
+                reply,
+            } => {
+                let result = ops::record_embed_failure(&conn, &page_id, outcome, detail.as_deref());
+                send_or_warn(reply, result, "record_embed_failure");
             }
             WriteCmd::CancelHandoff {
                 handoff_id,
@@ -2017,6 +4008,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &owner_filter,
                 );
                 send_or_warn(reply, result, "cancel_handoff");
+            }
+            WriteCmd::InsertMessage { message, reply } => {
+                let result = ops::insert_message(&mut conn, &message);
+                send_or_warn(reply, result, "insert_message");
+            }
+            WriteCmd::PopMessage {
+                claim,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::pop_message(&mut conn, &claim, specific_id);
+                send_or_warn(reply, result, "pop_message");
+            }
+            WriteCmd::CancelMessages {
+                from_workspace_id,
+                from_project_id,
+                specific_id,
+                reply,
+            } => {
+                let result = ops::cancel_messages(
+                    &mut conn,
+                    &from_workspace_id,
+                    &from_project_id,
+                    specific_id,
+                );
+                send_or_warn(reply, result, "cancel_messages");
             }
             WriteCmd::Reorg {
                 workspace_id,
@@ -2077,6 +4094,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "soft_delete_for_decay_if_latest");
             }
+            WriteCmd::SoftDeleteForReconcileIfLatest {
+                workspace_id,
+                project_id,
+                path,
+                expected_latest_id,
+                reply,
+            } => {
+                let result = ops::soft_delete_for_reconcile_if_latest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    expected_latest_id,
+                );
+                send_or_warn(reply, result, "soft_delete_for_reconcile_if_latest");
+            }
             WriteCmd::HardDeleteDecayedPageChain {
                 workspace_id,
                 project_id,
@@ -2096,6 +4129,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     cutoff_us,
                 );
                 send_or_warn(reply, result, "hard_delete_decayed_page_chain");
+            }
+            WriteCmd::PruneConsolidatedObservations {
+                workspace_id,
+                project_id,
+                cutoff_us,
+                batch,
+                reply,
+            } => {
+                let result = ops::prune_consolidated_observations(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    cutoff_us,
+                    batch,
+                );
+                send_or_warn(reply, result, "prune_consolidated_observations");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {
                 let result = ops::heal_catch_all_repo_paths(&mut conn, home.as_deref());
@@ -2123,6 +4172,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::store_embeddings(&mut conn, &embeddings);
                 send_or_warn(reply, result, "store_embeddings");
             }
+            WriteCmd::StoreAbstractEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_abstract_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_abstract_embeddings");
+            }
+            WriteCmd::DeleteAbstractEmbedding { page_id, reply } => {
+                let result = ops::delete_abstract_embedding(&mut conn, &page_id);
+                send_or_warn(reply, result, "delete_abstract_embedding");
+            }
             WriteCmd::DeleteStalePageEmbeddings {
                 workspace_id,
                 project_id,
@@ -2147,6 +4204,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 author_id,
                 force,
+                compaction,
+                mode,
                 reply,
             } => {
                 let result = ops::purge_project(
@@ -2156,15 +4215,54 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &label,
                     author_id,
                     force,
+                    compaction,
+                    mode,
                 );
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::PurgeSession {
+                workspace_id,
+                project_id,
+                session_id,
+                author_id,
+                compaction,
+                mode,
+                reply,
+            } => {
+                let result = ops::purge_session(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                    mode,
+                );
+                send_or_warn(reply, result, "purge_session");
+            }
+            WriteCmd::Compact { reply } => {
+                let result = ops::compact(&mut conn);
+                send_or_warn(reply, result, "compact");
+            }
+            WriteCmd::ReclaimLedgerVersions {
+                dry_run,
+                drop_latest,
+                compaction,
+                reply,
+            } => {
+                let result =
+                    ops::reclaim_ledger_versions(&mut conn, dry_run, drop_latest, compaction);
+                send_or_warn(reply, result, "reclaim_ledger_versions");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,
                 force,
+                compaction,
+                mode,
                 reply,
             } => {
-                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                let result =
+                    ops::delete_workspace(&mut conn, &workspace_id, force, compaction, mode);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {
@@ -2209,6 +4307,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "move_session");
             }
+            WriteCmd::RepairSessionTimes {
+                workspace_id,
+                project_id,
+                candidates,
+                now_us,
+                author_id,
+                commit,
+                reply,
+            } => {
+                let result = ops::repair_session_times(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &candidates,
+                    now_us,
+                    author_id,
+                    commit,
+                );
+                send_or_warn(reply, result, "repair_session_times");
+            }
             WriteCmd::RenameProject {
                 workspace_id,
                 project_id,
@@ -2225,6 +4343,30 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "rename_project");
             }
+            WriteCmd::OkfMigrateLatestPages { reply } => {
+                let result = ops::okf_migrate_latest_pages(&mut conn);
+                send_or_warn(reply, result, "okf_migrate_latest_pages");
+            }
+            WriteCmd::RepairDateOnlyStaleAfter { reply } => {
+                let result = ops::repair_date_only_stale_after(&mut conn);
+                send_or_warn(reply, result, "repair_date_only_stale_after");
+            }
+            WriteCmd::OkfNonconformantCount { reply } => {
+                let result = ops::okf_nonconformant_latest_pages(&conn);
+                send_or_warn(reply, result, "okf_nonconformant_count");
+            }
+            WriteCmd::MarkExperiencePassRun {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = crate::auto_improve::mark_experience_pass_run(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                );
+                send_or_warn(reply, result, "mark_experience_pass_run");
+            }
             WriteCmd::InsertWikiMigration {
                 name,
                 applied_at,
@@ -2233,29 +4375,212 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_wiki_migration(&mut conn, &name, applied_at);
                 send_or_warn(reply, result, "insert_wiki_migration");
             }
-            WriteCmd::CreateUser {
-                new_user,
-                token_hash,
+            WriteCmd::BootstrapRoot {
+                username,
+                name,
+                email,
+                password_hash,
                 reply,
             } => {
-                let result = users::insert_user(&conn, &new_user, &token_hash);
-                send_or_warn(reply, result, "create_user");
+                let result = users::bootstrap_root(
+                    &mut conn,
+                    &username,
+                    name.as_deref(),
+                    email.as_deref(),
+                    &password_hash,
+                );
+                send_or_warn(reply, result, "bootstrap_root");
             }
-            WriteCmd::RotateUserToken {
+            WriteCmd::RecoverRoot {
+                username,
+                name,
+                email,
+                password_hash,
+                reply,
+            } => {
+                let result = users::recover_root(
+                    &mut conn,
+                    &username,
+                    name.as_deref(),
+                    email.as_deref(),
+                    &password_hash,
+                );
+                send_or_warn(reply, result, "recover_root");
+            }
+            WriteCmd::GrantMemory {
                 user_id,
-                new_token_hash,
+                repository_id,
+                role,
+                granted_by,
                 reply,
             } => {
-                let result = users::rotate_user_token(&conn, user_id, &new_token_hash);
-                send_or_warn(reply, result, "rotate_user_token");
+                let result = crate::grants::grant(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    role,
+                    granted_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "grant_memory");
             }
-            WriteCmd::ExpireUserToken { user_id, reply } => {
-                let result = users::expire_user_token(&conn, user_id);
-                send_or_warn(reply, result, "expire_user_token");
+            WriteCmd::RevokeMemory {
+                user_id,
+                repository_id,
+                revoked_by,
+                reply,
+            } => {
+                let result = crate::grants::revoke(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    revoked_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "revoke_memory");
             }
-            WriteCmd::ReviveUserToken { user_id, reply } => {
-                let result = users::revive_user_token(&conn, user_id);
-                send_or_warn(reply, result, "revive_user_token");
+            WriteCmd::CreateHumanUser {
+                new_user,
+                role,
+                password_hash,
+                must_change_password,
+                reply,
+            } => {
+                let result = users::insert_human_user(
+                    &conn,
+                    &new_user,
+                    role,
+                    password_hash.as_deref(),
+                    must_change_password,
+                );
+                send_or_warn(reply, result, "create_human_user");
+            }
+            WriteCmd::ResetHumanPassword {
+                user_id,
+                password_hash,
+                must_change_password,
+                reply,
+            } => {
+                let result = users::reset_human_password(
+                    &mut conn,
+                    user_id,
+                    &password_hash,
+                    must_change_password,
+                );
+                send_or_warn(reply, result, "reset_human_password");
+            }
+            WriteCmd::SetUserDisabled {
+                user_id,
+                disabled,
+                reply,
+            } => {
+                let result = users::set_user_disabled(&mut conn, user_id, disabled);
+                send_or_warn(reply, result, "set_user_disabled");
+            }
+            WriteCmd::PatchUser {
+                user_id,
+                name,
+                email,
+                role,
+                reply,
+            } => {
+                let result = users::patch_user(&mut conn, user_id, name, email, role);
+                send_or_warn(reply, result, "patch_user");
+            }
+            WriteCmd::ChangePassword {
+                user_id,
+                expected_password_hash,
+                new_password_hash,
+                session_id,
+                new_session_hash,
+                new_csrf_hash,
+                reply,
+            } => {
+                let result = users::change_password(
+                    &mut conn,
+                    user_id,
+                    &expected_password_hash,
+                    &new_password_hash,
+                    session_id,
+                    &new_session_hash,
+                    &new_csrf_hash,
+                );
+                send_or_warn(reply, result, "change_password");
+            }
+            WriteCmd::IssueWebSession {
+                user_id,
+                expected_password_hash,
+                expected_role,
+                expected_must_change,
+                session_hash,
+                csrf_hash,
+                reply,
+            } => {
+                let result = users::issue_web_session(
+                    &mut conn,
+                    user_id,
+                    &expected_password_hash,
+                    expected_role,
+                    expected_must_change,
+                    &session_hash,
+                    &csrf_hash,
+                );
+                send_or_warn(reply, result, "issue_web_session");
+            }
+            WriteCmd::RevokeWebSession {
+                session_hash,
+                reply,
+            } => {
+                let result = web_sessions::revoke_session_by_hash(&conn, &session_hash);
+                send_or_warn(reply, result, "revoke_web_session");
+            }
+            WriteCmd::TouchWebSession {
+                session_id,
+                last_used_at,
+                reply,
+            } => {
+                let result = web_sessions::touch_web_session(&conn, session_id, last_used_at);
+                send_or_warn(reply, result, "touch_web_session");
+            }
+            WriteCmd::CreateApiCredential {
+                id,
+                user_id,
+                label,
+                token_hash,
+                preview,
+                reply,
+            } => {
+                let result = api_credentials::insert_api_credential(
+                    &conn,
+                    id,
+                    user_id,
+                    &label,
+                    &token_hash,
+                    preview.as_deref(),
+                );
+                send_or_warn(reply, result, "create_api_credential");
+            }
+            WriteCmd::RotateApiCredential {
+                id,
+                new_token_hash,
+                preview,
+                reply,
+            } => {
+                let result = api_credentials::rotate_api_credential(
+                    &conn,
+                    id,
+                    &new_token_hash,
+                    preview.as_deref(),
+                );
+                send_or_warn(reply, result, "rotate_api_credential");
+            }
+            WriteCmd::RevokeApiCredential { id, reply } => {
+                let result = api_credentials::revoke_api_credential(&conn, id);
+                send_or_warn(reply, result, "revoke_api_credential");
+            }
+            WriteCmd::TouchApiCredential { id, reply } => {
+                let result = api_credentials::touch_api_credential(&conn, id);
+                send_or_warn(reply, result, "touch_api_credential");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);
@@ -2314,12 +4639,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
             }
+            WriteCmd::RecordAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::record_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "record_auto_improve_claim_failure");
+            }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
             }
-            WriteCmd::PrepareWorkstreamRun { input, reply } => {
-                let result = crate::workstream::prepare_run(&mut conn, &input);
+            WriteCmd::PrepareWorkstreamRun {
+                input,
+                owner_user,
+                force_unlock,
+                reply,
+            } => {
+                let result = crate::workstream::prepare_run(
+                    &mut conn,
+                    &input,
+                    owner_user.as_deref(),
+                    force_unlock,
+                );
                 send_or_warn(reply, result, "prepare_workstream_run");
             }
             WriteCmd::HeartbeatManagedRun { run_id, reply } => {
@@ -2344,6 +4695,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "link_managed_run_session");
             }
+            WriteCmd::LinkOrAdoptManagedRunSession { input, reply } => {
+                let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
+                send_or_warn(reply, result, "link_or_adopt_managed_run_session");
+            }
+            WriteCmd::LinkManagedRunSessionInScope { input, reply } => {
+                let result = crate::workstream::link_native_session_in_scope(&mut conn, &input);
+                send_or_warn(reply, result, "link_managed_run_session_in_scope");
+            }
             WriteCmd::AcceptManagedRunContext { run_id, reply } => {
                 let result = crate::workstream::accept_context(&mut conn, run_id);
                 send_or_warn(reply, result, "accept_managed_run_context");
@@ -2352,6 +4711,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff,
                 managed_run_id,
                 receiving_session,
+                busy_since,
                 reply,
             } => {
                 let result = (|| {
@@ -2380,7 +4740,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         return Ok(StartupContextAcceptance::default());
                     }
                     let handoff_accepted = match handoff {
-                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
+                        Some(acceptance) => ops::accept_handoff_in_transaction(
+                            &tx,
+                            &acceptance,
+                            Some(busy_since.as_microsecond()),
+                        )?,
                         None => false,
                     };
                     tx.commit()?;
@@ -2391,9 +4755,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 })();
                 send_or_warn(reply, result, "accept_startup_context");
             }
-            WriteCmd::FinishWorkstreamRun { input, reply } => {
-                let result = crate::workstream::finish_run(&mut conn, &input);
+            WriteCmd::FinishWorkstreamRun {
+                authority,
+                input,
+                recover_expired,
+                reply,
+            } => {
+                let result = if recover_expired {
+                    crate::workstream::recover_run(&mut conn, &authority, &input)
+                } else {
+                    crate::workstream::finish_run(&mut conn, &authority, &input)
+                };
                 send_or_warn(reply, result, "finish_workstream_run");
+            }
+            WriteCmd::RenameWorkstream { input, reply } => {
+                let result = crate::workstream::rename(&mut conn, &input);
+                send_or_warn(reply, result, "rename_workstream");
             }
         }
     }
@@ -2422,6 +4799,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -2623,6 +5001,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: src,
@@ -2655,6 +5034,45 @@ mod tests {
             store.reader.session_project_ids(sid).await.unwrap(),
             Some((ws, dst))
         );
+    }
+
+    /// Commands racing the shutdown never hang: a send that holds a channel
+    /// permit when the actor stops must still be dropped, so its caller gets
+    /// a reply (a result or `WriterClosed`) instead of waiting forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commands_racing_shutdown_always_get_a_reply() {
+        for round in 0..20 {
+            let tmp = TempDir::new().unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let writer = store.writer.clone();
+            drop(store);
+            let callers: Vec<_> = (0..64)
+                .map(|i| {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        writer
+                            .get_or_create_workspace(&format!("ws-{round}-{i}"))
+                            .await
+                    })
+                })
+                .collect();
+            writer
+                .inner
+                .tx
+                .send(WriteCmd::Shutdown)
+                .await
+                .expect("writer channel closed before Shutdown");
+            for caller in callers {
+                let reply = tokio::time::timeout(std::time::Duration::from_secs(10), caller)
+                    .await
+                    .expect("a command racing shutdown hung instead of replying")
+                    .expect("caller task panicked");
+                assert!(
+                    matches!(reply, Ok(_) | Err(StoreError::WriterClosed)),
+                    "unexpected reply: {reply:?}"
+                );
+            }
+        }
     }
 
     /// Once the actor has stopped, calls fail fast with

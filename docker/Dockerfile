@@ -30,9 +30,13 @@ COPY evals ./evals
 # `docs/logo*.png` are include_bytes!'d by ai-memory-web's static
 # routes at compile time, so they must be in the build context.
 COPY docs ./docs
+# `ai-memory setup` renders the user service from these packaged templates,
+# include_str!'d at compile time.
+COPY packaging/systemd ./packaging/systemd
+COPY packaging/launchd ./packaging/launchd
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
-    TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli \
+    cargo build --locked --release -p ai-memory-cli \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
 FROM debian:bookworm-slim AS runtime-base

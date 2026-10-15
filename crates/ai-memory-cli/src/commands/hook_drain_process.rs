@@ -36,6 +36,13 @@ pub struct DrainCommandSpec {
     pub args: Vec<OsString>,
     /// Stderr log file under `<data_dir>/logs`.
     pub stderr_log: PathBuf,
+    /// Current static bearer to hand the child in its environment, when the
+    /// spawning hook has one.
+    ///
+    /// The environment rather than an argument: a flag would put the
+    /// credential in the process table for the lifetime of the drain, readable
+    /// by anyone who can run `ps`.
+    pub live_token: Option<OsString>,
 }
 
 /// Unit-testable stdio/detach configuration for a drainer process.
@@ -67,7 +74,12 @@ pub enum DetachConfig {
 }
 
 /// Build `ai-memory --data-dir <dir> hook-drain`.
-pub fn command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
+///
+/// `live_token` is the bearer the spawning hook is currently configured with.
+/// A spooled envelope froze its own credential at capture time, so handing the
+/// drain a current one is what lets it recover entries stranded by a rotation
+/// (#542).
+pub fn command_spec(data_dir: &Path, live_token: Option<&str>) -> io::Result<DrainCommandSpec> {
     Ok(DrainCommandSpec {
         exe: std::env::current_exe()?,
         args: vec![
@@ -76,7 +88,62 @@ pub fn command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
             OsString::from("hook-drain"),
         ],
         stderr_log: data_dir.join("logs").join("hook-drain.log"),
+        live_token: live_token.filter(|t| !t.is_empty()).map(OsString::from),
     })
+}
+
+/// Which server the spawned backfill delivers to: the one the spawning hook
+/// resolved for this event, never whatever the environment points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillTarget<'a> {
+    /// The hook's install-time `--server-url`.
+    ServerUrl(&'a str),
+    /// A server profile the repository's marker selected (#992).
+    Profile(&'a str),
+}
+
+/// Build `ai-memory --data-dir <dir> backfill --auto --quiet` plus the hook's
+/// resolved target.
+///
+/// The one-time boot backfill of pre-hook local history is potentially long
+/// (it reads native transcripts and imports them), so it runs detached exactly
+/// like the drainer rather than inline in the SessionStart hook's tight budget.
+///
+/// The target is passed explicitly because, left to itself, `backfill`
+/// resolves the server from config and the environment: a hook pointed at a
+/// remote server then backfilled into `127.0.0.1` whenever the agent was
+/// launched without `AI_MEMORY_SERVER_URL`. It carries no bearer on its argv
+/// or in its environment: `backfill` reads the persisted hook token, or the
+/// profile's own token, from the data dir.
+pub fn backfill_command_spec(
+    data_dir: &Path,
+    target: BackfillTarget<'_>,
+) -> io::Result<DrainCommandSpec> {
+    let (flag, value) = match target {
+        BackfillTarget::ServerUrl(url) => ("--server-url", url),
+        BackfillTarget::Profile(name) => ("--server-profile", name),
+    };
+    Ok(DrainCommandSpec {
+        exe: std::env::current_exe()?,
+        args: vec![
+            OsString::from("--data-dir"),
+            data_dir.as_os_str().to_os_string(),
+            OsString::from("backfill"),
+            OsString::from("--auto"),
+            OsString::from("--quiet"),
+            OsString::from(flag),
+            OsString::from(value),
+        ],
+        stderr_log: data_dir.join("logs").join("backfill.log"),
+        live_token: None,
+    })
+}
+
+/// Spawn the detached one-time boot backfill without inheriting hook stdio.
+/// Best-effort: a spawn failure must never break session start.
+pub fn spawn_backfill(data_dir: &Path, target: BackfillTarget<'_>) -> io::Result<()> {
+    let spec = backfill_command_spec(data_dir, target)?;
+    spawn_spec(&spec)
 }
 
 /// Build the stdio/detach shape used when spawning.
@@ -91,9 +158,17 @@ pub fn spawn_config(spec: &DrainCommandSpec, try_breakaway: bool) -> SpawnConfig
 }
 
 /// Spawn the hidden drainer without inheriting hook stdio.
-pub fn spawn(data_dir: &Path) -> io::Result<()> {
-    let spec = command_spec(data_dir)?;
+pub fn spawn(data_dir: &Path, live_token: Option<&str>) -> io::Result<()> {
+    let spec = command_spec(data_dir, live_token)?;
     spawn_spec(&spec)
+}
+
+/// Hand the child the current bearer in its environment, when there is one.
+/// Applied to every spawn path so the breakaway-retry cannot silently drop it.
+fn apply_live_token(command: &mut Command, spec: &DrainCommandSpec) {
+    if let Some(token) = &spec.live_token {
+        command.env(crate::commands::hook_spool::LIVE_TOKEN_ENV, token);
+    }
 }
 
 fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
@@ -108,6 +183,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
         .open(&config.stderr_file)?;
 
     let mut command = command_for_spec(spec, &config.detach);
+    apply_live_token(&mut command, spec);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -130,6 +206,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .append(true)
                 .open(&config.stderr_file)?;
             let mut retry = command_for_spec(spec, &config.detach);
+            apply_live_token(&mut retry, spec);
             retry
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -234,7 +311,7 @@ mod tests {
     #[test]
     fn command_spec_uses_data_dir_then_hidden_subcommand() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
 
         assert_eq!(
             spec.args,
@@ -277,10 +354,80 @@ mod tests {
         rotate_oversized_log(&log, 16);
     }
 
+    /// The credential must reach the drain in its environment and nowhere
+    /// near its argv. A command line is world-readable through the process
+    /// table for as long as the process lives, so passing the token as a flag
+    /// would publish it to every local user each time a session ends.
+    #[test]
+    fn the_live_token_travels_in_the_environment_not_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = command_spec(tmp.path(), Some("SECRET-BEARER")).unwrap();
+
+        assert_eq!(
+            spec.live_token.as_deref(),
+            Some(std::ffi::OsStr::new("SECRET-BEARER"))
+        );
+        let rendered: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !rendered.iter().any(|a| a.contains("SECRET-BEARER")),
+            "token leaked into argv: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|a| a == "hook-drain"),
+            "still the drain command: {rendered:?}"
+        );
+    }
+
+    /// The backfill goes where the hook resolved, and a profile travels as a
+    /// name only — the worker reads its token from the data dir.
+    #[test]
+    fn backfill_carries_the_hooks_target_and_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default =
+            backfill_command_spec(tmp.path(), BackfillTarget::ServerUrl("https://a.example"))
+                .unwrap();
+        assert_eq!(
+            &default.args[2..],
+            [
+                "backfill",
+                "--auto",
+                "--quiet",
+                "--server-url",
+                "https://a.example"
+            ]
+            .map(OsString::from)
+        );
+        let profile = backfill_command_spec(tmp.path(), BackfillTarget::Profile("team-b")).unwrap();
+        assert_eq!(
+            &profile.args[5..],
+            ["--server-profile", "team-b"].map(OsString::from)
+        );
+        assert!(profile.live_token.is_none());
+        assert!(default.live_token.is_none());
+    }
+
+    /// An absent or empty token carries nothing, so a no-auth deployment does
+    /// not export an empty bearer into the child.
+    #[test]
+    fn an_absent_or_empty_token_is_not_carried() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(command_spec(tmp.path(), None).unwrap().live_token.is_none());
+        assert!(
+            command_spec(tmp.path(), Some(""))
+                .unwrap()
+                .live_token
+                .is_none()
+        );
+    }
+
     #[test]
     fn spawn_config_redirects_stdio_and_logs_under_data_dir_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let config = spawn_config(&spec, true);
 
         assert!(config.stdin_null);
@@ -295,7 +442,7 @@ mod tests {
     #[test]
     fn unix_spawn_config_prefers_true_session_detach_when_available() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let DetachConfig::UnixNewSession { setsid } = spawn_config(&spec, true).detach;
         if let Some(path) = setsid {
             assert!(
@@ -309,7 +456,7 @@ mod tests {
     #[test]
     fn windows_spawn_config_uses_expected_flags_and_breakaway_toggle() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let DetachConfig::WindowsCreationFlags(with_breakaway) = spawn_config(&spec, true).detach;
         let DetachConfig::WindowsCreationFlags(without_breakaway) =
             spawn_config(&spec, false).detach;

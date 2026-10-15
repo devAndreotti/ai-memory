@@ -26,6 +26,26 @@ function Get-EnvOrDefault {
     return $value
 }
 
+# Resolve the real subcommand, skipping the global options that may precede
+# it. `--config` and `--data-dir` take a separate value, so their argument has
+# to be stepped over as well or it would be mistaken for the subcommand.
+function Get-WrapperSubcommand {
+    param([string[]]$WrapperArgs)
+
+    $Index = 0
+    while ($Index -lt $WrapperArgs.Count) {
+        $Arg = $WrapperArgs[$Index]
+        if ($Arg -eq "--config" -or $Arg -eq "--data-dir") {
+            $Index += 2
+        } elseif ($Arg -like "--*") {
+            $Index += 1
+        } else {
+            return $Arg
+        }
+    }
+    return ""
+}
+
 $Image = Get-EnvOrDefault "AI_MEMORY_IMAGE" "akitaonrails/ai-memory:latest"
 $Docker = Get-EnvOrDefault "AI_MEMORY_DOCKER" "docker"
 $DataVolume = Get-EnvOrDefault "AI_MEMORY_DATA_VOLUME" "ai-memory-data"
@@ -59,9 +79,23 @@ if ($InsideHome) {
 } else {
     $ScopeRoot = $WorkPath
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $DetectedScopeRoot = (& git -C $WorkPath rev-parse --show-toplevel 2>$null)
-        if (-not [string]::IsNullOrWhiteSpace($DetectedScopeRoot)) {
-            $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
+        # Probe for the repo root, but never let git's "not a git
+        # repository" message abort the wrapper. Under this script's
+        # $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns a
+        # REDIRECTED native stderr (the 2>$null below) into a *terminating*
+        # error, so running `status` outside a repo crashed the wrapper
+        # (#591). Suppress locally, gate on the exit code, and restore. The
+        # unredirected `& $Docker` calls are unaffected, which is why only
+        # this probe tripped it.
+        $PrevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        try {
+            $DetectedScopeRoot = (& git -C $WorkPath rev-parse --show-toplevel 2>$null)
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($DetectedScopeRoot)) {
+                $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
+            }
+        } finally {
+            $ErrorActionPreference = $PrevErrorAction
         }
     }
     $ScopeRoot = $ScopeRoot.TrimEnd([char[]]@('/', '\'))
@@ -111,23 +145,78 @@ foreach ($Name in @(
     "AI_MEMORY_LLM_PROVIDER",
     "AI_MEMORY_LLM_MODEL",
     "AI_MEMORY_LLM_BASE_URL",
+    "AI_MEMORY_COPILOT_CLIENT_ID",
     "AI_MEMORY_EMBEDDING_PROVIDER",
     "AI_MEMORY_EMBEDDING_MODEL",
     "AI_MEMORY_EMBEDDING_BASE_URL",
     "AI_MEMORY_EMBEDDING_DIM",
     "AI_MEMORY_ALLOWED_HOSTS",
+    "AI_MEMORY_WORKSTREAM_ID",
+    "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_SESSION_ID",
+    "MUSE_SESSION_ID",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN",
+    "COPILOT_API_URL",
     "VOYAGE_API_KEY",
     "LLM_API_KEY",
+    "EMBEDDING_API_KEY",
+    "OPENCODE_API_KEY",
     "RUST_LOG"
 )) {
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Name))) {
         $DockerArgs += @("-e", $Name)
     }
+}
+
+# Presence-based, not non-empty-based like the loop above: an operator sets
+# one of these to the empty string to deliberately clear a
+# config.toml-configured prefix without editing the file (see
+# Config::load's figment overlay), and a present-but-empty value must reach
+# the container for that to work — `IsNullOrEmpty` above would drop it,
+# making the wrapper indistinguishable from the variable never having been
+# set at all. `GetEnvironmentVariable` returns `$null` only when the
+# variable is truly unset, and `""` when it is set-but-empty, so a `-ne
+# $null` check is exactly the presence test needed here.
+#
+# An operator's own `$env:NAME = ''` additionally needs PowerShell 7.5+
+# (first built on .NET 9) to leave a set-but-empty variable rather than
+# deleting it; not exercised on a real pwsh runtime.
+# https://learn.microsoft.com/en-us/dotnet/api/system.environment.setenvironmentvariable
+# https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-75
+foreach ($Name in @(
+    "AI_MEMORY_EMBEDDING_QUERY_PREFIX",
+    "AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX"
+)) {
+    if ($null -ne [Environment]::GetEnvironmentVariable($Name)) {
+        $DockerArgs += @("-e", $Name)
+    }
+}
+
+# Docker Desktop gives Windows no host networking for Linux containers, so a
+# thin-client command (status, search, bootstrap, ...) reaches the loopback-
+# published server from this helper container through Docker Desktop's host
+# alias; 127.0.0.1 would mean the helper container itself and the call dies
+# with "Connection refused". But install-mcp/install-hooks/setup-agent RENDER
+# the URL into the *host* agent config, and host.docker.internal does NOT
+# resolve on the Windows host: baking it in silently breaks MCP and every
+# capture hook. So for those commands leave AI_MEMORY_SERVER_URL unset, letting
+# the CLI render its host-reachable default (http://127.0.0.1:49374).
+# (issue #107)
+$RendersHostConfig = (Get-WrapperSubcommand $CommandArgs) -in @(
+    "install-mcp",
+    "install-hooks",
+    "setup-agent"
+)
+if (-not $RendersHostConfig -and
+    [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("AI_MEMORY_SERVER_URL"))) {
+    $DockerArgs += @("-e", "AI_MEMORY_SERVER_URL=http://host.docker.internal:49374")
 }
 
 $DockerArgs += $Image

@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
 
 /// Default Gemini API base.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -31,6 +31,7 @@ pub struct GeminiProvider {
     base_url: String,
     model: String,
     timeout: Duration,
+    extra_headers: ExtraHeaders,
 }
 
 impl GeminiProvider {
@@ -47,6 +48,7 @@ impl GeminiProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -62,6 +64,14 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 }
@@ -233,15 +243,14 @@ impl GeminiProvider {
             self.model
         );
         debug!(url, "POST gemini");
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(self.timeout)
-            .header("x-goog-api-key", self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+        let request = self.extra_headers.apply(
+            self.client
+                .post(&url)
+                .timeout(self.timeout)
+                .header("x-goog-api-key", self.api_key.expose_secret())
+                .header("content-type", "application/json"),
+        );
+        let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -268,9 +277,16 @@ fn default_thinking_config_for(model: &str) -> Option<GeminiThinkingConfig> {
     // behaviour unchanged — narrowing 2.5 as well would re-enable its
     // default thinking and let hidden thought tokens truncate strict JSON,
     // which is the whole reason this function exists.
+    //
+    // 3.8 Flash thinks by default too (229 hidden thought tokens on a short
+    // structured prompt, verified against the live API) and accepts
+    // `thinkingBudget = 0` (HTTP 200, 0 thought tokens, half the latency).
+    // Its `-lite` variant is unverified, so it is excluded the same way as
+    // 3.5's rather than assumed to accept the field.
     let is_25_flash = model.contains("gemini-2.5-flash");
     let is_35_flash_non_lite = model.contains("gemini-3.5-flash") && !model.contains("-lite");
-    if is_25_flash || is_35_flash_non_lite {
+    let is_38_flash_non_lite = model.contains("gemini-3.8-flash") && !model.contains("-lite");
+    if is_25_flash || is_35_flash_non_lite || is_38_flash_non_lite {
         return Some(GeminiThinkingConfig { thinking_budget: 0 });
     }
     None
@@ -626,6 +642,26 @@ mod tests {
     #[test]
     fn build_request_disables_default_thinking_for_35_flash() {
         assert_thinking_budget_disabled("gemini-3.5-flash");
+    }
+
+    #[test]
+    fn build_request_disables_default_thinking_for_38_flash() {
+        assert_thinking_budget_disabled("gemini-3.8-flash");
+    }
+
+    /// 3.8 Flash-Lite has not been verified against the live API, so it keeps
+    /// the conservative 3.5-lite behaviour: omit the field rather than risk an
+    /// HTTP 400 on every call.
+    #[test]
+    fn build_request_omits_thinking_config_for_38_flash_lite() {
+        let lite =
+            GeminiProvider::new(SecretString::from("test-key"), "gemini-3.8-flash-lite").unwrap();
+        let body =
+            serde_json::to_value(lite.build_request(&ChatRequest::user_prompt("x"), None)).unwrap();
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "{body}"
+        );
     }
 
     /// `gemini-3.5-flash-lite` rejects `thinkingConfig` with HTTP 400 while

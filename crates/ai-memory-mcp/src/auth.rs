@@ -1,74 +1,57 @@
 //! Authorization middleware for the HTTP server.
 //!
-//! When `[auth].bearer_token` (or the `AI_MEMORY_AUTH_TOKEN` env var)
-//! is set, every request to `/mcp`, `/hook`, `/handoff`, and `/web/*`
-//! must present the token via one of three transports:
+//! Machine-only routes (`/mcp`, `/hook`, `/handoff`,
+//! `/workstream/*`) accept `Authorization: Bearer` only. Browser
+//! routes use Bearer plus one of two mutually exclusive modes:
 //!
-//! - **Bearer header** (any method): MCP clients + hooks. Required
-//!   on all non-GET methods.
-//! - **Basic auth** (GET only): browsers — username ignored, token
-//!   in the password field. Triggers the native credential dialog
-//!   via the `WWW-Authenticate: Basic` challenge in 401 responses.
-//! - **Session cookie** (GET only): set automatically after a
-//!   successful Basic auth so the browser doesn't re-prompt every
-//!   session.
+//! - before human password auth is configured, GET requests retain
+//!   the deprecated Basic / `ai_memory_auth` cookie transport;
+//! - after human auth is configured, only short-lived human sessions
+//!   authenticate browser requests.
 //!
-//! When the token is *unset*, the middleware is a no-op — preserving
-//! the zero-config local-development experience and keeping the
-//! existing e2e + unit tests working.
+//! When no authority is configured the middleware is a no-op,
+//! preserving zero-config loopback.
 //!
 //! Comparison uses [`subtle::ConstantTimeEq`] so an attacker on the
 //! same LAN cannot use response-time leaks to recover the token byte
-//! by byte. The constant-time guarantee depends on both sides being
-//! the same length; `subtle` returns a constant-cost `Choice::from(0)`
-//! when lengths differ, which is the right thing here.
-//!
-//! Wire shape matches the MCP authorization spec
-//! (modelcontextprotocol.io/specification/.../basic/authorization):
-//! 401 responses include `WWW-Authenticate: Bearer …` so MCP clients
-//! detect missing/expired credentials. GET 401s ALSO include `Basic
-//! …` so browsers dialog-prompt automatically.
-//!
-//! ## Why not OAuth
-//!
-//! The MCP spec mandates full OAuth 2.1 for HTTP-authenticated
-//! servers. That's overkill for a single-user homelab and would
-//! force every MCP client config to deal with authorization-server
-//! discovery + PKCE + token refresh. A static bearer token is
-//! wire-compatible with the spec's `Authorization: Bearer …` shape
-//! (clients send the header the same way; they just don't run the
-//! OAuth dance to obtain the token). Every supported client
-//! (Claude Code, Codex, OpenCode, Cursor, Claude Desktop via
-//! `mcp-remote`, Gemini CLI, OpenClaw) accepts a static
-//! `Authorization` header in its config.
+//! by byte.
 
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, AuthLevel, IdentityKey};
 use ai_memory_store::{ReaderPool, TokenPepper, WriterHandle, hash_token};
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use tracing::debug;
 
-/// Cookie name used for browser session persistence after a
-/// successful Basic auth handshake.
-const AUTH_COOKIE: &str = "ai_memory_auth";
-/// Realm advertised in `WWW-Authenticate` challenges. Shows up in
-/// the browser's credential prompt as "Server says: <realm>".
+/// Realm advertised in `WWW-Authenticate` Bearer challenges.
 const AUTH_REALM: &str = "ai-memory";
 
+/// Outcome of inspecting `Authorization: Bearer` without running the
+/// rest of the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerAuth {
+    /// Actor and [`AuthLevel`] were injected into the request.
+    Authenticated,
+    /// No Bearer scheme. Basic, empty, unknown, or missing Authorization
+    /// do not count as a presented Bearer.
+    Absent,
+    /// Bearer scheme was present and did not authenticate.
+    Rejected,
+}
+
 /// Optional multi-user resolver tier — token-hash lookup against the
-/// `users` table. Populated only when both a per-server pepper and a
+/// `api_credentials` table. Populated only when both a per-server pepper and a
 /// reader pool are available (i.e. after `ai-memory init` ran and a
 /// store was opened). Single-user (rung-1) setups skip this entirely;
 /// rung-0 (no auth) skips the whole middleware.
 #[derive(Clone)]
 pub struct MultiUserResolver {
     /// Hashes incoming tokens with the per-server pepper before the
-    /// `users.token_hash` lookup.
+    /// `api_credentials.token_hash` lookup.
     pub pepper: TokenPepper,
     /// Read-only pool used by the auth hot path
     /// (`find_active_user_by_token_hash`).
@@ -104,6 +87,13 @@ pub struct AuthState {
     /// separate from the root bearer so a missing identity assertion cannot
     /// accidentally turn proxy traffic into root traffic.
     actor_proxy_bearer: Option<String>,
+    /// Human password/session runtime. `None` for machine-only or
+    /// zero-config anonymous loopback.
+    pub human: Option<crate::human_auth::HumanAuthRuntime>,
+    /// Whether human auth was intended at startup. Runtime presence is
+    /// separate because the browser transition checks persisted password /
+    /// bootstrap state on every request.
+    human_intended: bool,
 }
 
 impl AuthState {
@@ -171,8 +161,8 @@ impl AuthState {
     }
 
     /// Enable multi-user lookups: a bearer that doesn't match the root
-    /// token is hashed with `pepper` and checked against the `users`
-    /// table; a hit attributes the request to that user's identity.
+    /// token is hashed with `pepper` and checked against
+    /// `api_credentials`; a hit attributes the request to that user.
     /// Without this attach, the middleware only knows about rung 0/1
     /// and rejects unknown bearers (closing the bypass).
     #[must_use]
@@ -190,37 +180,52 @@ impl AuthState {
         self
     }
 
-    /// True when a token is configured (i.e. the middleware is doing
-    /// anything). Useful for the startup log line so the operator
-    /// sees whether their server is open or closed.
+    /// Attach an active human password/session runtime.
+    #[must_use]
+    pub fn with_human(self, human: crate::human_auth::HumanAuthRuntime) -> Self {
+        self.with_human_runtime(human, true)
+    }
+
+    /// Attach the runtime while preserving the startup decision about whether
+    /// human auth contributes authority. HTTP serving attaches the runtime
+    /// even before bootstrap so the transition can happen without restart.
+    #[must_use]
+    pub fn with_human_runtime(
+        mut self,
+        human: crate::human_auth::HumanAuthRuntime,
+        human_intended: bool,
+    ) -> Self {
+        self.human = Some(human);
+        self.human_intended = human_intended;
+        self
+    }
+
+    /// Per-server token pepper when multi-user lookup is enabled.
+    #[must_use]
+    pub fn pepper(&self) -> Option<&TokenPepper> {
+        self.multiuser.as_ref().map(|mu| &mu.pepper)
+    }
+
+    /// Whether browser cookies must be marked `Secure`.
+    #[must_use]
+    pub fn secure_cookie(&self) -> bool {
+        self.secure_cookie
+    }
+
+    /// Dedicated actor-proxy bearer, if configured.
+    #[must_use]
+    pub fn actor_proxy_bearer(&self) -> Option<&str> {
+        self.actor_proxy_bearer.as_deref()
+    }
+
+    /// True when machine authority or startup-intended human auth is
+    /// configured.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.expected.is_some()
+        self.expected.is_some() || self.human_intended
     }
 }
 
-/// axum middleware closure. Wire with
-/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
-///
-/// Token sources, in priority order:
-/// 1. `Authorization: Bearer <token>` header. Works for any method.
-///    This is what MCP + hook clients send.
-/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
-///    Username is ignored; the password portion is the token.
-///    Browsers send this automatically after the native credential
-///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
-///    we also set the `ai_memory_auth` cookie so subsequent visits
-///    (including from a fresh browser session) skip the prompt.
-/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
-///
-/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
-/// Basic auth are GET-only, which confines cookie-CSRF to read-only
-/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
-///
-/// On 401 for GET requests the response includes both `Basic` and
-/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
-/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
-/// challenge.
 /// Every header the trusted-proxy assertion reads.
 /// A repeated occurrence of any of them makes the assertion ambiguous — see
 /// [`trusted_proxy_actor`].
@@ -275,82 +280,48 @@ fn trusted_proxy_actor(headers: &HeaderMap) -> Result<ActorContext, ProxyAsserti
     Ok(asserted)
 }
 
-/// axum middleware closure. Wire with
-/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+/// Inspect `Authorization: Bearer` and inject actor / [`AuthLevel`] on
+/// success.
 ///
-/// Token sources, in priority order:
-/// 1. `Authorization: Bearer <token>` header. Works for any method.
-///    This is what MCP + hook clients send.
-/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
-///    Username is ignored; the password portion is the token.
-///    Browsers send this automatically after the native credential
-///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
-///    we also set the `ai_memory_auth` cookie so subsequent visits
-///    (including from a fresh browser session) skip the prompt.
-/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
-///
-/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
-/// Basic auth are GET-only, which confines cookie-CSRF to read-only
-/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
-///
-/// On 401 for GET requests the response includes both `Basic` and
-/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
-/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
-/// challenge.
-pub async fn require_bearer(
-    State(state): State<Arc<AuthState>>,
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    // Rung 0: auth disabled. Inject anonymous actor + anonymous
-    // tier (so downstream handlers that read Extension<ActorContext>
-    // and Extension<AuthLevel> always have one), then pass through.
-    let Some(expected) = state.expected.as_deref() else {
-        req.extensions_mut().insert(ActorContext::anonymous());
-        req.extensions_mut().insert(AuthLevel::Anonymous);
-        return next.run(req).await;
+/// * [`BearerAuth::Authenticated`] — extensions populated; caller runs `next`.
+/// * [`BearerAuth::Absent`] — no Bearer scheme (missing, Basic, empty, unknown).
+/// * [`BearerAuth::Rejected`] — Bearer scheme was present and did not authenticate.
+/// * `Err(Response)` — trusted-proxy assertion is malformed (400).
+pub async fn authenticate_bearer(
+    state: &AuthState,
+    req: &mut Request<axum::body::Body>,
+) -> Result<BearerAuth, Response> {
+    let Some(provided) = extract_bearer_from_headers(req.headers()) else {
+        return Ok(BearerAuth::Absent);
     };
+    authenticate_token(state, req, &provided, true).await
+}
 
-    let is_get = req.method() == Method::GET;
-    let from_bearer = extract_bearer_header(&req);
-    let from_basic = if is_get {
-        extract_basic_header(&req)
-    } else {
-        None
-    };
-    let from_cookie = if is_get { extract_cookie(&req) } else { None };
-
-    let provided = from_bearer
-        .as_deref()
-        .or(from_basic.as_deref())
-        .or(from_cookie.as_deref())
-        .unwrap_or("");
-
-    // Rung 1: root credential. Actor assertion headers are intentionally
-    // ignored here; only the distinct proxy credential may assert them.
-    if bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
-        req.extensions_mut().insert(state.root_actor.clone());
-        req.extensions_mut().insert(AuthLevel::Root);
-
-        // First successful Basic-auth hit (no cookie yet) → also stamp
-        // the cookie so the user doesn't get the dialog again next
-        // browser session. Subsequent navigations ride the cookie alone.
-        if from_basic.is_some() && from_cookie.is_none() {
-            let mut resp = next.run(req).await;
-            if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse() {
-                resp.headers_mut().insert(header::SET_COOKIE, cookie);
-            }
-            return resp;
-        }
-        return next.run(req).await;
+/// Authenticate one already-extracted token.
+///
+/// Browser Basic/cookie compatibility calls this with `allow_proxy=false`:
+/// proxy credentials may assert identities only through an explicit Bearer.
+pub(crate) async fn authenticate_token(
+    state: &AuthState,
+    req: &mut Request<axum::body::Body>,
+    provided: &str,
+    allow_proxy: bool,
+) -> Result<BearerAuth, Response> {
+    if provided.is_empty() {
+        return Ok(BearerAuth::Rejected);
     }
 
-    // Rung 1b: only an explicit Bearer token can enter the trusted-proxy
-    // branch. Basic auth and cookies are browser conveniences for the root
-    // credential, not a way to impersonate the proxy.
-    if let (Some(proxy_expected), Some(proxy_provided)) =
-        (state.actor_proxy_bearer.as_deref(), from_bearer.as_deref())
-        && bool::from(proxy_provided.as_bytes().ct_eq(proxy_expected.as_bytes()))
+    if let Some(expected) = state.expected.as_deref()
+        && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+    {
+        req.extensions_mut().insert(state.root_actor.clone());
+        req.extensions_mut().insert(AuthLevel::Root);
+        return Ok(BearerAuth::Authenticated);
+    }
+
+    if allow_proxy
+        && let Some(proxy_expected) = state.actor_proxy_bearer.as_deref()
+        && bool::from(provided.as_bytes().ct_eq(proxy_expected.as_bytes()))
     {
         let actor = match trusted_proxy_actor(req.headers()) {
             Ok(actor) => actor,
@@ -359,7 +330,7 @@ pub async fn require_bearer(
                     ?error,
                     "auth rejected: invalid trusted-proxy identity assertion"
                 );
-                return invalid_proxy_identity(error);
+                return Err(invalid_proxy_identity(error));
             }
         };
         let level = if state.asserts_root_identity(&actor) {
@@ -367,120 +338,147 @@ pub async fn require_bearer(
         } else {
             AuthLevel::User
         };
-        debug!(actor.user = ?actor.user, actor.issuer = ?actor.issuer, actor.sub = ?actor.sub, ?level, "identity asserted by trusted proxy");
+        debug!(
+            actor.user = ?actor.user,
+            actor.issuer = ?actor.issuer,
+            actor.sub = ?actor.sub,
+            ?level,
+            "identity asserted by trusted proxy"
+        );
         req.extensions_mut().insert(actor);
         req.extensions_mut().insert(level);
-        return next.run(req).await;
+        return Ok(BearerAuth::Authenticated);
     }
 
-    // Rung 2: bearer matches neither root nor proxy. If multi-user is enabled,
-    // hash + look up the token against the `users` table.
-    if let Some(mu) = state.multiuser.as_ref()
-        && !provided.is_empty()
-    {
+    if let Some(mu) = state.multiuser.as_ref() {
         let hash = hash_token(provided, &mu.pepper);
         match mu.reader.find_active_user_by_token_hash(hash).await {
-            Ok(Some(user)) => {
-                // NEVER log the token itself; the username + agent is
-                // safe and useful for "who hit /api/v1 last".
-                debug!(actor.user = %user.username, "authenticated as DB user");
+            Ok(Some(hit)) => {
+                debug!(actor.user = %hit.user.username, "authenticated as DB user");
                 let actor = ActorContext {
-                    user: Some(user.username.clone()),
-                    name: user.name.clone(),
-                    email: user.email.clone(),
+                    user: Some(hit.user.username.clone()),
+                    name: hit.user.name.clone(),
+                    email: hit.user.email.clone(),
                     ..ActorContext::default()
                 };
                 req.extensions_mut().insert(actor);
-                req.extensions_mut().insert(user.id);
+                req.extensions_mut().insert(hit.user.id);
+                // Every database user is subject to per-project access; an
+                // open project admits them, a restricted one asks for a grant.
+                req.extensions_mut()
+                    .insert(ai_memory_core::AuthorizedViewer(hit.user.id));
                 req.extensions_mut().insert(AuthLevel::User);
-
-                // Fire-and-forget last_seen_at bump. Errors are logged
-                // but never block the response — middleware MUST stay
-                // off the response's critical path. Same browser-cookie
-                // dance as rung 1 above.
                 let writer = mu.writer.clone();
-                let user_id = user.id;
+                let user_id = hit.user.id;
+                let credential_id = hit.credential_id;
                 tokio::spawn(async move {
+                    if let Err(e) = writer.touch_api_credential(credential_id).await {
+                        tracing::warn!(
+                            error = %e,
+                            credential_id = %credential_id,
+                            "touch_api_credential failed"
+                        );
+                    }
                     if let Err(e) = writer.touch_user_last_seen(user_id).await {
                         tracing::warn!(error = %e, user_id = %user_id, "touch_user_last_seen failed");
                     }
                 });
-
-                if from_basic.is_some() && from_cookie.is_none() {
-                    let mut resp = next.run(req).await;
-                    if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse()
-                    {
-                        resp.headers_mut().insert(header::SET_COOKIE, cookie);
-                    }
-                    return resp;
-                }
-                return next.run(req).await;
+                return Ok(BearerAuth::Authenticated);
             }
-            Ok(None) => {
-                // Bearer present + multi-user enabled + no match → fall
-                // through to the 401 below. Critical for closing the
-                // bypass: an unknown bearer MUST NOT pass even when
-                // multi-user lookup is configured.
-            }
+            Ok(None) => return Ok(BearerAuth::Rejected),
             Err(e) => {
-                tracing::error!(error = %e, "auth: users table lookup failed");
-                return unauthorized(is_get);
+                tracing::error!(error = %e, "auth: api_credentials lookup failed");
+                return Ok(BearerAuth::Rejected);
             }
         }
     }
 
-    debug!("auth rejected: invalid or missing token");
-    unauthorized(is_get)
+    Ok(BearerAuth::Rejected)
 }
 
-fn extract_bearer_header(req: &Request<axum::body::Body>) -> Option<String> {
-    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    // Accept both "Bearer xxx" and "bearer xxx" (case-insensitive
-    // scheme per RFC 7235 §2.1).
-    let (scheme, value) = h.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") {
-        Some(value.trim_start().to_string())
-    } else {
-        None
-    }
-}
-
-fn extract_basic_header(req: &Request<axum::body::Body>) -> Option<String> {
-    use base64::Engine;
-    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, value) = h.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("Basic") {
-        return None;
-    }
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value.trim_start())
-        .ok()?;
-    let s = std::str::from_utf8(&decoded).ok()?;
-    // Standard form: `user:password`. We ignore the username (the
-    // browser dialog always asks for one but we don't have multi-user
-    // accounts — only the password = bearer token matters).
-    let (_user, pass) = s.split_once(':')?;
-    Some(pass.to_string())
-}
-
-fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
-    let h = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    for pair in h.split(';') {
-        let pair = pair.trim();
-        if let Some(val) = pair.strip_prefix(&format!("{AUTH_COOKIE}=")) {
-            return Some(val.to_string());
+/// Machine-only middleware. Wire with
+/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+///
+/// Anonymous passthrough happens only when [`AuthState::enabled`] is
+/// false (zero-config loopback). Human mode without a presented Bearer
+/// is 401 — sessions never authenticate `/mcp`.
+pub async fn require_bearer(
+    State(state): State<Arc<AuthState>>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match authenticate_bearer(&state, &mut req).await {
+        Ok(BearerAuth::Authenticated) => next.run(req).await,
+        Err(resp) => resp,
+        Ok(BearerAuth::Absent | BearerAuth::Rejected) if !state.enabled() => {
+            // With no configured authority the wire gate is disabled. A
+            // client may still carry a stale bearer from an older secured
+            // deployment; treat it like an anonymous request instead of
+            // making the no-auth server stricter than an absent header.
+            req.extensions_mut().insert(ActorContext::anonymous());
+            req.extensions_mut().insert(AuthLevel::Anonymous);
+            next.run(req).await
+        }
+        Ok(BearerAuth::Absent | BearerAuth::Rejected) => {
+            debug!("auth rejected: invalid or missing token");
+            unauthorized_bearer()
         }
     }
-    None
 }
 
-fn build_session_cookie(token: &str, secure_cookie: bool) -> String {
-    // 30-day Max-Age — long enough that re-entering the credential
-    // every month is rare. HttpOnly hides it from inline JS and Strict keeps
-    // cross-site requests from riding it. `Secure` remains opt-in so direct
-    // loopback/plain-HTTP browser use works; never infer it from proxy headers.
-    let secure = if secure_cookie { "; Secure" } else { "" };
-    format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}")
+/// Bearer token value from all `Authorization` occurrences.
+///
+/// Basic, unknown, and empty headers are discarded. Exactly one Bearer
+/// attempt is accepted; repeated Bearer attempts collapse to an empty
+/// value so authentication fails closed rather than choosing one.
+#[must_use]
+pub fn extract_bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut bearer = None;
+    for value in headers.get_all(header::AUTHORIZATION) {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        let split_at = trimmed.find([' ', '\t']);
+        let (scheme, token) = split_at.map_or((trimmed, ""), |idx| {
+            (&trimmed[..idx], trimmed[idx..].trim())
+        });
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            continue;
+        }
+        if bearer.is_some() {
+            return Some(String::new());
+        }
+        bearer = Some(token.to_string());
+    }
+    bearer
+}
+
+/// True when `Authorization` uses the Bearer scheme, even with no token.
+#[must_use]
+pub fn has_bearer_scheme(headers: &HeaderMap) -> bool {
+    extract_bearer_from_headers(headers).is_some()
+}
+
+/// True when any trusted-proxy identity header is present.
+#[must_use]
+pub fn any_actor_header(headers: &HeaderMap) -> bool {
+    PROXY_ASSERTION_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// 401 with `WWW-Authenticate: Bearer` only. Never advertise Basic.
+#[must_use]
+pub fn unauthorized_bearer() -> Response {
+    let mut resp = (StatusCode::UNAUTHORIZED, "auth required\n").into_response();
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        format!("Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\"")
+            .parse()
+            .expect("static header value is valid"),
+    );
+    resp
 }
 
 /// The proxy's identity headers contradict themselves. Not a 401 — the
@@ -500,32 +498,6 @@ fn invalid_proxy_identity(error: ProxyAssertionError) -> Response {
         }
     };
     (StatusCode::BAD_REQUEST, message).into_response()
-}
-
-fn unauthorized(include_basic_challenge: bool) -> Response {
-    let mut resp = (StatusCode::UNAUTHORIZED, "auth required\n").into_response();
-    // Order of challenges matters: browsers parse the first challenge
-    // they understand and show the dialog for it. Putting `Basic`
-    // first ensures GET-from-browser triggers the native prompt; MCP
-    // clients (which speak only Bearer) ignore the Basic and read
-    // their challenge from the second value.
-    //
-    // Non-GET 401s skip the Basic challenge — sending it on a POST
-    // would invite the browser to dialog-prompt for an endpoint
-    // it can't authenticate this way anyway.
-    let value = if include_basic_challenge {
-        format!(
-            "Basic realm=\"{AUTH_REALM}\", \
-             Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\""
-        )
-    } else {
-        format!("Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\"")
-    };
-    resp.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        value.parse().expect("static header value is valid"),
-    );
-    resp
 }
 
 /// Generate a fresh random bearer token, hex-encoded.
@@ -588,6 +560,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_token_configured_ignores_an_unexpected_bearer() {
+        let r = router_with_auth(None);
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer stale-client-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn missing_header_returns_401_with_www_authenticate() {
         let r = router_with_auth(Some("secret"));
         let resp = r
@@ -602,10 +590,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
         let www = www.to_str().unwrap();
-        // GET 401 advertises BOTH challenges so browsers (Basic) and
-        // MCP clients (Bearer) each see what they understand.
         assert!(www.contains("Bearer"));
-        assert!(www.contains("Basic"));
+        assert!(!www.contains("Basic"));
     }
 
     #[tokio::test]
@@ -674,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cookie_with_right_token_passes_get() {
+    async fn cookie_is_never_a_machine_credential() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
@@ -686,7 +672,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[tokio::test]
@@ -697,44 +684,6 @@ mod tests {
                 Request::builder()
                     .uri("/probe")
                     .header("Authorization", "Bearer wrong-token")
-                    .header("Cookie", "ai_memory_auth=right-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn cookie_with_wrong_token_fails() {
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Cookie", "ai_memory_auth=wrong-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn cookie_ignored_on_post() {
-        // POST routes must use Bearer header; cookie auth is GET-only
-        // to keep the CSRF surface confined to read paths.
-        let state = Arc::new(AuthState::new(Some("right-token".to_string())));
-        let r = Router::new()
-            .route("/probe", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/probe")
                     .header("Cookie", "ai_memory_auth=right-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -755,76 +704,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_with_right_token_passes_get_and_sets_non_secure_cookie() {
+    async fn basic_auth_is_never_a_machine_credential() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
                 Request::builder()
                     .uri("/probe")
                     .header("Authorization", basic_auth("right-token"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // First successful Basic hit also stamps the cookie so the
-        // browser doesn't dialog-prompt every session.
-        let cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("set-cookie on first Basic-auth success")
-            .to_str()
-            .unwrap();
-        assert_eq!(
-            cookie,
-            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
-        );
-    }
-
-    #[tokio::test]
-    async fn basic_auth_sets_secure_cookie_only_when_explicitly_enabled() {
-        let r = router_with_auth_secure_cookie(Some("right-token"), true);
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Authorization", basic_auth("right-token"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::SET_COOKIE)
-                .expect("set-cookie on first Basic-auth success")
-                .to_str()
-                .unwrap(),
-            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure"
-        );
-    }
-
-    #[tokio::test]
-    async fn basic_auth_with_wrong_password_returns_401() {
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Authorization", basic_auth("wrong-token"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        let www = www.to_str().unwrap();
+        assert!(www.contains("Bearer"));
+        assert!(!www.contains("Basic"));
     }
 
     #[tokio::test]
     async fn basic_auth_ignored_on_post() {
-        // POST routes must use Bearer header; Basic auth is GET-only.
         let state = Arc::new(AuthState::new(Some("right-token".to_string())));
         let r = Router::new()
             .route("/probe", axum::routing::post(|| async { "ok" }))
@@ -841,31 +742,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        // POST 401 must NOT advertise Basic — browsers would dialog
-        // for a route they can't authenticate this way.
         let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
         let www = www.to_str().unwrap();
         assert!(www.contains("Bearer"));
         assert!(!www.contains("Basic"));
     }
 
-    #[tokio::test]
-    async fn cookie_request_does_not_re_set_cookie() {
-        // Already-authed-by-cookie requests don't need a Set-Cookie
-        // refresh; that's a waste of bandwidth on every navigation.
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Cookie", "ai_memory_auth=right-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    #[test]
+    fn bearer_parser_discards_other_schemes_and_accepts_tabs() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Basic saved-browser-value"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("bEaReR\tmachine-token"),
+        );
+        assert_eq!(
+            extract_bearer_from_headers(&headers).as_deref(),
+            Some("machine-token")
+        );
+    }
+
+    #[test]
+    fn bearer_parser_rejects_multiple_bearer_attempts() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer first"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer second"),
+        );
+        assert_eq!(extract_bearer_from_headers(&headers).as_deref(), Some(""));
     }
 
     #[test]
@@ -1447,17 +1358,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let pepper = TokenPepper::new("test-pepper");
-        let token = ai_memory_store::generate_token().unwrap();
-        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         let mut new_user = NewUser {
             username: username.into(),
             name: Some(format!("{username} display")),
             email: Some(format!("{username}@example.com")),
         };
         new_user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
+        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         store
             .writer
-            .create_user(new_user, token_hash)
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                user_id,
+                "test".into(),
+                token_hash,
+                Some(ai_memory_store::api_key_preview(&token)),
+            )
             .await
             .unwrap();
 
@@ -1496,6 +1418,47 @@ mod tests {
         assert_ne!(actor.user.as_deref(), Some("root"));
     }
 
+    /// Every database user is subject to per-project access, so the
+    /// middleware stamps the viewer for each of them — there is no switch.
+    /// Root is never stamped: it is authorized above per-project granularity.
+    #[tokio::test]
+    async fn a_database_user_is_always_a_viewer_and_root_never_is() {
+        async fn viewer(
+            viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+        ) -> String {
+            viewer.map_or_else(String::new, |axum::Extension(v)| v.user().to_string())
+        }
+        let (_tmp, state, token) = setup_multiuser("alice").await;
+        let router = Router::new().route("/viewer", get(viewer)).layer(
+            axum::middleware::from_fn_with_state(Arc::new(state), require_bearer),
+        );
+        let ask = |bearer: String| {
+            let router = router.clone();
+            async move {
+                let resp = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/viewer")
+                            .header("Authorization", format!("Bearer {bearer}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        };
+        assert!(!ask(token).await.is_empty(), "a database user is a viewer");
+        assert!(
+            ask("root-token-distinct-from-user-token".to_owned())
+                .await
+                .is_empty(),
+            "root is not"
+        );
+    }
+
     #[tokio::test]
     async fn rung3_unknown_bearer_with_multiuser_returns_401_not_anonymous() {
         // The bypass guard: bearer present but matches NEITHER root
@@ -1517,14 +1480,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rung2_expired_user_token_is_rejected() {
-        // Expiring a user's token must immediately stop authenticating
+    async fn rung2_revoked_api_credential_is_rejected() {
+        // Revoking a native API key must immediately stop authenticating
         // (no 30s cache window or similar). Critical for `ai-memory
-        // user expire` to be useful as an offboarding tool.
+        // api-key revoke` to be useful as an offboarding tool.
         let (_tmp, state, token) = setup_multiuser("alice").await;
 
-        // Look up user id via the writer-side roundtrip (no public
-        // find-by-username on WriterHandle, so use the reader pool).
         let user = state
             .multiuser
             .as_ref()
@@ -1534,8 +1495,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let creds = state
+            .multiuser
+            .as_ref()
+            .unwrap()
+            .reader
+            .list_api_credentials_for_user(user.id)
+            .await
+            .unwrap();
         let writer = state.multiuser.as_ref().unwrap().writer.clone();
-        writer.expire_user_token(user.id).await.unwrap();
+        writer.revoke_api_credential(creds[0].id).await.unwrap();
 
         let r = router_with_state(state);
         let resp = r
@@ -1556,8 +1525,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rung2_revived_user_token_authenticates_again() {
-        let (_tmp, state, token) = setup_multiuser("alice").await;
+    async fn rung2_rotated_api_credential_replaces_the_secret() {
+        let (_tmp, state, old_token) = setup_multiuser("alice").await;
         let user = state
             .multiuser
             .as_ref()
@@ -1567,22 +1536,50 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let creds = state
+            .multiuser
+            .as_ref()
+            .unwrap()
+            .reader
+            .list_api_credentials_for_user(user.id)
+            .await
+            .unwrap();
+        let pepper = state.pepper().expect("pepper");
+        let new_token = ai_memory_store::generate_api_key().unwrap();
         let writer = state.multiuser.as_ref().unwrap().writer.clone();
-        writer.expire_user_token(user.id).await.unwrap();
-        writer.revive_user_token(user.id).await.unwrap();
+        writer
+            .rotate_api_credential(
+                creds[0].id,
+                ai_memory_store::hash_token(&new_token, pepper),
+                Some(ai_memory_store::api_key_preview(&new_token)),
+            )
+            .await
+            .unwrap();
 
         let r = router_with_state(state);
-        let resp = r
+        let old = r
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/probe")
-                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Authorization", format!("Bearer {old_token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let new = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {new_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1624,16 +1621,27 @@ mod tests {
             axum::middleware::from_fn_with_state(Arc::new(state), require_bearer),
         );
 
-        let token = ai_memory_store::generate_token().unwrap();
         let mut user = NewUser {
             username: "alice".into(),
             name: None,
             email: None,
         };
         user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
         store
             .writer
-            .create_user(user, ai_memory_store::hash_token(&token, &pepper))
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                user_id,
+                "test".into(),
+                ai_memory_store::hash_token(&token, &pepper),
+                Some(ai_memory_store::api_key_preview(&token)),
+            )
             .await
             .unwrap();
 
@@ -1669,6 +1677,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_bearer_401_advertises_bearer_not_basic() {
+        let resp = router_with_auth(Some("secret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate")
+            .to_str()
+            .unwrap();
+        assert!(www.contains("Bearer"), "{www}");
+        assert!(!www.to_ascii_lowercase().contains("basic"), "{www}");
+    }
+
+    #[tokio::test]
     async fn rung1_setup_with_unknown_bearer_returns_401() {
         // Existing single-user setup (rung 1 only, no multi-user). An
         // unknown bearer must still 401 — same as pre-P1.3 behaviour.
@@ -1688,5 +1718,908 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn owner_finish_user(store: &Store, name: &str) -> (ai_memory_core::UserId, String) {
+        let id = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: name.into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
+        store
+            .writer
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                id,
+                "owner-finish".into(),
+                ai_memory_store::hash_token(&token, &TokenPepper::new("finish-pepper")),
+                None,
+            )
+            .await
+            .unwrap();
+        (id, token)
+    }
+
+    async fn owner_finish_run(
+        store: &Store,
+        ws: ai_memory_core::WorkspaceId,
+        project: ai_memory_core::ProjectId,
+        name: &str,
+        owner: Option<String>,
+    ) -> ai_memory_store::PreparedWorkstreamRun {
+        store
+            .writer
+            .prepare_workstream_run_owned(
+                ai_memory_store::PrepareWorkstreamRun {
+                    workspace_id: ws,
+                    project_id: project,
+                    repo_fingerprint: "repo".into(),
+                    worktree_fingerprint: "tree".into(),
+                    cwd: "/repo".into(),
+                    agent: ai_memory_core::AgentKind::Codex,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: ai_memory_store::WorkstreamSelection::New(name.into()),
+                    lease_owner: "diagnostic-only".into(),
+                },
+                owner,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn owner_finish_http(store: &Store, root: &std::path::Path, auth: AuthState) -> Router {
+        ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(root, store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
+            data_dir: root.into(),
+            home_dir: None,
+            trusted_proxy_identity: auth.actor_proxy_bearer().is_some(),
+        })
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(auth),
+            require_bearer,
+        ))
+    }
+
+    async fn owner_finish_request(
+        http: &Router,
+        id: ai_memory_core::ManagedRunId,
+        token: Option<&str>,
+        events: serde_json::Value,
+        complete: bool,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("/workstream/runs/{id}/finish"))
+            .header("Content-Type", "application/json")
+            .header("X-Memory-Actor-User", "alice")
+            .header("X-Memory-Actor-Sub", "alice")
+            .header("X-Memory-Actor-Issuer", "https://idp.example");
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let payload = serde_json::json!({
+            "native_session_id": "native-owner", "source_cursor": "foreign-cursor",
+            "events": events, "complete": complete, "exit_code": 9, "checkpoint": {},
+            "actor": {"user": "alice"}, "principal": {"is_root": true}
+        });
+        let request = request.body(Body::from(payload.to_string())).unwrap();
+        http.clone().oneshot(request).await.unwrap()
+    }
+
+    fn owner_finish_events() -> serde_json::Value {
+        serde_json::json!([{
+            "event_id": "owner-finish-event", "agent": "codex", "native_session_id": "native-owner",
+            "kind": "message", "role": "assistant", "content": "owner finish evidence",
+            "metadata": {"actor_user": "alice", "owner_user": "user:alice", "is_root": true}
+        }])
+    }
+
+    async fn owner_finish_prepare_http(
+        http: &Router,
+        token: &str,
+        name: &str,
+    ) -> ai_memory_core::PrepareManagedRunResponse {
+        let response = http
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workstream/runs")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("X-Memory-Actor-User", "alice")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .header("X-Memory-Actor-Sub", "alice")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace": "finish-compat", "project": "restricted", "cwd": "/repo",
+                            "repo_fingerprint": "compat-repo", "worktree_fingerprint": name,
+                            "agent": "codex", "new_workstream": name, "lease_owner": "display-only"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "authenticated prepare must remain legitimate"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_trusted_proxy_preserves_restricted_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("finish-compat")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        // A DB user with the same display name must not change the proxy's OIDC owner.
+        let (alice, db_token) = owner_finish_user(&store, "alice").await;
+        let auth = AuthState::new(Some("root-finish-token".into()))
+            .with_trusted_proxy_bearer("proxy-finish-token")
+            .with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            );
+        let http = owner_finish_http(&store, tmp.path(), auth.clone());
+        let run = owner_finish_prepare_http(&http, "proxy-finish-token", "proxy-owned").await;
+        let before = owner_finish_snapshot(&store).await;
+        for token in [None, Some("invalid-token")] {
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, token, owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for invalid in [true, false] {
+            let mut events = owner_finish_events();
+            if invalid {
+                events[0]["agent"] = serde_json::json!("claude-code");
+            }
+            let response = http.clone().oneshot(
+                Request::builder().method("POST").uri(format!("/workstream/runs/{}/finish", run.run_id))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer proxy-finish-token")
+                    .header("X-Memory-Actor-User", "alice")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .header("X-Memory-Actor-Sub", "bob")
+                    .body(Body::from(serde_json::json!({"events": events, "complete": true, "checkpoint": {}, "actor": {"sub": "alice"}, "principal": {"is_root": true}}).to_string())).unwrap()
+            ).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "foreign proxy owner must be refused before payload handling"
+            );
+        }
+        let malformed = http
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workstream/runs/{}/finish", run.run_id))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer proxy-finish-token")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .body(Body::from("{\"events\":[],\"complete\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        // Enabling proxy authentication never exempts an actual DB principal from grants.
+        let db_run = owner_finish_run(
+            &store,
+            ws,
+            project,
+            "db-no-grant",
+            Some("user:alice".into()),
+        )
+        .await;
+        let db_before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                db_run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "a DB principal must retain its current project grant check with proxy enabled"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, db_before);
+        assert!(!tmp.path().join("raw/workstreams").exists());
+        // The configured server flag is also required, not just User without a DB id.
+        let without_proxy_policy =
+            ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+                writer: store.writer.clone(),
+                reader: store.reader.clone(),
+                sanitizer: ai_memory_core::Sanitizer::default(),
+                wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                    .unwrap()
+                    .with_store_reader(store.reader.clone()),
+                data_dir: tmp.path().into(),
+                home_dir: None,
+                trusted_proxy_identity: false,
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(auth),
+                require_bearer,
+            ));
+        assert_eq!(
+            owner_finish_request(
+                &without_proxy_policy,
+                run.run_id,
+                Some("proxy-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "proxy compatibility requires the server's trusted-proxy configuration"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, db_before);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = 0 WHERE id = ?1",
+            rusqlite::params![run.run_id.as_bytes()],
+        )
+        .unwrap();
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("proxy-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a genuine proxy owner must finish the restricted run it prepared"
+        );
+        let finished = owner_finish_snapshot(&store).await;
+        let foreign_retry = http.clone().oneshot(
+            Request::builder().method("POST").uri(format!("/workstream/runs/{}/finish", run.run_id))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer proxy-finish-token")
+                .header("X-Memory-Actor-User", "alice")
+                .header("X-Memory-Actor-Issuer", "https://idp.example")
+                .header("X-Memory-Actor-Sub", "bob")
+                .body(Body::from(serde_json::json!({"events": owner_finish_events(), "complete": true, "checkpoint": {}}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(
+            foreign_retry.status(),
+            StatusCode::FORBIDDEN,
+            "finished proxy retries must still refuse a foreign owner"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        let retry = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("proxy-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(retry.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "a DB username cannot forge the proxy's qualified OIDC owner"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                db_run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_active_api_key_survives_disabled_human_login() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("finish-compat")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let (alice, token) = owner_finish_user(&store, "alice").await;
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        store.writer.set_user_disabled(alice, true).await.unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let run = owner_finish_prepare_http(&http, &token, "api-human-disabled").await;
+        let response =
+            owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an active API key with Write must finish after human login is disabled"
+        );
+        let revoked = owner_finish_prepare_http(&http, &token, "api-grant-revoked").await;
+        store
+            .writer
+            .revoke_memory(alice, project, None)
+            .await
+            .unwrap();
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            revoked.run_id,
+            Some(&token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "disabled human login does not waive current API-user project grants"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path()
+                .join(format!(
+                    "raw/workstreams/{}/segments",
+                    revoked.workstream_id
+                ))
+                .exists()
+        );
+        let credentials = store
+            .reader
+            .list_api_credentials_for_user(alice)
+            .await
+            .unwrap();
+        store
+            .writer
+            .revoke_api_credential(credentials[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "a revoked API key must be refused by the real middleware"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+    }
+
+    async fn owner_finish_snapshot(store: &Store) -> Vec<Vec<rusqlite::types::Value>> {
+        store
+            .reader
+            .with_conn(|conn| {
+                let mut result = Vec::new();
+                for table in [
+                    "managed_runs",
+                    "workstreams",
+                    "workstream_events",
+                    "workstream_native_sessions",
+                    "workstream_events_fts_data",
+                    "workstream_events_fts_idx",
+                    "workstream_events_fts_docsize",
+                    "sessions",
+                ] {
+                    let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))?;
+                    let count = stmt.column_count();
+                    let rows =
+                        stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())?;
+                    result.extend(
+                        rows.collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()?,
+                    );
+                }
+                Ok(result)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_refuses_another_writer_before_payload_or_segment() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("owner-finish")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let (alice, alice_token) = owner_finish_user(&store, "alice").await;
+        let (bob, bob_token) = owner_finish_user(&store, "bob").await;
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        for user in [alice, bob] {
+            store
+                .writer
+                .grant_memory(user, project, ai_memory_store::GrantLevel::Write, None)
+                .await
+                .unwrap();
+        }
+        let run = owner_finish_run(&store, ws, project, "owned", Some("user:alice".into())).await;
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let before = owner_finish_snapshot(&store).await;
+        let mut invalid = owner_finish_events();
+        invalid[0]["agent"] = serde_json::json!("claude-code");
+        let response =
+            owner_finish_request(&http, run.run_id, Some(&bob_token), invalid, true).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "owner refusal must precede payload validation"
+        );
+        for complete in [false, true] {
+            let response = owner_finish_request(
+                &http,
+                run.run_id,
+                Some(&bob_token),
+                owner_finish_events(),
+                complete,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "Write permission must not bypass another author's owner"
+            );
+        }
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path().join("raw/workstreams").exists(),
+            "foreign owner must write no raw segment"
+        );
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&alice_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&bob_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "finished retries still check the owner"
+        );
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&alice_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_real_auth_rungs_shared_and_project_controls() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("rungs").await.unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let anonymous_http = owner_finish_http(&store, tmp.path(), AuthState::new(None));
+        let anonymous_run = owner_finish_run(&store, ws, project, "anonymous", None).await;
+        assert_eq!(
+            owner_finish_request(
+                &anonymous_http,
+                anonymous_run.run_id,
+                None,
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let (alice, token) = owner_finish_user(&store, "alice").await;
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let shared = owner_finish_run(&store, ws, project, "shared-root", None).await;
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &anonymous_http,
+                shared.run_id,
+                None,
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "an anonymous caller must not acquire root on topology reload"
+        );
+        assert_eq!(
+            owner_finish_request(&http, shared.run_id, None, owner_finish_events(), true)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                shared.run_id,
+                Some(&token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "Read is insufficient for finish"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                shared.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "authenticated root without actor may finish NULL-owned runs"
+        );
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        let owned =
+            owner_finish_run(&store, ws, project, "owned-user", Some("user:alice".into())).await;
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                owned.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "root without actor must not become Any"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        // Exercise the real DB-user tier with only its optional viewer marker removed.
+        let without_viewer = ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
+            data_dir: tmp.path().into(),
+            home_dir: None,
+            trusted_proxy_identity: false,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: Next| async move {
+                request
+                    .extensions_mut()
+                    .remove::<ai_memory_core::AuthorizedViewer>();
+                next.run(request).await
+            },
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(
+                AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                    TokenPepper::new("finish-pepper"),
+                    store.reader.clone(),
+                    store.writer.clone(),
+                ),
+            ),
+            require_bearer,
+        ));
+        let response = owner_finish_request(
+            &without_viewer,
+            owned.run_id,
+            Some(&token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "DB-user authority must survive an absent optional viewer marker"
+        );
+        for (workspace, name) in [
+            (ws, "foreign-project"),
+            (
+                store
+                    .writer
+                    .get_or_create_workspace("other-rungs")
+                    .await
+                    .unwrap(),
+                "shared",
+            ),
+        ] {
+            let foreign = store
+                .writer
+                .get_or_create_project(workspace, name, None)
+                .await
+                .unwrap();
+            store
+                .writer
+                .set_access_mode(foreign, ai_memory_store::AccessMode::Restricted)
+                .await
+                .unwrap();
+            let run = owner_finish_run(&store, workspace, foreign, name, None).await;
+            let before = owner_finish_snapshot(&store).await;
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(owner_finish_snapshot(&store).await, before);
+            assert!(
+                !tmp.path()
+                    .join("raw/workstreams")
+                    .join(run.workstream_id.to_string())
+                    .exists()
+            );
+            store
+                .writer
+                .grant_memory(alice, foreign, ai_memory_store::GrantLevel::Write, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_preserves_late_active_terminal_and_missing_phases() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("phases")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())),
+        );
+        let run = owner_finish_run(&store, ws, project, "late-active", None).await;
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = 0 WHERE id = ?1",
+            [run.run_id.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                run.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "active is allowed even after the lease timestamp"
+        );
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("root-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        let expired = owner_finish_run(&store, ws, project, "cancelled", None).await;
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(expired.run_id)
+                .await
+                .unwrap()
+        );
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                expired.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                ai_memory_core::ManagedRunId::new(),
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path()
+                .join("raw/workstreams")
+                .join(expired.workstream_id.to_string())
+                .exists()
+        );
     }
 }

@@ -1,11 +1,10 @@
 //! Mounting orchestration for the `/api/v1` + web-UI HTTP surfaces.
 //!
-//! The host binary (`ai-memory serve`) builds its MCP/hook/admin router,
-//! then hands it to [`mount_web_router`] to nest the JSON API and mount
-//! either the operator's custom SPA (`--web-ui-dir`) or the built-in
-//! server-rendered wiki browser. Base-path / web-slug normalisation and
-//! `<base href>` injection live here too so the served HTML always
-//! resolves relative URLs under the configured prefix.
+//! The host binary (`ai-memory serve`) splits the JSON API and either the
+//! operator's custom SPA (`--web-ui-dir`) or built-in server-rendered wiki,
+//! attaches the appropriate public/dual-auth middleware, then merges them.
+//! Base-path normalisation and `<base href>` injection live here too so
+//! served HTML resolves relative URLs under the configured prefix.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -17,7 +16,7 @@ use ai_memory_wiki::Wiki;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tower::service_fn;
@@ -128,7 +127,9 @@ fn inject_into_head(html: &str, snippet: &str) -> String {
             out.push_str(&html[pos..]);
             return out;
         }
-        cursor += 1;
+        // Step a whole character: slicing `html[cursor..]` inside a
+        // multi-byte one (a UTF-8 BOM, an accented attribute value) panics.
+        cursor += html[cursor..].chars().next().map_or(1, char::len_utf8);
     }
     format!("{snippet}{html}")
 }
@@ -253,6 +254,21 @@ mod web_base_tests {
         assert!(out.contains("<head><base href=\"/wiki/web/\"><meta"));
     }
 
+    /// The scan walks the page byte by byte, and slicing inside a multi-byte
+    /// character panics. A custom SPA `index.html` saved with a UTF-8 BOM,
+    /// or with any non-ASCII text before `<head>`, took `serve
+    /// --web-ui-dir` down at startup.
+    #[test]
+    fn inject_base_href_steps_over_non_ascii_before_head() {
+        let bom = "\u{feff}<!doctype html><html><head><meta charset=\"utf-8\"></head></html>";
+        let out = inject_base_href(bom, "/w/");
+        assert!(out.starts_with('\u{feff}'), "the BOM stays where it was");
+        assert!(out.contains("<head><base href=\"/w/\"><meta"));
+
+        let accent = "<html data-app=\"Mémoire\"><head></head></html>";
+        assert!(inject_base_href(accent, "/w/").contains("<head><base href=\"/w/\"></head>"));
+    }
+
     #[test]
     fn inject_base_href_no_head_prepends() {
         let out = inject_base_href("<html></html>", "/x/");
@@ -275,11 +291,13 @@ mod web_base_tests {
     }
 }
 
-/// Path / URL config the web mount needs. Bundling these together
-/// keeps `mount_web_router` and its helpers under clippy's
-/// `too_many_arguments` threshold without `#[allow]` papering over
-/// the call shape.
+/// Path / URL config the web mount needs. Bundling these together keeps
+/// [`split_web_routers`] below clippy's `too_many_arguments` threshold
+/// without hiding the call shape.
 pub struct WebMountSpec<'a> {
+    /// Mount `/api/v1` even when the browser UI is disabled. The browser UI
+    /// always implies the API for backward compatibility.
+    pub enable_api: bool,
     /// Operator-supplied custom SPA directory (`--web-ui-dir`). `None`
     /// mounts the built-in server-rendered wiki browser instead.
     pub web_ui_dir: Option<&'a Path>,
@@ -293,59 +311,154 @@ pub struct WebMountSpec<'a> {
     /// Normalised base path (`""` or `/<core>`) the whole surface is
     /// nested under; stamped into the `ai-memory-base-path` meta tag.
     pub base_path: &'a str,
+    /// A trusted identity proxy is configured; the root-only pending-writes
+    /// page needs it to decide whether operators are told apart.
+    pub trusted_proxy_identity: bool,
+    /// The server's configured embedder and reranker, so project search in
+    /// `/web` and `/api/v1` ranks like `memory_query`.
+    pub recall: crate::Recall,
+    /// Process-side sources for the root-only health page.
+    pub health: Option<Arc<crate::health::HealthSources>>,
 }
 
-/// Orchestrator: assemble the `/api/v1` + web-UI surfaces on top of
-/// `router`. Skips everything when web is disabled. Each concern lives
-/// in a dedicated helper below so this function reads as a four-step
-/// recipe (CORS-scoped API, slug normalisation, SPA-vs-builtin choice,
-/// final mount).
-pub fn mount_web_router(
+/// Public SPA vs dual-auth wiki/API split.
+///
+/// Custom `--web-ui-dir` shells are public (session login lives in the SPA).
+/// Builtin wiki pages and `/api/v1` are dual-auth.
+pub struct SplitWebRouters {
+    /// Unauthenticated custom SPA (empty when builtin wiki is mounted).
+    pub public: axum::Router,
+    /// `/api/v1` plus the builtin wiki when that is the chosen UI.
+    pub protected: axum::Router,
+    /// Builtin login / change-password redirect targets. `None` when web is
+    /// disabled or a custom SPA is mounted (no builtin auth pages).
+    pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
+}
+
+/// Refuse to be framed by any page. With auth off, a page inside an iframe
+/// makes same-origin requests the cross-origin guard rightly allows, so a
+/// foreign site could frame `/web/pending` and trick a click on Approve or
+/// Reject. Set only when a handler has not chosen its own value.
+async fn deny_framing(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'none'"));
+    response
+}
+
+/// Split the web surfaces so the host can attach different auth layers.
+/// Every web surface refuses framing (see [`deny_framing`]).
+///
+/// # Errors
+/// Custom SPA `index.html` cannot be read.
+pub fn split_web_routers(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    let split = split_web_routers_unframed(enable_web, reader, wiki, spec)?;
+    let layer = || axum::middleware::map_response(deny_framing);
+    Ok(SplitWebRouters {
+        public: split.public.layer(layer()),
+        protected: split.protected.layer(layer()),
+        html_auth: split.html_auth,
+    })
+}
+
+fn split_web_routers_unframed(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    if !enable_web && !spec.enable_api {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: axum::Router::new(),
+            html_auth: None,
+        });
+    }
+    let mut state = crate::WebState::new(reader, wiki)
+        .with_trusted_proxy_identity(spec.trusted_proxy_identity)
+        .with_recall(spec.recall);
+    if let Some(health) = spec.health {
+        state = state.with_health(health);
+    }
+    let api = build_api_router(state.clone(), spec.cors_origins);
+    let protected_api = axum::Router::new().nest("/api/v1", api);
+    if !enable_web {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: protected_api,
+            html_auth: None,
+        });
+    }
+    let slug = normalize_prefix(spec.web_slug);
+    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
+    if let Some(dir) = spec.web_ui_dir {
+        let public = mount_custom_spa(
+            axum::Router::new(),
+            dir,
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        )?;
+        return Ok(SplitWebRouters {
+            public,
+            protected: protected_api,
+            html_auth: None,
+        });
+    }
+    let auth_cfg = Arc::new(crate::HtmlAuthRedirectConfig::from_mount(
+        spec.base_path,
+        spec.web_slug,
+    ));
+    let browser_inject = Arc::new(WebInjectState {
+        base_href: spec.base_href.to_string(),
+        base_path: spec.base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
+    Ok(SplitWebRouters {
+        public: mount_builtin_public(
+            auth_cfg.clone(),
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        ),
+        protected: mount_builtin_browser(protected_api, state, &slug, mount, browser_inject),
+        html_auth: Some(auth_cfg),
+    })
+}
+
+/// Test-only composition helper. Production must attach distinct auth
+/// middleware to [`SplitWebRouters::public`] and
+/// [`SplitWebRouters::protected`] before merging them.
+#[cfg(test)]
+fn mount_web_router(
     router: axum::Router,
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
-    if !enable_web {
-        return Ok(router);
-    }
-    // Register the web surfaces BEFORE applying the bearer middleware. In
-    // axum 0.8, `.layer()` only attaches to routes registered before the
-    // call; nesting after the layer would silently bypass auth for /web/*.
-    let router = router.nest(
-        "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
-    );
-
-    // Where the UI is mounted WITHIN the (already-applied) base path.
-    // Empty slug => the UI is the root of the base path itself.
-    let slug = normalize_prefix(spec.web_slug);
-    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
-
-    // Custom SPA via --web-ui-dir (SPA fallback to index.html), otherwise
-    // the built-in server-side wiki browser. In both cases the served
-    // index carries an injected `<base href>` so relative asset/router
-    // URLs resolve under `{base_path}{web_slug}`.
-    if let Some(dir) = spec.web_ui_dir {
-        return mount_custom_spa(router, dir, &slug, spec.base_href, spec.base_path, mount);
-    }
-    Ok(mount_builtin_browser(
-        router,
-        reader,
-        wiki,
-        &slug,
-        spec.base_href,
-        mount,
-    ))
+    let split = split_web_routers(enable_web, reader, wiki, spec)?;
+    Ok(router.merge(split.protected).merge(split.public))
 }
 
 /// Build the `/api/v1` router and apply the per-origin CORS layer if
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Router {
+    let api = crate::routes::build_api(Arc::new(state));
     if cors_origins.is_empty() {
         return api;
     }
@@ -358,7 +471,11 @@ fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -
     let cors = CorsLayer::new()
         .allow_origin(parsed)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-csrf-token"),
+        ])
         .allow_credentials(true)
         .max_age(Duration::from_secs(600));
     info!(origins = ?cors_origins, "CORS layer attached to /api/v1");
@@ -407,26 +524,49 @@ fn mount_custom_spa(
     })
 }
 
+/// Mount public builtin auth pages + static assets at `slug`.
+fn mount_builtin_public(
+    auth_cfg: Arc<crate::HtmlAuthRedirectConfig>,
+    slug: &str,
+    base_href: &str,
+    base_path: &str,
+    mount: &str,
+) -> axum::Router {
+    let inject = Arc::new(WebInjectState {
+        base_href: base_href.to_string(),
+        base_path: base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
+    let public = crate::routes::build_public_auth(auth_cfg).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
+    info!(mount, base_href, "builtin public auth pages mounted");
+    if slug.is_empty() {
+        public
+    } else {
+        axum::Router::new().nest(slug, public)
+    }
+}
+
 /// Mount the built-in server-rendered wiki browser at `slug` with
 /// `<base href>` injection middleware. When `slug` is non-empty also
 /// register the trailing-slash → canonical redirect, preserving any
 /// query string the caller passed.
 fn mount_builtin_browser(
     router: axum::Router,
-    reader: ReaderPool,
-    wiki: Wiki,
+    state: crate::WebState,
     slug: &str,
-    base_href: &str,
     mount: &str,
+    inject: Arc<WebInjectState>,
 ) -> axum::Router {
     // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        Arc::new(base_href.to_string()),
-        inject_web_base_href,
-    ));
+    let base_href = inject.base_href.clone();
+    let web_router = crate::routes::build(Arc::new(state)).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         return router.merge(web_router);
@@ -495,12 +635,20 @@ fn custom_spa_router(dir: std::path::PathBuf, injected_index: String) -> axum::R
         .route_service("/{*path}", assets)
 }
 
-/// Response middleware: inject `<base href>` into `text/html` responses from
-/// the built-in server-rendered web browser, so its relative URLs resolve
-/// under the configured `{base_path}{web_slug}` prefix. Non-HTML responses
-/// (static assets, redirects) pass through untouched.
+/// Values injected into every builtin HTML response.
+struct WebInjectState {
+    base_href: String,
+    base_path: String,
+    login_path: String,
+}
+
+/// Response middleware: inject `<base href>` plus auth meta tags into
+/// `text/html` responses from the built-in browser / auth pages, so
+/// relative URLs and logout/login fetch paths resolve under the
+/// configured prefix. Non-HTML responses (static assets, redirects)
+/// pass through untouched.
 async fn inject_web_base_href(
-    State(base_href): State<Arc<String>>,
+    State(inject): State<Arc<WebInjectState>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -531,7 +679,15 @@ async fn inject_web_base_href(
     };
     match std::str::from_utf8(&bytes) {
         Ok(html) => {
-            let injected = inject_base_href(html, &base_href);
+            let with_base = inject_base_href(html, &inject.base_href);
+            let with_path = inject_base_path_meta(&with_base, &inject.base_path);
+            let injected = inject_into_head(
+                &with_path,
+                &format!(
+                    "<meta name=\"ai-memory-login-path\" content=\"{}\">",
+                    escape_attr(&inject.login_path)
+                ),
+            );
             // Stale length from the pre-injection body; let hyper recompute.
             parts.headers.remove(header::CONTENT_LENGTH);
             Response::from_parts(parts, Body::from(injected))
@@ -563,11 +719,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug,
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -580,6 +740,120 @@ mod tests {
         // absolute host root, outside the base-path nest.
         let router = router.merge(crate::favicon_router());
         (tmp, router)
+    }
+
+    /// The homepage shows the pre-migration backup notice while the
+    /// archive exists, and drops it once the archive is deleted
+    /// (docs/okf.md).
+    /// 2.0.1: the always-on backup banner is gone — the migration
+    /// dialog is the single carrier of the archive path and restore
+    /// pointer (and `ai-memory status` keeps the durable reminder).
+    #[tokio::test]
+    async fn homepage_has_no_backup_banner_and_dialog_carries_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt: neither banner nor dialog.
+        let body = body_of(&router).await;
+        assert!(!body.contains("pre-migration backup of your memory"));
+        assert!(!body.contains("okf-dialog-overlay"));
+
+        // Receipt + archive present: still no banner — the dialog holds
+        // the archive path and the restore pointer instead.
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+            dest_free_bytes: None,
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let body = body_of(&router).await;
+        assert!(
+            !body.contains("pre-migration backup of your memory"),
+            "the redundant banner must never render"
+        );
+        assert!(body.contains("okf-dialog-overlay"), "dialog missing");
+        assert!(body.contains("fake-archive.tar.gz"), "archive path missing");
+        assert!(body.contains("MIGRATION-2.0.md"), "restore pointer missing");
+    }
+
+    /// The one-time 2.0 explainer dialog renders whenever a migration
+    /// receipt exists — with recovery steps while the archive is
+    /// present, with the git-checkpoint fallback after it was deleted —
+    /// keyed for per-browser "do not show me again" dismissal.
+    #[tokio::test]
+    async fn homepage_migration_dialog_adapts_to_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt → no dialog at all.
+        assert!(!body_of(&router).await.contains("okf-dialog-overlay"));
+
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+            dest_free_bytes: None,
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        // Archive present → dialog with restore steps + dismissal key.
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("upgraded to the 2.0 format"));
+        assert!(body.contains("Do not show me again"));
+        assert!(
+            body.contains("ai-memory-okf-dialog-2026-09-01T00:00:00Z"),
+            "dismissal key must be migration-stamped"
+        );
+        assert!(body.contains("Unpack the archive"));
+
+        // Archive deleted → dialog still explains, recovery falls back
+        // to the git checkpoint; the inline banner is gone.
+        std::fs::remove_file(&archive).unwrap();
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("pre-okf-migration checkpoint"));
+        assert!(!body.contains("pre-migration backup of your memory"));
     }
 
     #[tokio::test]
@@ -849,11 +1123,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -903,6 +1181,163 @@ mod tests {
         assert_eq!(js, "console.log('asset');");
     }
 
+    /// `serve --web-ui-dir` mounts the SPA at startup, so an `index.html`
+    /// saved with a UTF-8 BOM (Notepad's "UTF-8 with BOM", Visual Studio's
+    /// "UTF-8 with signature") panicked the server before it listened.
+    #[tokio::test]
+    async fn custom_spa_index_with_a_bom_mounts_and_is_injected() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "\u{feff}<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+        )
+        .unwrap();
+
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: false,
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
+            },
+        )
+        .unwrap();
+        let resp = router
+            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains(r#"<base href="/web/"><title>spa</title>"#),
+            "the base href belongs in the head: {html}"
+        );
+    }
+
+    /// Every web surface refuses framing: the built-in pages (the pending
+    /// writes page among them), the login page, and the API. A foreign site
+    /// that frames `/web/pending` on an auth-off server could otherwise trick
+    /// a click on Approve or Reject (GHSA-6mc4-46pr-w82w).
+    #[tokio::test]
+    async fn web_surfaces_refuse_to_be_framed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // A page version and a session, so the history and timeline routes
+        // answer 200 rather than an error page.
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: ai_memory_core::PagePath::new("notes/a.md").unwrap(),
+                title: "A".into(),
+                body: "a".into(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let session = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
+            },
+        )
+        .unwrap();
+        let session_uri = format!("/web/w/default/scratch/s/{session}");
+        for uri in [
+            "/web",
+            "/web/pending",
+            "/web/login",
+            "/api/v1/projects",
+            "/web/w/default/scratch/h/notes/a.md",
+            session_uri.as_str(),
+            "/api/v1/workspaces/default/projects/scratch/history/notes/a.md",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if uri.contains("/h/") || uri.contains("/s/") || uri.contains("/history/") {
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+                Some("DENY"),
+                "{uri} ({})",
+                resp.status()
+            );
+            assert_eq!(
+                headers
+                    .get("content-security-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("frame-ancestors 'none'"),
+                "{uri}"
+            );
+        }
+    }
+
     /// Regression for the prod 404: with `base_path=""` (host root) the custom
     /// SPA mounts at slug `/web`. `nest("/web", …)` served `/web` and
     /// `/web/<route>` but left the bare trailing-slash root `/web/` unrouted →
@@ -928,11 +1363,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -986,11 +1425,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1073,11 +1516,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1128,11 +1575,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1172,11 +1623,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

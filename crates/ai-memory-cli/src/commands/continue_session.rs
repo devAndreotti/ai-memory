@@ -72,7 +72,16 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 new_workstream: None,
                 executable: None,
                 yolo: args.yolo,
+                true_yolo: args.true_yolo,
+                jail: None,
+                no_jail: false,
                 fresh: args.fresh,
+                force_unlock: false,
+                no_autowire: false,
+                require_server: false,
+                profile: None,
+                env: Vec::new(),
+                env_file: None,
                 // Bare mode: `run` resolves the harness that owns the newest
                 // usable session for this workstream.
                 harness: None,
@@ -130,7 +139,7 @@ fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
 /// replaced by a symlink; the scope check rejects a directory that still
 /// exists but now resolves to a different project, which would otherwise
 /// file this session's memory under the wrong scope.
-fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
+pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
     let path = validate_registered_path(&link.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != link.workspace || project != link.project {

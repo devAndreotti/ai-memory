@@ -4,6 +4,7 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,35 @@ use super::hook_spool::{SpoolHealth, spool_dir, spool_health};
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
+
+/// Server-side hook-ingestion counters. `Option` at the call site so a
+/// newer CLI pointed at an older server renders the rest of `status`
+/// instead of failing to deserialise the whole report.
+#[derive(Debug, Deserialize, Serialize)]
+struct IngestReport {
+    accepted: u64,
+    #[serde(default)]
+    dropped_unauthorized: u64,
+    #[serde(default)]
+    stored: u64,
+    #[serde(default)]
+    replayed: u64,
+    #[serde(default)]
+    resumed: u64,
+    #[serde(default)]
+    ignored_end: u64,
+    #[serde(default)]
+    dropped_collision: u64,
+    #[serde(default)]
+    dropped_invalid: u64,
+    #[serde(default)]
+    failed: u64,
+
+    dropped_by_policy: u64,
+    shed_saturated: u64,
+    shed_rate_limited: u64,
+    last_persisted_ms: Option<u64>,
+}
 
 /// Server-shaped response. Mirrors `ai_memory_mcp::admin::StatusReport`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -29,9 +59,31 @@ struct Report {
     /// Derived-index diagnostics.
     #[serde(default)]
     derived: Derived,
+    /// Physical storage figures (absent from pre-#549 servers).
+    #[serde(default)]
+    storage: Storage,
+    /// Hook-ingestion counters from the server process.
+    #[serde(default)]
+    ingest: Option<IngestReport>,
     /// Passive process-scoped provider health.
     #[serde(default)]
     providers: ProviderHealthSnapshot,
+    /// Write-queue depth `(queued, capacity)` (2.0 servers).
+    #[serde(default)]
+    write_queue: Option<(usize, usize)>,
+    /// Wiki-format state (2.0 servers).
+    #[serde(default)]
+    wiki_format: Option<WikiFormatReport>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WikiFormatReport {
+    #[serde(default)]
+    okf_migrated: bool,
+    #[serde(default)]
+    backup_archive: Option<String>,
+    #[serde(default)]
+    backup_archive_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,11 +101,32 @@ struct Derived {
     observations_rows: u64,
     observations_fts_rows: u64,
     latest_pages_missing_embeddings: u64,
+    #[serde(default)]
+    latest_pages_unembeddable: u64,
+    #[serde(default)]
+    typed_links_from_latest_pages: Vec<(String, u64)>,
+    #[serde(default)]
+    embed_failures_unresolved: u64,
+    #[serde(default)]
+    embed_failures_recovered: u64,
     embedding_rows: u64,
     embedding_triples: Vec<EmbeddingTriple>,
     links_from_latest_pages: u64,
     unresolved_links_from_latest_pages: u64,
     stale_links_from_latest_pages: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Storage {
+    page_size: u64,
+    page_count: u64,
+    freelist_count: u64,
+    database_bytes: u64,
+    reclaimable_bytes: u64,
+    /// Free space on the filesystem holding the database (absent from
+    /// pre-#629 servers).
+    #[serde(default)]
+    data_dir_free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -73,6 +146,20 @@ struct EmbeddingTriple {
 /// single object on stdout and get a non-zero exit here anyway. The
 /// unreachable-server error still propagates unchanged; this only adds the
 /// local half of the picture that the caller can actually act on.
+/// Render the last-persisted stamp as an age, or `-` when this server
+/// process has not written an event yet.
+///
+/// An age rather than a wall-clock time: the useful question is "how long
+/// since anything landed", and the server may be in another timezone.
+fn last_write_line(unix_ms: Option<u64>) -> String {
+    let Some(ms) = unix_ms else {
+        return "-".to_string();
+    };
+    let now = jiff::Timestamp::now().as_millisecond();
+    let now_ms = u64::try_from(now).unwrap_or(0);
+    spool_age_line(Some(now_ms.saturating_sub(ms)))
+}
+
 fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
@@ -84,7 +171,13 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     eprintln!("  pending:    {}", spool.pending);
     eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
     eprintln!("  retries:    {}", spool.retries_total);
-    if spool.pending > 0 {
+    if spool.evicting() {
+        eprintln!(
+            "  The spool is full ({} events): each new event evicts the oldest \
+             undelivered one, which is lost. Bring the server back to stop the loss.",
+            spool.capacity
+        );
+    } else if spool.pending > 0 {
         eprintln!(
             "  {} event(s) are queued locally and will be delivered once the \
              server is reachable again.",
@@ -93,10 +186,48 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     }
 }
 
+/// One line pointing at `ai-memory recover` while the server is down, when
+/// there is actually something waiting: queued hook events or journaled
+/// outage runs. Goes to stderr like the spool block above, so `--json`
+/// consumers' stdout stays a single object.
+fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
+    let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
+    if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
+        return;
+    }
+    if json {
+        eprintln!(
+            "recovery hint (server unreachable): {{\"journal_pending\": {journal_pending},\
+             \"spool_pending\": {}}}",
+            spool.pending
+        );
+        return;
+    }
+    eprintln!(
+        "  run `{}` once the server is back to deliver queued events and \
+         repair unrecorded runs ({journal_pending} journaled)",
+        fix_lines::RECOVER
+    );
+}
+
+/// Which capture mode the hook would enforce for this install (#446).
+///
+/// Reads the same file the hook reads rather than keeping a second source of
+/// truth that could drift from the one actually gating events. Anything
+/// unreadable or unrecognised reports the historical default, matching the
+/// hook's own fallback.
+fn resolve_capture_mode(data_dir: &std::path::Path) -> &'static str {
+    match std::fs::read_to_string(data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE)) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist",
+        _ => "denylist",
+    }
+}
+
 /// Returns an error if the server is unreachable, returns non-2xx, or
 /// the response can't be parsed.
 pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let capture_mode = resolve_capture_mode(&config.data_dir);
 
     // Read the spool BEFORE contacting the server, and surface it even when
     // that call fails.
@@ -112,29 +243,30 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         Ok(report) => report,
         Err(err) => {
             report_offline_spool(&spool, args.json);
+            report_offline_recovery_hint(config, &spool, args.json);
             return Err(err);
         }
     };
+    let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
+        super::recovery::journal_summary(&config.data_dir);
+    // `/admin/status` answered. Without a credential that can only mean the
+    // server does not require one.
+    let auth_posture = crate::local_auth::AuthPosture::classify(ep.auth_token.is_none(), &ep.url);
 
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "version": report.version,
-                "data_dir": report.data_dir,
-                "bind": report.bind,
-                "db_path": report.db_path,
-                "counts": {
-                    "pages_latest": report.counts.pages_latest,
-                    "pages_all": report.counts.pages_all,
-                    "sessions": report.counts.sessions,
-                    "observations": report.counts.observations,
-                },
-                "derived": report.derived,
-                "providers": report.providers,
-                "spool": spool,
-                "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
-            }))?
+            serde_json::to_string_pretty(&json_report(
+                report,
+                spool,
+                journal_pending,
+                journal_degraded,
+                journal_finish_failed,
+                journal_error,
+                capture_mode,
+                &ep,
+                auth_posture,
+            ))?
         );
     } else {
         println!("ai-memory {} (server)", report.version);
@@ -142,6 +274,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("  data-dir:     {}", report.data_dir);
         println!("  db:           {}", report.db_path);
         println!("  bind:         {}", report.bind);
+        println!("  auth:         {}", auth_posture.line());
         println!(
             "  pages:        {} (all versions: {})",
             report.counts.pages_latest, report.counts.pages_all
@@ -159,16 +292,136 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             "  embeddings:   {} rows; {} latest pages missing",
             report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
         );
+        if report.derived.latest_pages_unembeddable > 0 {
+            println!(
+                "    unembeddable: {} (empty body; no embedder can cover these)",
+                report.derived.latest_pages_unembeddable
+            );
+        }
+        for triple in &report.derived.embedding_triples {
+            println!(
+                "    {}/{} dim {}: {} rows",
+                triple.provider, triple.model, triple.dim, triple.count
+            );
+        }
+        // Only shown when there is something to act on. A recovered count with
+        // no outstanding failures is history, not a problem.
+        if report.derived.embed_failures_unresolved > 0 {
+            println!(
+                "    embed failures: {} unresolved ({} recovered since)",
+                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
+            );
+        }
+        // The figure that makes a `compact` decision possible. Reported
+        // always, so "should I VACUUM?" has an answer other than a guess; the
+        // advisory line only appears once it is worth the exclusive lock.
+        if report.storage.database_bytes > 0 {
+            let pct = (report.storage.reclaimable_bytes as f64
+                / report.storage.database_bytes as f64)
+                * 100.0;
+            println!(
+                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
+                super::compact::human_bytes(report.storage.database_bytes),
+                super::compact::human_bytes(report.storage.reclaimable_bytes),
+            );
+            if let Some(free) = report.storage.data_dir_free_bytes {
+                println!("    filesystem free: {}", super::compact::human_bytes(free));
+            }
+            if fix_lines::reclaim_advised(
+                report.storage.reclaimable_bytes,
+                report.storage.database_bytes,
+            ) {
+                println!(
+                    "    `{}` would return it (blocks writes while it runs)",
+                    fix_lines::COMPACT
+                );
+            }
+        }
         println!(
             "  links:        {} latest-page links (unresolved: {}, stale: {})",
             report.derived.links_from_latest_pages,
             report.derived.unresolved_links_from_latest_pages,
             report.derived.stale_links_from_latest_pages
         );
+        if !report.derived.typed_links_from_latest_pages.is_empty() {
+            let typed: Vec<String> = report
+                .derived
+                .typed_links_from_latest_pages
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            println!("    typed edges: {}", typed.join(", "));
+        }
+        if let Some(wiki) = &report.wiki_format {
+            let migrated = if wiki.okf_migrated {
+                "OKF v0.2 (migrated)"
+            } else {
+                "OKF v0.2 (native, no migration needed)"
+            };
+            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
+                (Some(path), Some(bytes)) => println!(
+                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
+                     {path} ({})",
+                    super::compact::human_bytes(bytes)
+                ),
+                _ => println!("  wiki format:  {migrated}"),
+            }
+        }
+        if let Some((queued, capacity)) = report.write_queue {
+            // A queue pinned near capacity is the wedged-writer signal.
+            if queued > 0 {
+                println!("  write queue:  {queued}/{capacity}");
+            }
+        }
         println!("  spool:");
         println!("    pending:    {}", spool.pending);
         println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
         println!("    retries:    {}", spool.retries_total);
+        if journal_pending > 0 || journal_error.is_some() {
+            println!("  recovery:");
+            println!(
+                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
+            );
+            if let Some(error) = &journal_error {
+                println!("    error:      {error}");
+            }
+            println!("    action:     run `{}`", fix_lines::RECOVER);
+        }
+        if let Some(ingest) = &report.ingest {
+            println!("  ingest (server, this process):");
+            println!("    accepted:   {}", ingest.accepted);
+            println!(
+                "    dropped:    {} (capture policy)",
+                ingest.dropped_by_policy
+            );
+            println!(
+                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
+                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
+            );
+            println!(
+                "    drops:      {} unauthorized, {} collision, {} invalid",
+                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
+            );
+            println!(
+                "    shed:       {} saturated, {} rate-limited",
+                ingest.shed_saturated, ingest.shed_rate_limited
+            );
+            println!(
+                "    last write: {}",
+                last_write_line(ingest.last_persisted_ms)
+            );
+        }
+        // #446 + #428 interact here: under allowlist mode an unmarked
+        // repository never sends, so zero counters read exactly like a broken
+        // install. Deliberately outside the ingest block above: the mode is a
+        // client-side fact, and an older server returns no ingest section at
+        // all — which is precisely a case where the operator needs telling.
+        if capture_mode == "allowlist" {
+            println!(
+                "  capture mode: allowlist — repositories without a \
+                 .ai-memory.toml marker send nothing"
+            );
+        }
         println!("  providers:");
         println!(
             "    llm:       {}",
@@ -183,14 +436,40 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         {
             println!("    retry:     {hint}");
         }
+        // Only present when `llm_fallbacks` is configured — an older server
+        // or a plain single-provider setup reports an empty list.
+        if !report.providers.llm_candidates.is_empty() {
+            println!("    fallback chain:");
+            for candidate in &report.providers.llm_candidates {
+                println!("      {}", fallback_candidate_line(candidate));
+            }
+        }
     }
     Ok(())
+}
+
+/// One line per `llm_candidates` entry: label, whether it answered the last
+/// completed call, and its most notable state (an open circuit takes
+/// priority over a stale last-error status).
+fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String {
+    let mut line = format!("{}/{}", candidate.provider, candidate.model);
+    if candidate.last_selected {
+        line.push_str(" (last selected)");
+    }
+    if let Some(until) = &candidate.circuit_open_until {
+        line.push_str(&format!(" — circuit open until {until}"));
+    } else if let Some(status) = candidate.last_error_status {
+        line.push_str(&format!(" — last error: status {status}"));
+    } else if let Some(class) = &candidate.last_error_class {
+        line.push_str(&format!(" — last error: {class}"));
+    }
+    line
 }
 
 /// Render a spool age (ms) as a compact human duration, or `-` when the spool
 /// holds no events. Allowed to saturate: an operator reading a stuck-spool
 /// diagnosis wants the magnitude, not sub-second precision.
-fn spool_age_line(age_ms: Option<u64>) -> String {
+pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     let Some(ms) = age_ms else {
         return "-".to_string();
     };
@@ -204,6 +483,46 @@ fn spool_age_line(age_ms: Option<u64>) -> String {
     } else {
         format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_report(
+    report: Report,
+    spool: SpoolHealth,
+    journal_pending: usize,
+    journal_degraded: usize,
+    journal_finish_failed: usize,
+    journal_error: Option<String>,
+    capture_mode: &str,
+    endpoint: &ServerEndpoint,
+    auth_posture: crate::local_auth::AuthPosture,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": report.version,
+        "data_dir": report.data_dir,
+        "bind": report.bind,
+        "db_path": report.db_path,
+        "counts": {
+            "pages_latest": report.counts.pages_latest,
+            "pages_all": report.counts.pages_all,
+            "sessions": report.counts.sessions,
+            "observations": report.counts.observations,
+        },
+        "derived": report.derived,
+        "storage": report.storage,
+        "providers": report.providers,
+        "spool": spool,
+        "recovery": {
+            "journal_pending": journal_pending,
+            "degraded_runs": journal_degraded,
+            "finish_failed_runs": journal_finish_failed,
+            "journal_error": journal_error,
+        },
+        "capture_mode": capture_mode,
+        "ingest": report.ingest,
+        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
+    })
 }
 
 fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
@@ -259,6 +578,117 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {
+        let report: Report = serde_json::from_value(serde_json::json!({
+            "version": "2.6.0",
+            "data_dir": "/data",
+            "bind": "127.0.0.1:49374",
+            "db_path": "/data/db/memory.sqlite",
+            "counts": {"pages_latest": 1, "pages_all": 2, "sessions": 3, "observations": 4},
+            "derived": {
+                "pages_rows": 0, "pages_fts_rows": 0,
+                "observations_rows": 0, "observations_fts_rows": 0,
+                "latest_pages_missing_embeddings": 0,
+                "embedding_rows": 0, "embedding_triples": [],
+                "links_from_latest_pages": 0,
+                "unresolved_links_from_latest_pages": 0,
+                "stale_links_from_latest_pages": 0
+            },
+            "storage": {
+                "page_size": 0, "page_count": 0, "freelist_count": 0,
+                "database_bytes": 0, "reclaimable_bytes": 0
+            },
+            "providers": ProviderHealthSnapshot::default(),
+            "ingest": null,
+            "write_queue": null,
+            "wiki_format": null
+        }))
+        .unwrap();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
+        let value = json_report(
+            report,
+            SpoolHealth::default(),
+            2,
+            1,
+            1,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+        );
+        assert_eq!(value["auth_posture"]["posture"], "none_loopback");
+        assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
+        for key in [
+            "version",
+            "data_dir",
+            "bind",
+            "db_path",
+            "counts",
+            "derived",
+            "storage",
+            "providers",
+            "spool",
+            "capture_mode",
+            "ingest",
+            "client",
+        ] {
+            assert!(value.get(key).is_some(), "missing legacy status key {key}");
+        }
+        assert_eq!(value["recovery"]["journal_pending"], 2);
+        assert_eq!(value["counts"]["observations"], 4);
+    }
+
+    #[test]
+    fn ingest_additions_default_for_older_servers_and_roundtrip() {
+        let old = serde_json::json!({"accepted": 2, "dropped_by_policy": 1, "shed_saturated": 0, "shed_rate_limited": 0, "last_persisted_ms": null});
+        let report: IngestReport = serde_json::from_value(old).unwrap();
+        let mut value = serde_json::to_value(report).unwrap();
+        for name in [
+            "stored",
+            "replayed",
+            "resumed",
+            "ignored_end",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+            "failed",
+        ] {
+            assert_eq!(value[name], 0);
+            value[name] = serde_json::json!(7);
+        }
+        let current: IngestReport = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(current).unwrap(), value);
+    }
+
+    /// #428's counters and #446's gate compose into a trap: under allowlist
+    /// mode an unmarked repository never sends, so `accepted: 0` with an empty
+    /// spool looks exactly like a broken install. `status` must be able to say
+    /// which of the two it is. Resolved from the same file the hook enforces
+    /// from, so the two cannot drift.
+    #[test]
+    fn capture_mode_defaults_to_denylist_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_capture_mode(tmp.path()), "denylist");
+    }
+
+    #[test]
+    fn capture_mode_reports_allowlist_when_the_hook_would_enforce_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(crate::commands::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_capture_mode(tmp.path()), "allowlist");
+        // The status reader and the hook enforcer must agree.
+        assert_eq!(
+            crate::commands::hook::CAPTURE_MODE_FILE,
+            "capture-mode",
+            "status reads the file the hook enforces from"
+        );
+    }
     use jiff::Timestamp;
 
     /// The offline path must be readable and, critically, must not write the
@@ -270,23 +700,53 @@ mod tests {
             pending: 2,
             oldest_age_ms: Some(900_000),
             retries_total: 4,
+            ..SpoolHealth::default()
         };
         let rendered = serde_json::to_string(&spool).expect("SpoolHealth serialises");
         assert_eq!(
             rendered,
-            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4}"#
+            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4,"capacity":3}"#
         );
         // The shape is the contract: counts and ages only. If a field
         // carrying captured text is ever added, this fails loudly.
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, vec!["pending", "oldest_age_ms", "retries_total"]);
+        assert_eq!(
+            keys,
+            vec!["pending", "oldest_age_ms", "retries_total", "capacity"]
+        );
 
         // Both render paths must tolerate an empty spool.
         report_offline_spool(&SpoolHealth::default(), false);
         report_offline_spool(&SpoolHealth::default(), true);
         report_offline_spool(&spool, false);
         report_offline_spool(&spool, true);
+    }
+
+    /// A pre-#629 server's `/admin/status` response has no
+    /// `data_dir_free_bytes` key at all; the field must default to `None`
+    /// rather than fail the whole `storage` object.
+    #[test]
+    fn storage_deserializes_without_free_space_from_an_older_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, None);
+    }
+
+    /// The signal #629 adds: once a server reports free space, it round-trips
+    /// through the CLI's own struct unchanged.
+    #[test]
+    fn storage_deserializes_free_space_from_a_current_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0,
+                "data_dir_free_bytes":80740352}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, Some(80_740_352));
     }
 
     #[test]
@@ -324,6 +784,42 @@ mod tests {
         assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
         assert!(provider_health_line(&role).contains("status 401"));
         assert!(provider_health_line(&role).contains("bad token"));
+    }
+
+    #[test]
+    fn fallback_candidate_line_marks_the_last_selected_candidate() {
+        let candidate = ai_memory_llm::CandidateHealth {
+            provider: "gemini".to_string(),
+            model: "gemini-3.5-flash".to_string(),
+            last_selected: true,
+            last_success_at: Some("2026-05-28T12:00:00Z".parse::<Timestamp>().unwrap()),
+            last_error_at: None,
+            last_error_status: None,
+            last_error_class: None,
+            circuit_open_until: None,
+        };
+        let line = fallback_candidate_line(&candidate);
+        assert!(line.contains("gemini/gemini-3.5-flash"));
+        assert!(line.contains("last selected"));
+    }
+
+    #[test]
+    fn fallback_candidate_line_surfaces_an_open_circuit_over_a_stale_error() {
+        let when = "2026-05-28T12:00:30Z".parse::<Timestamp>().unwrap();
+        let candidate = ai_memory_llm::CandidateHealth {
+            provider: "openai-compat".to_string(),
+            model: "local-router".to_string(),
+            last_selected: false,
+            last_success_at: None,
+            last_error_at: Some(when),
+            last_error_status: Some(503),
+            last_error_class: Some("provider".to_string()),
+            circuit_open_until: Some(when),
+        };
+        let line = fallback_candidate_line(&candidate);
+        assert!(line.contains("openai-compat/local-router"));
+        assert!(line.contains("circuit open until"));
+        assert!(!line.contains("last error"));
     }
 
     #[test]

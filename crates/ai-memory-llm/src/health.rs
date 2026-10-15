@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::embedding::Embedder;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
@@ -21,14 +21,28 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 pub struct ProviderHealth {
     llm: ProviderRoleHealth,
     embedding: ProviderRoleHealth,
+    /// The configured LLM provider, held only so `snapshot()` can read its
+    /// [`LlmProvider::candidate_health`] — a plain provider always returns
+    /// empty here, a [`crate::fallback::FallbackLlmProvider`] returns its
+    /// ordered candidate list. Never dereferenced for anything but that
+    /// read, so this adds no behavior beyond passive reporting.
+    llm_provider: Arc<Mutex<Option<Arc<dyn LlmProvider>>>>,
 }
 
 impl ProviderHealth {
     /// Return a serializable snapshot of the latest recorded state.
     #[must_use]
     pub fn snapshot(&self) -> ProviderHealthSnapshot {
+        let llm_candidates = self
+            .llm_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|provider| provider.candidate_health())
+            .unwrap_or_default();
         ProviderHealthSnapshot {
             llm: self.llm.snapshot(),
+            llm_candidates,
             embedding: self.embedding.snapshot(),
         }
     }
@@ -44,6 +58,7 @@ impl ProviderHealth {
     ) -> Arc<dyn LlmProvider> {
         let health = self.llm.clone();
         health.configure(provider.into(), model.into(), None, retry_hint);
+        *self.llm_provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(inner.clone());
         Arc::new(HealthRecordingLlmProvider { inner, health })
     }
 
@@ -77,13 +92,62 @@ pub enum ProviderHealthStatus {
     Error,
 }
 
+impl ProviderHealthStatus {
+    /// Canonical kebab-case wire string.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Unknown => "unknown",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Wire-format health snapshot for all provider roles.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderHealthSnapshot {
     /// LLM provider role.
     pub llm: ProviderRoleHealthSnapshot,
+    /// Ordered LLM fallback-chain candidate state (`llm_fallbacks`), in
+    /// declaration order (index 0 is the primary provider). Empty for a
+    /// single configured provider or no provider at all.
+    /// `#[serde(default)]` so a response from a server built before this
+    /// field existed still deserializes for a newer CLI.
+    #[serde(default)]
+    pub llm_candidates: Vec<CandidateHealth>,
     /// Embedding provider role.
     pub embedding: ProviderRoleHealthSnapshot,
+}
+
+/// One candidate's passive health state in an ordered LLM fallback chain.
+/// See `docs/llm-provider-fallback.md`. Every entry here is by construction
+/// a configured chain member; redaction is total — only labels, timestamps,
+/// an HTTP status, and a short error class are recorded, never a response
+/// body or credential.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateHealth {
+    /// Candidate provider label.
+    pub provider: String,
+    /// Candidate model id.
+    pub model: String,
+    /// Whether this candidate answered the most recently completed chain
+    /// call.
+    pub last_selected: bool,
+    /// Timestamp of the last call this candidate answered successfully.
+    pub last_success_at: Option<Timestamp>,
+    /// Timestamp of the last call this candidate failed.
+    pub last_error_at: Option<Timestamp>,
+    /// HTTP status captured from the last error, when available.
+    pub last_error_status: Option<u16>,
+    /// Redacted error class captured from the last error
+    /// ([`LlmError::class`]), never a response body or secret.
+    pub last_error_class: Option<String>,
+    /// When this candidate's circuit reopens, if a transient failure has it
+    /// currently open. `None` once the cooldown has elapsed, even if no
+    /// later call has explicitly closed it.
+    pub circuit_open_until: Option<Timestamp>,
 }
 
 /// Wire-format health snapshot for one provider role.
@@ -281,6 +345,23 @@ impl LlmProvider for HealthRecordingLlmProvider {
         result
     }
 
+    // The operation-id variants must be forwarded, not left to the trait
+    // defaults: those call `self.complete*`, which drops the caller's id, so
+    // the inner provider would mint a fresh one per call and every retry of
+    // one logical operation would look unrelated on the wire.
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        let result = self
+            .inner
+            .complete_with_operation_id(request, operation_id)
+            .await;
+        self.health.record_result(&result);
+        result
+    }
+
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
@@ -289,6 +370,24 @@ impl LlmProvider for HealthRecordingLlmProvider {
         let result = self.inner.complete_structured_raw(request, schema).await;
         self.health.record_result(&result);
         result
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        let result = self
+            .inner
+            .complete_structured_raw_with_operation_id(request, schema, operation_id)
+            .await;
+        self.health.record_result(&result);
+        result
+    }
+
+    fn candidate_health(&self) -> Vec<CandidateHealth> {
+        self.inner.candidate_health()
     }
 }
 
@@ -305,6 +404,17 @@ impl Embedder for HealthRecordingEmbedder {
 
     fn model(&self) -> &str {
         self.inner.model()
+    }
+
+    fn model_identity(&self) -> String {
+        // Not the default (`self.model().to_string()`): every configured
+        // embedder is wrapped in this type before being handed to the rest
+        // of the server (`serve.rs`'s `wrap_embedder`), so without this
+        // override every caller of `model_identity` — the refuse-on-mismatch
+        // check, backfill, retrieval, cleanup — would silently see the
+        // wire model name instead of the inner embedder's actual document-
+        // prefix-aware identity.
+        self.inner.model_identity()
     }
 
     fn dim(&self) -> u32 {
@@ -423,6 +533,80 @@ mod tests {
         }
     }
 
+    /// Records the operation id each operation-aware call receives.
+    #[derive(Default)]
+    struct OperationIdLlm {
+        seen: Mutex<Vec<LlmOperationId>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for OperationIdLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "pong".to_string(),
+                usage: None,
+                model: "fake-model".to_string(),
+            })
+        }
+
+        async fn complete_with_operation_id(
+            &self,
+            request: ChatRequest,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<ChatResponse> {
+            self.seen.lock().unwrap().push(operation_id);
+            self.complete(request).await
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_wrapper_forwards_the_callers_operation_id() {
+        let health = ProviderHealth::default();
+        let inner = Arc::new(OperationIdLlm::default());
+        let llm = health.wrap_llm_provider(inner.clone(), "openai", "gpt-test", None);
+        let id = LlmOperationId::new();
+
+        llm.complete_with_operation_id(ChatRequest::user_prompt("ping"), id)
+            .await
+            .unwrap();
+        llm.complete_structured_raw_with_operation_id(
+            ChatRequest::user_prompt("ping"),
+            serde_json::json!({}),
+            id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*inner.seen.lock().unwrap(), vec![id, id]);
+        assert_eq!(health.snapshot().llm.status, ProviderHealthStatus::Ok);
+    }
+
     #[tokio::test]
     async fn llm_wrapper_records_unknown_success_and_error() {
         let health = ProviderHealth::default();
@@ -489,5 +673,54 @@ mod tests {
         let after = health.snapshot().embedding;
         assert_eq!(after.status, ProviderHealthStatus::Ok);
         assert!(after.last_call_at.is_some());
+    }
+
+    /// Every configured embedder is wrapped in `HealthRecordingEmbedder`
+    /// before reaching the rest of the server (`serve.rs`'s
+    /// `wrap_embedder`), so a caller of `model_identity` — the
+    /// refuse-on-mismatch check, backfill, retrieval, cleanup — only ever
+    /// sees the wrapper, never the inner embedder directly. Without the
+    /// wrapper's own `model_identity` override, the default trait impl
+    /// (`self.model().to_string()`) would silently discard a document
+    /// prefix's identity fingerprint. `TaskAwareEmbedder` doesn't
+    /// distinguish this (it never overrides `model_identity` either, so a
+    /// missing wrapper override would coincidentally still pass against
+    /// it); a real `OpenAiCompatEmbedder` with a document prefix set does.
+    #[test]
+    fn embedder_wrapper_forwards_the_inner_model_identity_override() {
+        let inner =
+            crate::OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+                .expect("embedder builds")
+                .with_prefixes("query: ", "passage: ");
+        let inner_identity = inner.model_identity();
+        assert_ne!(
+            inner_identity,
+            inner.model(),
+            "the fixture must actually have a distinct identity, or this test proves nothing"
+        );
+
+        let health = ProviderHealth::default();
+        let wrapped = health.wrap_embedder(Arc::new(inner), "openai-compat", "nomic-embed-text", 8);
+        assert_eq!(wrapped.model_identity(), inner_identity);
+    }
+
+    #[test]
+    fn provider_health_status_wire_labels() {
+        for (status, label) in [
+            (ProviderHealthStatus::Disabled, "disabled"),
+            (ProviderHealthStatus::Unknown, "unknown"),
+            (ProviderHealthStatus::Ok, "ok"),
+            (ProviderHealthStatus::Error, "error"),
+        ] {
+            assert_eq!(status.as_str(), label);
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(label)
+            );
+            assert_eq!(
+                serde_json::from_value::<ProviderHealthStatus>(serde_json::json!(label)).unwrap(),
+                status
+            );
+        }
     }
 }

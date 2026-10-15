@@ -17,7 +17,7 @@
 //!    `config.auth.bearer_token`. Middleware fills `user` / `email` / `name`
 //!    from `[auth].root_username` / `root_email` (and optional `root_name`).
 //! 3. **Identified multi-user** — bearer token matches an active
-//!    `users.token_hash` row. Middleware fills the actor from the row.
+//!    `api_credentials.token_hash` row. Middleware fills the actor from the owning user.
 //! 4. **External auth proxy** — a trusted sidecar authenticates with the
 //!    dedicated proxy bearer and asserts a username or complete OIDC
 //!    issuer/subject pair in `X-Memory-Actor-*` headers. Proxy callers are users
@@ -86,6 +86,32 @@ pub struct ActorContext {
     /// forward-compat rationale as [`Self::sub`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+}
+
+/// The user this request is authorized *as*, for per-repository grants.
+///
+/// Distinct from the bare `UserId` the middleware also stamps, and the
+/// distinction is the whole point. `UserId` answers "who wrote this" and is
+/// always present for a database user, because attribution must not depend on
+/// a policy setting. This answers "whose access applies", and is stamped for
+/// every database user — never for the root token, which authenticates from
+/// configuration and is authorized above per-project granularity, and never on
+/// an install with no database users, where there is nobody to tell apart.
+///
+/// Every guard reads a missing `AuthorizedViewer` as "no per-project check
+/// applies". A present one is checked against the project's access mode: an
+/// `open` project admits every viewer, which is how every project behaves
+/// until an operator restricts it, so stamping every user changes nothing on
+/// upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedViewer(pub crate::UserId);
+
+impl AuthorizedViewer {
+    /// The user id inside.
+    #[must_use]
+    pub const fn user(self) -> crate::UserId {
+        self.0
+    }
 }
 
 /// Authorization tier the auth middleware resolved this request to.

@@ -56,6 +56,13 @@ pub enum AdmissionOp {
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
     PurgeProject,
+    /// One session is being purged (`purge_session`): its rows, the handoffs
+    /// it authored, and its `sessions/<id>.md` page and every version of it.
+    /// Carries the workspace/project; no page path, since the operation is
+    /// driven by session id rather than by path. Lets a mirror drop the
+    /// session page file, and lets a scope-guard webhook refuse the delete
+    /// before any row is touched.
+    PurgeSession,
     /// A whole workspace is being purged. Carries the workspace (ctx), no page
     /// path, and an empty project. Lets a mirror remove the workspace tree.
     PurgeWorkspace,
@@ -81,6 +88,15 @@ pub enum AdmissionOp {
     HandoffAccept,
     /// A pending handoff is being discarded.
     HandoffCancel,
+    /// A cross-project message is being sent into a recipient project's inbox
+    /// (V64). Carries the RECIPIENT workspace/project (the crossing point); no
+    /// page path, since messages live in their own table. Lets a per-operator
+    /// admission webhook see and refuse prompt-derived text crossing projects.
+    MessageSend,
+    /// A cross-project message is being popped (consumed) from an inbox.
+    MessagePop,
+    /// Pending cross-project messages are being cancelled by their sender.
+    MessageCancel,
 }
 
 impl AdmissionOp {
@@ -92,12 +108,16 @@ impl AdmissionOp {
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
             AdmissionOp::PurgeProject => "purge_project",
+            AdmissionOp::PurgeSession => "purge_session",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
             AdmissionOp::MoveProject => "move_project",
             AdmissionOp::MoveSession => "move_session",
             AdmissionOp::HandoffBegin => "handoff_begin",
             AdmissionOp::HandoffAccept => "handoff_accept",
             AdmissionOp::HandoffCancel => "handoff_cancel",
+            AdmissionOp::MessageSend => "message_send",
+            AdmissionOp::MessagePop => "message_pop",
+            AdmissionOp::MessageCancel => "message_cancel",
         }
     }
 }

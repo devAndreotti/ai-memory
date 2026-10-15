@@ -22,9 +22,14 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         provider,
         model: args.model,
         auth: config.provider_auth(provider, api_key_override),
-        base_url: args.base_url.or_else(|| config.llm_test_base_url()),
+        base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
+        compat_disable_thinking: config.llm_compat_disable_thinking,
         request_timeout_secs: config.llm_timeout_secs,
+        reasoning_effort: config.llm_reasoning_effort,
+        extra_headers: config
+            .llm_extra_headers()
+            .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(
@@ -32,10 +37,24 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         model = client.model(),
         "sending prompt",
     );
-    let resp = client
-        .complete(representative_request(args.prompt))
-        .await
-        .context("calling provider")?;
+    let request = representative_request(args.prompt);
+    if args.structured {
+        let value = client
+            .complete_structured_raw(
+                request,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"]
+                }),
+            )
+            .await
+            .context("calling provider for structured output")?;
+        println!("--- model: {} ---", client.model());
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let resp = client.complete(request).await.context("calling provider")?;
 
     println!("--- model: {} ---", resp.model);
     if let Some(u) = resp.usage {
@@ -65,8 +84,10 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Codex => Self::Codex,
             LlmProviderChoice::Copilot => Self::Copilot,
             LlmProviderChoice::Opencode => Self::OpenCode,
+            LlmProviderChoice::Cursor => Self::Cursor,
         }
     }
 }
@@ -80,6 +101,22 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn cursor_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Cursor),
+            ProviderChoice::Cursor
+        );
+    }
+
+    #[test]
+    fn codex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Codex),
+            ProviderChoice::Codex
         );
     }
 

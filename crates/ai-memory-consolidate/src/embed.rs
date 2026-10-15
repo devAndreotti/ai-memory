@@ -35,6 +35,9 @@ pub struct EmbedBackfillCounts {
     /// Pages that would be embedded in a live run (only meaningful
     /// when `dry_run` was requested).
     pub would_embed: usize,
+    /// L0 abstracts (frontmatter `abstract:`) embedded into
+    /// `page_abstract_embeddings` — the opt-in fifth retrieval stream.
+    pub abstracts_embedded: usize,
 }
 
 impl EmbedBackfillCounts {
@@ -44,6 +47,7 @@ impl EmbedBackfillCounts {
         self.skipped += other.skipped;
         self.failed += other.failed;
         self.would_embed += other.would_embed;
+        self.abstracts_embedded += other.abstracts_embedded;
     }
 }
 
@@ -87,7 +91,10 @@ pub async fn run_embedding_backfill(
     options: EmbedBackfillOptions,
 ) -> Result<EmbedBackfillCounts, EmbedBackfillError> {
     let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
+    // Not `.model()`: this identity drives both stale-row detection below
+    // (a document-prefix change must look "stale" like a model change
+    // would) and every write this pass makes. See `Embedder::model_identity`.
+    let model = embedder.model_identity();
     let dim = embedder.dim();
 
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
@@ -106,53 +113,154 @@ pub async fn run_embedding_backfill(
             .into_iter()
             .collect()
     };
+    // L0 abstracts ride the same pass: only pages whose frontmatter carries
+    // an `abstract:` can need one, so a page with neither a missing body
+    // vector nor a missing abstract vector is still skipped without a read.
+    let abstract_bearing: HashSet<_> = reader
+        .abstract_bearing_page_ids(workspace_id, project_id)
+        .await?
+        .into_iter()
+        .collect();
+    let already_abstract: HashSet<_> = if options.reembed {
+        HashSet::new()
+    } else {
+        reader
+            .abstract_embedded_page_ids(
+                workspace_id,
+                project_id,
+                provider.clone(),
+                model.clone(),
+                dim,
+            )
+            .await?
+            .into_iter()
+            .collect()
+    };
 
     let mut counts = EmbedBackfillCounts::default();
     let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
+    let mut pending_abstract = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
 
     for cand in candidates {
-        if already.contains(&cand.id) {
+        let need_body = !already.contains(&cand.id);
+        let need_abstract =
+            abstract_bearing.contains(&cand.id) && !already_abstract.contains(&cand.id);
+        if !need_body && !need_abstract {
             counts.skipped += 1;
             continue;
         }
         if options.dry_run {
-            counts.would_embed += 1;
+            if need_body {
+                counts.would_embed += 1;
+            }
             continue;
         }
         let md = match wiki.read_page(workspace_id, project_id, &cand.path) {
             Ok(md) => md,
             Err(e) => {
                 warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
+                // Durable, so the page is attributable after the container
+                // that logged this is gone (#528).
+                let _ = writer
+                    .record_embed_failure(
+                        cand.id,
+                        ai_memory_store::EmbedOutcome::Unreadable,
+                        Some(e.to_string()),
+                    )
+                    .await;
                 counts.failed += 1;
                 continue;
             }
         };
-        if md.body.trim().is_empty() {
-            counts.skipped += 1;
-            continue;
+        if need_body {
+            if md.body.trim().is_empty() {
+                // Permanent until the body changes. Recorded because a page
+                // skipped on every pass is otherwise indistinguishable from an
+                // idle one, which is what made #509 undiagnosable.
+                let _ = writer
+                    .record_embed_failure(
+                        cand.id,
+                        ai_memory_store::EmbedOutcome::SkippedEmpty,
+                        None,
+                    )
+                    .await;
+                counts.skipped += 1;
+            } else {
+                match embedder.embed_document(&md.body).await {
+                    Ok(vec) => pending.push(EmbeddingWrite {
+                        page_id: cand.id,
+                        vector_bytes: f32_vec_to_bytes(&vec),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        dim,
+                    }),
+                    Err(e) => {
+                        warn!(path = %cand.path, error = %e, "embed: provider call failed");
+                        let _ = writer
+                            .record_embed_failure(
+                                cand.id,
+                                ai_memory_store::EmbedOutcome::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                        counts.failed += 1;
+                    }
+                }
+                if pending.len() >= EMBEDDING_WRITE_BATCH {
+                    flush_embedding_batch(writer, &mut pending, &mut counts).await;
+                }
+            }
         }
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                counts.failed += 1;
-                continue;
+        if need_abstract && let Some(abstract_text) = frontmatter_abstract(&md.frontmatter) {
+            match embedder.embed_document(abstract_text).await {
+                Ok(vec) => pending_abstract.push(EmbeddingWrite {
+                    page_id: cand.id,
+                    vector_bytes: f32_vec_to_bytes(&vec),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    dim,
+                }),
+                Err(e) => {
+                    warn!(path = %cand.path, error = %e, "embed: abstract provider call failed");
+                    counts.failed += 1;
+                }
             }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(writer, &mut pending, &mut counts).await;
+            if pending_abstract.len() >= EMBEDDING_WRITE_BATCH {
+                flush_abstract_batch(writer, &mut pending_abstract, &mut counts).await;
+            }
         }
     }
     flush_embedding_batch(writer, &mut pending, &mut counts).await;
+    flush_abstract_batch(writer, &mut pending_abstract, &mut counts).await;
 
     Ok(counts)
+}
+
+/// The frontmatter `abstract:` line, when it is a non-empty string.
+fn frontmatter_abstract(frontmatter: &serde_json::Value) -> Option<&str> {
+    frontmatter
+        .get("abstract")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+async fn flush_abstract_batch(
+    writer: &WriterHandle,
+    pending: &mut Vec<EmbeddingWrite>,
+    counts: &mut EmbedBackfillCounts,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
+    let count = batch.len();
+    if let Err(e) = writer.store_abstract_embeddings(batch).await {
+        counts.failed += count;
+        warn!(count, error = %e, "embed: store_abstract_embeddings failed");
+    } else {
+        counts.abstracts_embedded += count;
+    }
 }
 
 async fn flush_embedding_batch(
