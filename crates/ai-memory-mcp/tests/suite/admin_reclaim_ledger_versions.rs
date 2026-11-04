@@ -29,7 +29,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -40,7 +43,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         data_dir: tmp.path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -127,10 +130,8 @@ async fn deleting_without_confirm_is_refused_and_changes_nothing() {
     );
 }
 
-/// `confirm` has no serde default, so a body that omits it is rejected by the
-/// extractor before the handler runs — the same fail-closed shape
-/// `/admin/compact` uses. A request that never states its intent cannot
-/// delete.
+/// An omitted `confirm` reads as `false`, so a body that never states its
+/// intent gets the same 400 as an explicit `false` — and cannot delete.
 #[tokio::test]
 async fn omitting_confirm_entirely_is_refused() {
     let tmp = TempDir::new().unwrap();
@@ -139,11 +140,7 @@ async fn omitting_confirm_entirely_is_refused() {
 
     let resp = post(state, "/admin/reclaim-ledger-versions", json!({})).await;
 
-    assert!(
-        resp.status().is_client_error(),
-        "expected a client error, got {}",
-        resp.status(),
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(page_rows(&store).await, 2);
 }
 

@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -148,13 +148,13 @@ fn create_pre_migration_backup_inner(
     crate::confinement::inspect_tree(data_dir)?;
     let dest_dir = destination_dir(dest_override, data_dir, in_container)?;
     let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
-    let archive_path = dest_dir.join(format!("ai-memory-backup-{label}-{stamp}.tar.gz"));
+    let (archive_path, archive_file) = reserve_archive(&dest_dir, label, &stamp)?;
 
     // The migration runs at server startup before any traffic, so the
     // SQLite files (db + WAL/SHM) are quiescent and archived as a set.
     let mut expected = 0usize;
     {
-        let file = BufWriter::new(File::create(&archive_path)?);
+        let file = BufWriter::new(archive_file);
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut tar = tar::Builder::new(enc);
         tar.follow_symlinks(false);
@@ -202,7 +202,21 @@ fn create_pre_migration_backup_inner(
                 }
             }
         }
-        tar.into_inner()?.finish()?;
+        // The verify pass below re-reads the page cache, so it cannot tell an
+        // archive on stable storage from one that is not. This archive is the
+        // gate for a destructive in-place migration, so it has to survive a
+        // crash: fsync the file, then its directory entry. The admin backup
+        // endpoints sync after `finish` for the same reason.
+        finish_archive(tar)?.sync_all()?;
+        File::open(&dest_dir)
+            .and_then(|dir| dir.sync_all())
+            .unwrap_or_else(|e| {
+                tracing::debug!(
+                    dest = %dest_dir.display(),
+                    error = %e,
+                    "could not fsync the backup destination directory"
+                );
+            });
     }
 
     // Verify: re-open and count entries; a torn or unreadable archive
@@ -257,10 +271,79 @@ fn create_pre_migration_backup_inner(
     Ok(receipt)
 }
 
+/// Different data dirs can migrate in the same second and share a destination
+/// (the default is the user's home). Reserve a new path atomically so neither
+/// archive can replace the other's only pre-migration snapshot.
+fn reserve_archive(dest: &Path, label: &str, stamp: &str) -> WikiResult<(PathBuf, File)> {
+    for suffix in 0_u32..=u32::MAX {
+        let suffix = if suffix == 0 {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
+        let path = dest.join(format!("ai-memory-backup-{label}-{stamp}{suffix}.tar.gz"));
+        match File::options().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(WikiError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique pre-migration archive path",
+    )))
+}
+
+/// End the gzip stream and flush the buffer, returning the underlying writer.
+///
+/// `GzEncoder::finish` hands back the `BufWriter`; dropping it would write the
+/// buffered tail from `Drop`, which discards the error, and a backup on a full
+/// disk would then reach the verify pass as if it had been written.
+fn finish_archive<W: Write>(
+    tar: tar::Builder<flate2::write::GzEncoder<BufWriter<W>>>,
+) -> std::io::Result<W> {
+    tar.into_inner()?
+        .finish()?
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A destination that takes no bytes, like a full disk.
+    struct FullDisk;
+
+    impl Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::StorageFull.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The whole small archive sits in the `BufWriter` until `finish`, so the
+    /// write that fails is the one flushing that tail; it must reach the
+    /// caller instead of being dropped with the buffer.
+    #[test]
+    fn a_failed_final_flush_fails_the_archive() {
+        let enc =
+            flate2::write::GzEncoder::new(BufWriter::new(FullDisk), flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        let body = b"page body";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "wiki/page.md", &body[..])
+            .unwrap();
+
+        let error = finish_archive(tar).err().expect("a full disk must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+    }
 
     fn data_dir_with_content() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -307,6 +390,58 @@ mod tests {
         assert!(receipt.archive_present());
         let loaded = BackupReceipt::load(data.path()).unwrap();
         assert_eq!(loaded.archive_path, receipt.archive_path);
+    }
+
+    #[test]
+    fn separate_installs_keep_their_own_pre_migration_archives() {
+        let first_data = data_dir_with_content();
+        let second_data = data_dir_with_content();
+        std::fs::write(second_data.path().join("db.sqlite"), b"another install").unwrap();
+        let dest = TempDir::new().unwrap();
+        let first =
+            create_pre_migration_backup(first_data.path(), "test", Some(dest.path())).unwrap();
+        let original = std::fs::read(&first.archive_path).unwrap();
+        let second =
+            create_pre_migration_backup(second_data.path(), "test", Some(dest.path())).unwrap();
+
+        assert_ne!(first.archive_path, second.archive_path);
+        assert_eq!(std::fs::read(&first.archive_path).unwrap(), original);
+        assert_eq!(
+            BackupReceipt::load(first_data.path()).unwrap().archive_path,
+            first.archive_path
+        );
+        assert_eq!(
+            BackupReceipt::load(second_data.path())
+                .unwrap()
+                .archive_path,
+            second.archive_path
+        );
+    }
+
+    #[test]
+    fn archive_reservations_at_the_same_timestamp_preserve_existing_files() {
+        let dest = TempDir::new().unwrap();
+        let stamp = "20261028-120000";
+        let first = dest
+            .path()
+            .join(format!("ai-memory-backup-test-{stamp}.tar.gz"));
+        let second = dest
+            .path()
+            .join(format!("ai-memory-backup-test-{stamp}-1.tar.gz"));
+        std::fs::write(&first, b"first snapshot").unwrap();
+        std::fs::write(&second, b"second snapshot").unwrap();
+
+        let (third, mut file) = reserve_archive(dest.path(), "test", stamp).unwrap();
+        file.write_all(b"third snapshot").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"first snapshot");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second snapshot");
+        assert_eq!(std::fs::read(&third).unwrap(), b"third snapshot");
+        assert_eq!(
+            third.file_name().unwrap(),
+            format!("ai-memory-backup-test-{stamp}-2.tar.gz").as_str()
+        );
     }
 
     /// The signal this field exists for: a verified archive next to a

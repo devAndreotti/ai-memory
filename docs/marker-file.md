@@ -30,7 +30,10 @@ project-scoped tool call because they cannot attach the real lifecycle-hook
 session id. Without a marker override, static clients derive the project from normalized
 `upstream`, then `origin`, joining the full hostless path with the standard safe
 name mapping; only no-valid-remote checkouts use their folder basename.
-Session-aware bridges keep automatic current-project routing.
+Session-aware bridges keep automatic current-project routing. The session-less
+`ai-memory mcp-bridge --no-session-id` applies this derivation itself, from its
+launch directory, to a call that names no scope
+([`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)).
 
 ## Where to put it
 
@@ -46,19 +49,21 @@ workspace-only markers resolve the canonical repository-path project, with
 A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
 walk: `workspace`, `project`, `project_strategy`, and the other forwarded
-settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`
-keys) are resolved from the nearest ancestor marker that declares at least
-one of them, skipping past any nearer marker that declares nothing but
-`[capture]`. A subdirectory marker added only to exclude some paths from
-capture therefore no longer resets scope to `default` / basename for that
-subtree. `[capture]`/`ignore_paths` itself is unaffected by this and always
-comes from the nearest marker, even a capture-only one.
+settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`,
+`[profile]`, `[handoff]` and `[recovery]` keys) are resolved from the nearest
+ancestor marker that declares at least one of them, skipping past any nearer
+marker that declares nothing but `[capture]`. A subdirectory marker added only
+to exclude some paths from capture therefore no longer resets scope to
+`default` / basename for that subtree. `[capture]`/`ignore_paths` itself is
+unaffected by this and always comes from the nearest marker, even a
+capture-only one.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
-`project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
-`briefing_budget` query params to the server when a marker declares them;
+`project_strategy`, `drop_subagent`, `default_global`, `briefing`,
+`briefing_budget`, `profile_contribute`, `profile_consume`, `handoff`, and
+`recovery` query params to the server as applicable;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
 `identity` / `identity_src` when the checkout has a repository identity (see
@@ -161,9 +166,9 @@ default_global = "true"
 # Optional. Inject a compiled project brief at session start (and after a
 # context clear — Claude Code re-fires SessionStart on /clear): the
 # session-start handoff fetch also returns this project's pinned /
-# `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
-# page titles, so the agent starts with the architecture context instead
-# of re-exploring the codebase. Appended AFTER any pending handoff, and
+# `_rules/` / `_slots/` wiki pages plus recently-updated page titles, so the
+# agent starts with the architecture context instead of re-exploring the
+# codebase. Appended AFTER any pending handoff, and
 # unlike the handoff it is not consumed — it is recomposed every opted-in
 # session start. Only agents whose session-start hook injects stdout as
 # context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
@@ -177,14 +182,55 @@ default_global = "true"
 inject_on_session_start = "true"
 
 # Optional. Char budget for the WHOLE brief (~4 chars per token), headers
-# and footers included. Bodies over budget are truncated with a visible
-# note; crowded-out core pages are listed by path so the agent can
-# `memory_query` them, degrading to a count when even the paths do not
-# fit. Page bodies are served first, then those pointer sections out of
-# what is left; the security notice and the untrusted-history markers are
-# never traded for content. Clamped server-side to [1500, 20000];
+# and footers included. Every core page first gets a short excerpt (its
+# frontmatter `abstract:` or `summary:`, else the prose it opens with); what is
+# left deepens pages to longer excerpts and then whole bodies, pinned and
+# `_slots/` pages first, then the cheapest bodies. A body is shown whole or
+# not at all, and a body shorter than its excerpt is always shown whole.
+# Four or more unpinned excerpts from one folder (`_rules/`, `gotchas/`,
+# `decisions/`, `procedures/`) share a heading. Pages the budget cannot
+# cover are listed by path so the agent can `memory_read_page` them,
+# degrading to a count when even the paths do not fit. Pin a page to give
+# it depth first. The security notice and the untrusted-history markers
+# are never traded for content. Clamped server-side to [1500, 20000];
 # defaults to 4000.
 max_chars = 4000
+
+# Optional. Hand the same brief to each `claude-code` subagent when it starts
+# (`SubagentStart`), so a delegated task begins with the project's rules and
+# slots too. Independent of `inject_on_session_start`; `max_chars` bounds it,
+# and that agent's 10,000-character hook context limit caps it. It comes
+# from the read-only `GET /brief`, which never reads or claims a handoff, so a
+# subagent cannot take its parent session's baton; a server without that
+# route answers 404 and the subagent starts without a brief. Off by default:
+# every subagent pays for the brief in tokens, so opt in per repo.
+inject_on_subagent_start = "true"
+
+# Optional. Stop delivering this project's handoff at session start. Only an
+# explicit false / "no" / "off" / "0" turns it off; the default is to deliver.
+# Handoffs are still created when a session ends, and stay open (an agent can
+# still take one with `memory_handoff_accept`), so only the automatic delivery
+# stops. The brief, the profile digest and everything else on start are
+# unchanged.
+[handoff]
+deliver_on_session_start = false
+
+# Optional. Stop delivering the unfinished-session recovery snapshot at
+# session start. Only an explicit false / "no" / "off" / "0" turns it off;
+# the default is to deliver. This also suppresses the snapshot's backfill
+# marker. The source session remains open and its lifecycle is unchanged.
+# Independent of [handoff]: handoffs, managed context, the brief, the profile
+# digest and the inbox notice are unchanged.
+[recovery]
+deliver_on_session_start = false
+
+# Optional. Show Claude Code the count-only pending-inbox notice on every
+# user prompt while the count or the inbox's names change, instead of only
+# at session start. The notice never carries message text; the agent still
+# pops and reviews the message itself. A marker that sets only [messaging]
+# is a settings boundary. Off by default.
+[messaging]
+inbox_notice_on_prompt = "true"
 
 # Optional. The cross-project profile (docs/cross-project-profile.md): your
 # usual choices from other projects, delivered at session start as defaults
@@ -257,7 +303,8 @@ in the home marker remain the fallback, followed by the default remote-path
 identity and then the installed/cwd fallback; explicit CLI scope always wins. A matched route replaces
 only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
 `project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
-`[recall]`, `[briefing]`, and `[profile]` settings still apply.
+`[recall]`, `[briefing]`, `[profile]`, `[handoff]`, `[recovery]`, and
+`[messaging]` settings still apply.
 
 A home route map is bounded to 64 routes, a 64 KiB file, 512 UTF-8 bytes per
 selector, and 512 UTF-8 bytes per scalar value. Its portable grammar permits
@@ -288,7 +335,36 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
-`default_global` and `inject_on_session_start` accept a truthy value
+`[handoff] deliver_on_session_start` is on unless the value is explicitly falsy
+(`false` / `0` / `no` / `off`, quoted or bare). Clients send `handoff=0` on the
+session-start fetch only when the marker turns it off, so the server reads
+nothing, claims nothing and adds no handoff or continuity notice for that
+project. A marker that sets only `[handoff]` is a settings boundary, like one
+with `[briefing]` or `[profile]` keys. Use it for projects whose automatic
+handoffs are mostly noise, such as a bot fleet driven by routines and webhooks.
+
+`[recovery] deliver_on_session_start` is also on unless explicitly falsy.
+Clients then send `recovery=0`, which suppresses only the unfinished-session
+recovery snapshot and its backfill marker. The source session stays open, and
+handoffs, managed context, the brief, the profile digest and the inbox notice
+are still delivered. A marker that sets only `[recovery]` is a settings
+boundary. Use this in projects with long-lived parallel sessions, where another
+session's recovery snapshot is usually noise for that layout.
+
+`[recall] default_global` applies to an agent's unscoped `memory_query` and
+`memory_recent` calls. On `memory_query`, an explicit `global: false` keeps
+the resolved project, even when the marker enables global recall. Explicit
+`workspace` + `project` or `scopes` also override the marker. A query with
+`as_of` reads the current project as it stood at that instant, and an explicit
+`global=true` with `as_of` is refused. The `ai-memory search` and
+`ai-memory recent` terminal commands do not read it: those commands stay
+scoped to the current project and cover every project only when you pass
+`--global` (see
+[usage.md](usage.md#search-from-the-terminal) and
+[usage.md](usage.md#recent-pages-from-the-terminal)).
+
+`default_global`, `inject_on_session_start`, `inject_on_subagent_start` and
+`inbox_notice_on_prompt` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
@@ -313,7 +389,10 @@ always stored regardless, including Claude Code sessions launched with
 parent's `session_id`, so only the events carrying `agent_id` (plus
 `SubagentStart`/`SubagentStop`) are dropped and the parent session's own
 prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
-still identifies subagent captures. This is per-project on purpose: there is no server-global
+still identifies subagent captures. The OMP extension posts every event of a
+subagent session with `agent_id`, so the whole subagent session is dropped,
+while an advisor's tool calls stay with the session they advise. This is
+per-project on purpose: there is no server-global
 switch, so opting one noisy project in never sheds subagent captures for the
 others on a shared instance.
 
@@ -414,7 +493,8 @@ Re-running `ai-memory server add` for an existing profile keeps its roots when
 `--root` is omitted, so rotating a token cannot lift the restriction. Changing
 a profile's `--url` without a new token discards the old token first: a token
 belongs to the server it was issued for, so the profile refuses events until
-you add one for the new URL.
+you add one for the new URL. Both `[servers.<name>]` tables and an inline
+`servers = { ... }` table can be read and updated by these commands.
 
 Check the decision for a directory without sending anything:
 
@@ -736,7 +816,12 @@ most 256 directories and runs at most 50 ms per call; past any bound the call
 is metadata-only, and so is glob syntax that can leave its leading directories:
 a brace or group spanning a separator, a `..` or `~` alternative, a brace
 expansion that builds one, or a brace-built directory name that older bash
-expands to `..` (`.{*,x}/`). A brace expansion too large to list (more than 64
+expands to `..` (`.{*,x}/`). In a shell argument, a `(` or `{` the shell does
+not expand is text, not glob syntax: one inside quotes or escaped
+(`awk '{print $1/2}'`, `jq '(.a // "x")'`, `echo 'a/{b'`), or in an element of
+an argument vector that no shell runs. Quoted braces that still list
+alternatives (`rg -g '{a/x,b}'`) are looked up once per alternative as well,
+since a program that globs its own argument expands them. A brace expansion too large to list (more than 64
 words) counts as leaving only when its pieces could build such a word; integer
 and letter sequences cannot, so `touch test/file{1..200}.txt` and `cat
 data/{a..h}{1..9}.csv` are walked like any other glob. A `..` after a `**`,
@@ -886,7 +971,11 @@ The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
-arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
+arguments, paths, input bodies, or arbitrary tool names. The one name kept is
+an MCP tool's: a call named `mcp__<server>__<tool>` (Claude Code, Codex, Hermes
+Agent) stays in the `unknown` family, with no input or output, and adds
+`mcp_server` and `mcp_tool` lines when the whole name is at most 64 ASCII
+letters, digits, `_` or `-`. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
 2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
 the bounded replacement or written-content field in `toolCall.args` because its
@@ -998,7 +1087,10 @@ undeclared checkout with a remote, or a checkout with an explicit
   are one project.
 - An existing project with that name and no identity yet is **claimed in
   place** by the first capture that may write to it, so upgrading moves no
-  memory.
+  memory. A linked worktree (`git worktree add`) claims the project named
+  after its main checkout's folder, so it does not matter which checkout
+  captures first. The server finds the main checkout from the worktree's git
+  metadata, so this needs a server that can read the checkout.
 - If the name already belongs to a different identity, the new repository
   gets its own project, named from its owner (`github.com/orgb/api` →
   `orgb-api`, then `orgb-api-2`, …).
@@ -1171,6 +1263,15 @@ shell command text is never reinterpreted as a project routing instruction;
 only the structured `workdir` field counts. This changes raw observation
 attribution only; the session row and its compiled session page remain in the
 project where the session began.
+
+Before that lookup, a Hermes event takes `TERMINAL_CWD` (the session's
+`terminal.cwd`) in place of the process directory. A multiplexing Hermes
+gateway exports only its default profile's `terminal.cwd`, so a gateway event
+of a named profile routes instead by a marker in that profile's own Hermes
+home, `~/.hermes/profiles/<name>/.ai-memory.toml` (under the gateway's
+`HERMES_HOME` when set). It is a normal local marker: `workspace`, `project`,
+`[capture]` and `server` all apply. Without it the event keeps the gateway's
+directory. See [install.md](install.md#hermes-agent-nous-research).
 
 Independently of this setting, under `project_strategy = "repo-root"` a
 mid-session event whose cwd is outside any git repo *and* any marker (agent

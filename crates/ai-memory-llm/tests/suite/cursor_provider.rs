@@ -121,6 +121,28 @@ async fn fenced_json_is_parsed() {
     assert_eq!(value["answer"], 1);
 }
 
+/// Ask mode often wraps the answer in prose. Brackets in that prose must not
+/// hide a well-formed JSON object from the parser.
+#[tokio::test]
+async fn json_wrapped_in_bracketed_prose_is_parsed() {
+    for stdout in [
+        "Here is the result for [the request]:\n{\"answer\":1}",
+        "{\"answer\":1}\n(see [schema])",
+    ] {
+        let dir = TempDir::new();
+        let sink = dir.0.join("argv");
+        let executable = fake_agent(&dir.0, &sink, stdout);
+        let value = provider(executable, "default")
+            .complete_structured_raw(
+                ChatRequest::user_prompt("status"),
+                serde_json::json!({"type": "object"}),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{stdout:?}: {err}"));
+        assert_eq!(value["answer"], 1, "{stdout:?}");
+    }
+}
+
 fn script_agent(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("agent");
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -164,6 +186,66 @@ async fn a_stderr_flood_neither_hangs_nor_blocks_stdout() {
     .expect("a stderr flood must not hang the call")
     .unwrap_err();
     assert!(err.to_string().contains("size cap"), "{err}");
+}
+
+/// A failing child's stderr becomes the provider error body, which callers
+/// log. It is scrubbed before the 500-byte cut, so a token straddling the
+/// cut cannot survive as a prefix too short to match, and terminal control
+/// sequences are stripped. Control: the text around them is kept, and the
+/// exit code still becomes the status.
+#[tokio::test]
+async fn a_failing_childs_stderr_is_scrubbed_before_the_cut() {
+    async fn failing_body(stderr: &str) -> String {
+        let dir = TempDir::new();
+        let agent = script_agent(
+            &dir.0,
+            &format!("printf '%s' {} >&2\nexit 3", sh_single(stderr)),
+        );
+        let err = provider(agent, "default")
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap_err();
+        let ai_memory_llm::LlmError::Provider { status, body, .. } = err else {
+            panic!("expected a provider error, got {err}");
+        };
+        assert_eq!(status, 3);
+        body
+    }
+
+    // The cut keeps `ghp_` plus 12 characters: too short for the GitHub
+    // token pattern, so only scrubbing first redacts it.
+    let secret = format!("ghp_{}", "FAKEfake0123".repeat(3));
+    let prefix = format!("{} ", "x".repeat(500 - 17));
+    let body = failing_body(&format!("{prefix}{secret}")).await;
+    assert!(!body.contains("ghp_"), "secret prefix leaked: {body}");
+    assert!(body.starts_with(&prefix), "unrelated text was lost: {body}");
+
+    let body = failing_body("before\x1b]0;retitled\x07\x1b[2Jafter").await;
+    assert!(!body.contains('\x1b'), "escape sequence survived: {body:?}");
+    assert!(!body.contains('\x07'), "bell survived: {body:?}");
+    assert!(body.starts_with("before"), "{body:?}");
+}
+
+/// A non-JSON answer is quoted in the parse error, which is logged too, so
+/// it gets the same scrub as stderr.
+#[tokio::test]
+async fn a_non_json_answer_is_scrubbed_in_the_parse_error() {
+    let dir = TempDir::new();
+    let sink = dir.0.join("argv");
+    let secret = format!("ghp_{}", "FAKEfake0123".repeat(3));
+    let executable = fake_agent(&dir.0, &sink, &format!("no json here {secret}"));
+
+    let err = provider(executable, "default")
+        .complete_structured_raw(
+            ChatRequest::user_prompt("status"),
+            serde_json::json!({"type": "object"}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(!err.contains(&secret), "secret leaked: {err}");
+    assert!(err.contains("no json here"), "{err}");
 }
 
 /// The per-call workspace holds the prompt (captured session text), so it is

@@ -70,8 +70,16 @@ pub enum StoreError {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// A restore source would initialize a new store instead of opening a
+    /// database that ai-memory already migrated.
+    #[error(
+        "backup has no initialized ai-memory database snapshot at db/memory.sqlite; \
+         restore requires an existing snapshot with applied migration history"
+    )]
+    UninitializedSnapshot,
+
     /// The store's schema is newer than this binary: an applied migration is
-    /// absent from the compiled-in set (refinery reports this as
+    /// above the highest compiled-in version (refinery reports this as
     /// `MissingVersion`). The data was written by a newer ai-memory build than
     /// the one now running, so the store is left untouched rather than opened
     /// against a schema this binary does not understand. This replaces
@@ -92,6 +100,20 @@ pub enum StoreError {
         supported: u32,
     },
 
+    /// An embedded migration is absent from the store's history even though a
+    /// later version is already applied. Opening remains refused; deciding how
+    /// to repair a divergent history requires inspecting the actual schema.
+    #[error(
+        "memory database migration history has a gap: migration {missing} is \
+         not recorded, but a later migration is already applied. Back up the \
+         data directory and report the migration history for review before \
+         attempting a repair."
+    )]
+    MigrationHistoryGap {
+        /// Missing embedded migration, formatted as `V{version} ({name})`.
+        missing: String,
+    },
+
     /// I/O failed (e.g. opening the DB file).
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -103,6 +125,11 @@ pub enum StoreError {
     /// Writer actor has shut down.
     #[error("writer actor is no longer running")]
     WriterClosed,
+
+    /// The read connection pool was closed at shutdown; no new read opens a
+    /// connection.
+    #[error("read connection pool is closed")]
+    ReaderClosed,
 
     /// A hook tried to reuse a session id that belongs to another immutable
     /// session tuple or operator. Deliberately carries no row details.
@@ -140,12 +167,27 @@ pub enum StoreError {
     /// caller-invariant violation).
     #[error("not found: {0}")]
     NotFound(String),
-    /// A late-arriving event named a session that `purge_session` removed.
+    /// An event or disk reindex named a session that `purge_session` removed.
     /// Recreating it would silently undo a deletion the operator already
     /// performed and an application may already have reported to a user, so
     /// ingest refuses instead (#387).
     #[error("session {0} was purged and cannot be recreated")]
     SessionPurged(String),
+
+    /// A hook named an ID-selected managed run whose boundary refuses it: the
+    /// run is no longer active, or the hook's agent, owner, native session or
+    /// checkout does not match the run. A lapsed renewable lease has its own
+    /// retryable error below. Typed apart from
+    /// `InvalidState` because the refusal is permanent for that event, so a
+    /// spool drain must drop it rather than stop behind it (#1892).
+    #[error("ID-selected managed run boundary mismatch")]
+    ManagedRunBoundaryRefused,
+
+    /// An otherwise-valid ID-selected run is still active but its renewable
+    /// lease has lapsed. Unlike a terminal boundary refusal, a heartbeat may
+    /// make the same spooled event valid after a server outage.
+    #[error("ID-selected managed run lease lapsed")]
+    ManagedRunLeaseLapsed,
 
     /// A workspace delete was refused because it still holds projects and the
     /// caller did not pass `force`. Carries the project count so the admin
@@ -171,6 +213,14 @@ pub enum StoreError {
         count: u64,
         /// Comma-separated workstream names holding those runs.
         workstreams: String,
+    },
+
+    /// A project merge was refused because sessions can still receive hook
+    /// observations under the source coordinate.
+    #[error("project has {count} open session(s); finish them before merging the project")]
+    ProjectSessionsOpen {
+        /// Number of source sessions whose `ended_at` is still NULL.
+        count: u64,
     },
 
     /// A workspace rename was rejected because the destination name is already

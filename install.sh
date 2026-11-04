@@ -56,7 +56,7 @@ detect_target() {
         Linux) os=linux ;;
         Darwin) os=macos ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "Windows is not supported by this script; download ai-memory-windows-x86_64.zip from the release page and follow docs/windows.md"
+            die "Windows is not supported by this script; in PowerShell run: irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex"
             ;;
         *) die "unsupported operating system: $os" ;;
     esac
@@ -194,13 +194,18 @@ main() {
     tar --no-same-owner -xzf "$work/$asset" -C "$work/release"
     [ -f "$work/release/ai-memory" ] || die "$asset has no ai-memory binary"
     chmod 0755 "$work/release/ai-memory"
-    "$work/release/ai-memory" --version >/dev/null 2>&1 ||
-        die "the downloaded binary does not run on this machine"
 
     mkdir -p "$(dirname "$lib_dir")" "$bin_dir"
     staged="$lib_dir.new.$$"
     rm -rf "$staged"
     mv "$work/release" "$staged"
+    # Run the binary from beside its install directory, not from the work
+    # directory: a TMPDIR mounted noexec refuses to execute anything there,
+    # which would reject a release that runs where it is installed.
+    if ! "$staged/ai-memory" --version >/dev/null 2>&1; then
+        rm -rf "$staged"
+        die "the downloaded binary does not run from $(dirname "$lib_dir") on this machine"
+    fi
     if [ -e "$lib_dir" ]; then
         previous="$lib_dir.old.$$"
         mv "$lib_dir" "$previous"
@@ -217,11 +222,15 @@ main() {
 
     say "installed $("$link" --version 2>/dev/null || echo ai-memory) to $lib_dir"
     say "linked $link"
+    # Off PATH, a bare `ai-memory setup` would fail with "command not found",
+    # so the next step names the link itself.
     case ":${PATH:-}:" in
-        *":$bin_dir:"*) ;;
-        *) say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\"" ;;
+        *":$bin_dir:"*) say "next: ai-memory setup" ;;
+        *)
+            say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\""
+            say "next: $link setup"
+            ;;
     esac
-    say "next: ai-memory setup"
 }
 
 main "$@"

@@ -167,7 +167,11 @@ fn read_input(file: &Path, binding: &Binding) -> Result<Vec<ValidEvent>> {
             file.display()
         );
     }
-    let input: Vec<InputEvent> = serde_json::from_slice(&raw).map_err(|e| {
+    // A Windows producer can write the file as UTF-8 with a byte-order mark
+    // (Windows PowerShell's `-Encoding UTF8`); the server's `/hook` ingress and
+    // the native hook client skip it too.
+    let json = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&raw);
+    let input: Vec<InputEvent> = serde_json::from_slice(json).map_err(|e| {
         // Category plus position only. `Display` on a serde error can quote the
         // offending value ("invalid type: string \"...\""), and an event body is
         // exactly the thing that must not reach a terminal or a log.
@@ -404,6 +408,20 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
             failure = Some(format!(
                 "HTTP {} from /hook/batch: {detail}; all {} item(s) kept pending",
                 delivery.status,
+                batch.items.len()
+            ));
+            break;
+        }
+
+        if delivery.body_over_limit {
+            for item in &batch.items {
+                queue.record_failure(&item.ingest_key, "oversized ack")?;
+            }
+            failure = Some(format!(
+                "HTTP {} from /hook/batch: hook batch ack exceeded {} bytes; \
+                 refusing to parse it; all {} item(s) kept pending",
+                delivery.status,
+                http::MAX_ACK_BYTES,
                 batch.items.len()
             ));
             break;

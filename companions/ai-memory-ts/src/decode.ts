@@ -15,6 +15,7 @@ import type {
   ApiPage,
   ApiSearchHit,
   Briefing,
+  SessionActivity,
   Handoff,
   Message,
   Observation,
@@ -230,6 +231,22 @@ export function briefing(value: unknown, where: string): Briefing {
     rules: list(o, "rules", where, pageSummary),
     slots: list(o, "slots", where, pageSummary),
     recentPages: requiredList(o, "recent_pages", where, pageSummary),
+    recentSessions: list(o, "recent_sessions", where, sessionActivity),
+    raw: o,
+  };
+}
+
+/** A `SessionActivity` row: one session's newest captured work. */
+export function sessionActivity(value: unknown, where: string): SessionActivity {
+  const o = record(value, where);
+  return {
+    sessionId: str(o, "session_id", where),
+    agentKind: str(o, "agent_kind", where),
+    cwd: optStr(o, "cwd", where),
+    lastActivityAt: str(o, "last_activity_at", where),
+    ended: bool(o, "ended", where),
+    handedOff: flag(o, "handed_off"),
+    current: flag(o, "current"),
     raw: o,
   };
 }
@@ -269,14 +286,22 @@ export function handoff(value: unknown, where: string): Handoff {
 export function message(value: unknown, where: string): Message {
   const o = record(value, where);
   const subject = nullableStr(o, "subject", where);
+  const evidence = nullableStr(o, "evidence", where);
+  const nature = optStr(o, "nature", where) ?? "unknown";
+  if (!["unknown", "measured", "reported", "inferred"].includes(nature)) {
+    throw new ProtocolError(`${where}.nature must be a supported message nature`);
+  }
   return {
     id: str(o, "id", where),
     subject: subject === null ? null : untrusted(subject),
     body: untrusted(str(o, "body", where)),
+    nature: nature as Message["nature"],
+    evidence: evidence === null ? null : untrusted(evidence),
     state: str(o, "state", where),
     createdAt: optStr(o, "created_at", where),
     claimedAt: nullableStr(o, "claimed_at", where),
     fromAgent: optStr(o, "from_agent", where),
+    toAgent: nullableStr(o, "to_agent", where),
     fromOwner: nullableStr(o, "from_owner_user", where),
     raw: o,
   };

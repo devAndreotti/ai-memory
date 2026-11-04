@@ -8,6 +8,7 @@ mod access_reinforcement;
 mod admin_audit_log;
 mod admin_backup;
 mod admin_bootstrap;
+mod admin_llm_test;
 mod admin_metrics;
 mod admin_move;
 mod admin_move_session;
@@ -36,7 +37,14 @@ mod query_pin_first;
 mod query_reasoning;
 mod query_superseded;
 mod read_page_related;
+mod recap_identity;
+mod restore_page_authz;
 mod retrieval_via_tools;
+mod self_service_keys;
+mod session_management;
 mod slot_identity;
 mod stress_autoscope;
+
+#[cfg(feature = "management-ui")]
+mod management;
 mod web_search_parity;

@@ -12,6 +12,7 @@ pub mod auto_improve;
 pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
+mod code_fence;
 pub mod cold_cluster;
 pub mod compaction;
 pub mod consolidator;
@@ -27,6 +28,7 @@ mod path_sanitize;
 pub mod profile;
 pub mod projection;
 mod prompt_template;
+mod slug_digest;
 pub mod sweep;
 pub mod types;
 
@@ -59,7 +61,8 @@ pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
     DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
-    path_is_git_ignored, plan_bootstrap_chunks, prune_sources_to_budget, read_identity_remotes,
+    linked_worktree_main_root, path_is_git_ignored, plan_bootstrap_chunks, prune_sources_to_budget,
+    read_identity_remotes,
 };
 pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
 pub use compaction::build_compacted_markdown;
@@ -84,16 +87,16 @@ pub use embed::{
 };
 pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
-pub use keep_tokens::mine_keep_tokens;
+pub use keep_tokens::{mine_keep_tokens, mine_residue_tokens};
 pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,
 };
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
-    MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
+    LedgerRetention, MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
     run_sweep_with_breadth, run_sweep_with_compaction, run_sweep_with_hygiene,
-    run_sweep_with_options,
+    run_sweep_with_ledgers, run_sweep_with_options,
 };
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,

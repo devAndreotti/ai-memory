@@ -24,7 +24,9 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
+use crate::commands::path_util::display_path;
 use crate::config::Config;
+use crate::http_client::display_url;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
 
@@ -76,10 +78,11 @@ pub(crate) struct EnableOutcome {
 /// Fails when a server profile named `default` would share the token file,
 /// when `servers.toml` or `config.toml` cannot be parsed, or on a failed write.
 pub fn run(config: &Config, args: &AuthEnableArgs, config_path: Option<&Path>) -> Result<()> {
+    let i18n = &config.i18n;
     let locate = |client: McpClient| install_mcp::mcp_config_path(client).ok();
     let locator: Option<ConfigLocator<'_>> = (!args.no_mcp).then_some(&locate as _);
     let outcome = enable(config, config_path, locator)?;
-    print_outcome(&outcome);
+    print_outcome(i18n, &outcome);
     Ok(())
 }
 
@@ -164,19 +167,19 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", config_path.display()));
+            return Err(e).with_context(|| format!("reading {}", display_path(config_path)));
         }
     };
     let mut doc: toml_edit::DocumentMut = existing
         .as_deref()
         .unwrap_or_default()
         .parse()
-        .with_context(|| format!("parsing {}", config_path.display()))?;
+        .with_context(|| format!("parsing {}", display_path(config_path)))?;
     let auth = doc
         .entry("auth")
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_like_mut()
-        .with_context(|| format!("`auth` in {} is not a table", config_path.display()))?;
+        .with_context(|| format!("`auth` in {} is not a table", display_path(config_path)))?;
     if auth.get("bearer_token_file").is_some() {
         return Ok(false);
     }
@@ -194,29 +197,31 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
     };
     if let Some(parent) = config_path.parent() {
         crate::commands::path_util::create_private_dir(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+            .with_context(|| format!("creating {}", display_path(parent)))?;
     }
     // The atomic write's temp file is owner-only; an existing config keeps
     // the mode it had (a packaged one may be group-readable on purpose).
     ai_memory_wiki::write_atomic(config_path, doc.to_string().as_bytes())
-        .with_context(|| format!("writing {}", config_path.display()))?;
+        .with_context(|| format!("writing {}", display_path(config_path)))?;
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("restoring the mode of {}", config_path.display()))?;
+            .with_context(|| format!("restoring the mode of {}", display_path(config_path)))?;
     }
     Ok(true)
 }
 
 /// Clients `install-mcp --apply` writes a config file for. Pi has no MCP
-/// config (its extension reads the hook credential file) and DeepSeek
-/// Harness is print-only, so neither has an entry to re-point.
+/// config (its extension reads the hook credential file), and DeepSeek
+/// Harness and Hermes Agent are print-only, so none has an entry to
+/// re-point. Hermes' entry is a bridge carrying no token, so a new token
+/// needs no edit there either.
 fn rewirable_clients() -> impl Iterator<Item = McpClient> {
     <McpClient as clap::ValueEnum>::value_variants()
         .iter()
         .copied()
-        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh))
+        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Hermes))
 }
 
 /// The endpoint without a `?flavor=` (or any) query, normalised to `/mcp`.
@@ -295,58 +300,74 @@ fn rewire(
     install_mcp::run_with_opencode_dialect(config, args, dialect)
 }
 
-fn print_outcome(outcome: &EnableOutcome) {
+fn print_outcome(i18n: &ai_memory_core::i18n::Localizer, outcome: &EnableOutcome) {
     if outcome.already_inline {
         println!(
-            "auth: already required by AI_MEMORY_AUTH_TOKEN or [auth].bearer_token; nothing changed."
-        );
+            "{}", i18n.text("cli-auth-enable-auth-already-required-by-ai-memory-auth-token-or-auth-bearer-token-nothing-c"));
         return;
     }
     println!(
-        "auth: bearer token {} at {} (owner-only)",
-        if outcome.token_created {
-            "generated"
-        } else {
-            "kept"
-        },
-        outcome.token_path.display()
+        "{}",
+        i18n.format(
+            "cli-auth-enable-auth-bearer-token-at-owner-only",
+            &[
+                (
+                    "value0",
+                    (if outcome.token_created {
+                        "generated"
+                    } else {
+                        "kept"
+                    })
+                    .to_string()
+                ),
+                ("value1", display_path(&outcome.token_path).to_string())
+            ]
+        )
     );
     println!(
-        "config: {} {}",
-        if outcome.config_changed {
-            "recorded [auth].bearer_token_file in"
-        } else {
-            "already names the token file:"
-        },
-        outcome.config_path.display()
+        "{}",
+        i18n.format(
+            "cli-setup-config",
+            &[
+                (
+                    "value0",
+                    (if outcome.config_changed {
+                        "recorded [auth].bearer_token_file in"
+                    } else {
+                        "already names the token file:"
+                    })
+                    .to_string()
+                ),
+                ("value1", display_path(&outcome.config_path).to_string())
+            ]
+        )
     );
     match outcome.hooks {
         Some(HookCredential::Seeded) => {
-            println!("hooks: given the token through the hook credential files");
+            println!("{}", i18n.text("cli-auth-enable-hooks-given-the-token-through-the-hook-credential-files"));
         }
-        Some(HookCredential::Current) => println!("hooks: already use the token"),
+        Some(HookCredential::Current) => println!("{}", i18n.text("cli-auth-enable-hooks-already-use-the-token")),
         Some(HookCredential::KeptOther) => println!(
-            "hooks: another credential is stored for them and was kept; re-run \
-             `ai-memory install-hooks --agent <agent> --apply` to switch them to this token"
-        ),
+            "{}", i18n.text("cli-auth-enable-hooks-another-credential-is-stored-for-them-and-was-kept-re-run-ai-memory-in")),
         None => {}
     }
     for line in &outcome.mcp {
         let client = format!("{:?}", line.client);
         match &line.wiring {
             Wiring::Rewired => println!(
-                "mcp {client}: re-registered in {} so it reads the token without holding it",
-                line.path.display()
-            ),
+                "{}", i18n.format("cli-auth-enable-mcp-client-re-registered-in-so-it-reads-the-token-without-holding-it", &[("value0", client.to_string()), ("value1", display_path(&line.path).to_string())])),
             Wiring::OtherServer(url) => {
-                println!("mcp {client}: targets {url}, another server; left unchanged");
+                println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", display_url(url))]));
             }
             Wiring::Manual(reason) => {
-                println!("mcp {client}: needs a manual change: {reason}");
+                println!("{}", i18n.format("cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
             }
         }
     }
-    println!("Restart the ai-memory server for it to require the token.");
+    println!(
+        "{}",
+        i18n.text("cli-auth-enable-restart-the-ai-memory-server-for-it-to-require-the-token")
+    );
 }
 
 #[cfg(test)]

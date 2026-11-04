@@ -36,21 +36,23 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_hooks::capture_policy::metadata_only_body;
+use ai_memory_hooks::payload::BACKFILL_EXTENSION;
 use ai_memory_workstream::{
-    LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
-    export_transcript_delta, export_transcript_range, list_native_sessions,
-    wait_for_transcript_flush,
+    LaunchRoots, ManagedHarness, OVERSIZED_RECORD_LOSS, build_launch_plan_with_env,
+    export_transcript, export_transcript_delta, export_transcript_range, find_native_session,
+    list_native_sessions, wait_for_transcript_flush,
 };
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
 use super::transcript_capture::{EventCapture, TranscriptCapture};
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, http_client, post_json};
 
 /// Circuit breaker on total imported events across the whole bootstrap. Once
 /// reached, no further sessions are started; the remaining sessions are
@@ -64,10 +66,6 @@ const PER_HARNESS_SCAN_LIMIT: usize = 200;
 /// server's `MAX_HOOK_BATCH_ITEMS` so a batch is never rejected for size.
 const HOOK_BATCH_ITEMS: usize = 256;
 const HOOK_BATCH_BYTES: usize = 8 * 1024 * 1024;
-
-/// The extension label backfilled non-user events (assistant/tool) are recorded
-/// under, mirroring the companion importer's replay-through-`/hook` mechanism.
-const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// A local native session eligible for import.
 #[derive(Debug, Clone)]
@@ -142,6 +140,166 @@ pub(crate) fn sentinel_path(data_dir: &Path, cwd: &Path) -> PathBuf {
     data_dir.join("backfill-state").join(format!("{digest:x}"))
 }
 
+/// How long an in-progress marker blocks a new automatic backfill for the same
+/// checkout. A worker that died without releasing it (killed, crashed host)
+/// stops blocking after this, so the marker can never wedge the trigger.
+const INFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Cap on the emptiness probe. Without it a saturated server leaves every
+/// spawned backfill parked on an open connection, which piles more load on it.
+const EMPTINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn inflight_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = sentinel_path(data_dir, cwd).into_os_string();
+    path.push(".inflight");
+    PathBuf::from(path)
+}
+
+fn inflight_lock_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = inflight_path(data_dir, cwd).into_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// Unpredictable ownership nonce for one in-flight marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InflightClaim(String);
+
+impl InflightClaim {
+    fn new() -> Self {
+        // UUID v4 draws from the operating system CSPRNG. The simple form is
+        // path- and argv-safe while retaining 122 random bits.
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(raw)
+            .ok()
+            .map(|token| Self(token.simple().to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Run one marker mutation while holding the checkout's advisory lock.
+///
+/// Hook calls must remain non-blocking, so contention or an unusable state
+/// directory fails closed instead of waiting. The lock file intentionally
+/// remains in place: unlinking an advisory-lock file can split contenders
+/// across two inodes and destroy serialization.
+fn with_inflight_lock<T>(data_dir: &Path, cwd: &Path, operation: impl FnOnce() -> T) -> Option<T> {
+    let lock_path = inflight_lock_path(data_dir, cwd);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    lock.try_lock_exclusive().ok()?;
+    let result = operation();
+    let _ = fs2::FileExt::unlock(&lock);
+    Some(result)
+}
+
+/// Claim the right to spawn the automatic backfill for `cwd`.
+///
+/// Returns an ownership token when this caller created the marker and must
+/// spawn (or call [`release_inflight`] if the spawn fails). The token travels
+/// to the detached worker and prevents a delayed old worker from refreshing or
+/// releasing a newer stale takeover. `O_CREAT|O_EXCL` plus the per-checkout
+/// lock makes a burst of SessionStart hooks launch exactly one backfill.
+pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> Option<InflightClaim> {
+    let path = inflight_path(data_dir, cwd);
+    let claim = InflightClaim::new();
+    with_inflight_lock(data_dir, cwd, || {
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    if file.write_all(claim.as_str().as_bytes()).is_err() {
+                        let _ = std::fs::remove_file(&path);
+                        return None;
+                    }
+                    return Some(claim.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
+                    if !stale {
+                        return None;
+                    }
+                    let mut aside = path.clone().into_os_string();
+                    aside.push(format!(".stale.{}", claim.as_str()));
+                    if std::fs::rename(&path, &aside).is_err() {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                // An unwritable state dir must not turn into a spawn storm.
+                Err(_) => return None,
+            }
+        }
+        None
+    })
+    .flatten()
+}
+
+/// Refresh the marker only while `claim` still owns it.
+fn refresh_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        if contents != claim.as_str() {
+            return false;
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .is_ok()
+    })
+    .unwrap_or(false)
+}
+
+/// Drop the in-progress marker taken by [`claim_inflight`].
+pub(crate) fn release_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(claim.as_str()) {
+            return false;
+        }
+        std::fs::remove_file(path).is_ok()
+    })
+    .unwrap_or(false)
+}
+
+struct InflightGuard<'a> {
+    data_dir: &'a Path,
+    cwd: &'a Path,
+    claim: InflightClaim,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        release_inflight(self.data_dir, self.cwd, &self.claim);
+    }
+}
+
 fn write_sentinel(data_dir: &Path, cwd: &Path) {
     let path = sentinel_path(data_dir, cwd);
     if let Some(parent) = path.parent() {
@@ -164,11 +322,22 @@ async fn backfill_endpoint(
     config: &Config,
     args: &crate::cli::BackfillArgs,
 ) -> Result<ServerEndpoint> {
+    let i18n = &config.i18n;
     if let Some(raw) = args.server_profile.as_deref() {
         let name = crate::server_profiles::ProfileName::parse(raw)
             .with_context(|| format!("`{raw}` is not a valid server profile name"))?;
-        let profile = crate::server_profiles::lookup(&config.data_dir, &name)
-            .map_err(|r| anyhow::anyhow!("server profile `{name}` was refused ({})", r.as_str()))?;
+        let profile = crate::server_profiles::lookup(&config.data_dir, &name).map_err(|r| {
+            anyhow::anyhow!(
+                "{}",
+                i18n.format(
+                    "cli-backfill-server-profile-name-was-refused",
+                    &[
+                        ("value0", format!("{}", name)),
+                        ("value1", r.as_str().to_string())
+                    ]
+                )
+            )
+        })?;
         return Ok(ServerEndpoint::for_hook_target(
             profile.url,
             Some(profile.token),
@@ -177,7 +346,7 @@ async fn backfill_endpoint(
     if let Some(url) = args.server_url.as_deref() {
         let static_token = crate::config::read_hook_auth_token(&config.data_dir);
         let token = super::hook_spool::resolve_bearer(
-            &reqwest::Client::new(),
+            &http_client(),
             &config.data_dir,
             static_token.as_deref(),
         )
@@ -201,6 +370,21 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
 
 /// [`run`] for the checkout at `cwd`.
 async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
+    let i18n = &config.i18n;
+    // The SessionStart hook took the in-progress marker before spawning this
+    // worker; free it however the run ends so a failed run can be retried.
+    let inflight_claim = args
+        .inflight_claim
+        .as_deref()
+        .and_then(InflightClaim::parse);
+    let _inflight = inflight_claim.clone().map(|claim| InflightGuard {
+        data_dir: &config.data_dir,
+        cwd: &cwd,
+        claim,
+    });
+    if let Some(claim) = &inflight_claim {
+        refresh_inflight(&config.data_dir, &cwd, claim);
+    }
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
@@ -213,7 +397,8 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let home = run::native_home(config).context("locating the local harness session stores")?;
+    let home = run::native_home(config)
+        .context(i18n.text("cli-backfill-locating-the-local-harness-session-stores"))?;
     let mut report = BackfillReport {
         workspace: workspace.clone(),
         project: project.clone(),
@@ -228,7 +413,7 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
     let capture = TranscriptCapture::for_checkout(&config.data_dir, &cwd);
     if !capture.admits_capture() {
         report.skipped_not_admitted = true;
-        return finish(&args, &report);
+        return finish(i18n, &args, &report);
     }
     let endpoint = backfill_endpoint(config, &args).await?;
 
@@ -242,7 +427,7 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
             if !args.dry_run {
                 write_sentinel(&config.data_dir, &cwd);
             }
-            return finish(&args, &report);
+            return finish(i18n, &args, &report);
         }
     }
 
@@ -253,45 +438,70 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
     report.selected = selected.len();
 
     if args.dry_run {
-        return finish(&args, &report);
+        return finish(i18n, &args, &report);
     }
 
     // Import each selected session, oldest-first so the imported history reads
     // chronologically, until the total-events circuit breaker trips.
+    let mut session_dirs: Vec<(ManagedHarness, Option<PathBuf>)> = Vec::new();
     for session in selected.into_iter().rev() {
         if report.imported_events >= MAX_EVENTS_TOTAL {
             report.skipped_for_cap += 1;
             continue;
         }
-        match import_one(
-            &endpoint, &workspace, &project, &home, &cwd, &capture, &session,
+        let session_dir = cached_session_dir(&mut session_dirs, session.harness, || {
+            import_session_dir(&home, &cwd, session.harness)
+        });
+        match import_one_with_session_dir(
+            &endpoint,
+            &workspace,
+            &project,
+            &home,
+            &cwd,
+            &capture,
+            &session,
+            session_dir.as_deref(),
         )
         .await
         {
             Ok(events) => {
                 report.imported_sessions += 1;
                 report.imported_events += events;
+                if let Some(claim) = &inflight_claim {
+                    refresh_inflight(&config.data_dir, &cwd, claim);
+                }
             }
             Err(error) => {
                 report.failed_sessions += 1;
                 // Quiet suppresses the success summary, not failures: the
                 // detached worker's stderr is the operator's diagnostic log.
                 eprintln!(
-                    "ai-memory: backfill of {} session {} failed: {error:#}",
-                    session.harness.as_str(),
-                    display_id(&session.native_session_id)
+                    "{}",
+                    i18n.format(
+                        "cli-backfill-ai-memory-backfill-of-session-failed-error",
+                        &[
+                            ("value0", session.harness.as_str().to_string()),
+                            ("value1", display_id(&session.native_session_id).to_string()),
+                            ("value2", format!("{:#}", error))
+                        ]
+                    )
                 );
             }
         }
     }
 
     write_sentinel(&config.data_dir, &cwd);
-    finish(&args, &report)?;
+    finish(i18n, &args, &report)?;
     if report.failed_sessions > 0 {
         bail!(
-            "backfill failed to import {} of {} selected session(s)",
-            report.failed_sessions,
-            report.selected
+            "{}",
+            i18n.format(
+                "cli-backfill-backfill-failed-to-import-of-selected-session-s",
+                &[
+                    ("value0", format!("{}", report.failed_sessions)),
+                    ("value1", format!("{}", report.selected))
+                ]
+            )
         );
     }
     Ok(())
@@ -303,13 +513,22 @@ async fn project_is_empty(
     workspace: &str,
     project: &str,
 ) -> Result<bool> {
-    match get_json::<ByAgentResponse>(
-        endpoint,
-        "/admin/sessions/by-agent",
-        &[("workspace", workspace), ("project", project)],
+    let probe = tokio::time::timeout(
+        EMPTINESS_PROBE_TIMEOUT,
+        get_json::<ByAgentResponse>(
+            endpoint,
+            "/admin/sessions/by-agent",
+            &[("workspace", workspace), ("project", project)],
+        ),
     )
     .await
-    {
+    .unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "the server did not answer within {}s",
+            EMPTINESS_PROBE_TIMEOUT.as_secs()
+        ))
+    });
+    match probe {
         Ok(response) => Ok(response.by_agent.iter().map(|c| c.sessions).sum::<u64>() == 0),
         // A project that has never been written to does not exist server-side
         // yet, so the no-create lookup answers 404 — which is the strongest
@@ -424,6 +643,21 @@ pub(crate) async fn collect_local_sessions_with(
     let mut limit_hit = Vec::new();
     for &harness in SCANNED_HARNESSES {
         let session_dir = session_dir_for(harness);
+        if let Some(id) = only_session {
+            // A named recovery target may be older than every session in the
+            // bounded listing. Resolve it directly, with the adapter's same
+            // checkout checks, rather than broadening the automatic scan.
+            if let Ok(Some(session)) =
+                find_native_session(harness, home, cwd, session_dir.as_deref(), id)
+            {
+                out.push(SessionRef {
+                    harness,
+                    native_session_id: session.native_session_id,
+                    updated_at: session.updated_at,
+                });
+            }
+            continue;
+        }
         let Ok(sessions) = list_native_sessions(
             harness,
             home,
@@ -439,9 +673,6 @@ pub(crate) async fn collect_local_sessions_with(
             limit_hit.push(harness);
         }
         for session in sessions {
-            if only_session.is_some_and(|want| want != session.native_session_id) {
-                continue;
-            }
             out.push(SessionRef {
                 harness,
                 native_session_id: session.native_session_id,
@@ -528,6 +759,7 @@ fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usi
 /// every event, so retroactive text crosses the same trust boundary as live
 /// capture, and `capture` drops or strips tool events the checkout's
 /// `[capture] ignore_paths` excludes before anything is posted.
+#[cfg(all(test, unix))]
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
@@ -537,11 +769,51 @@ async fn import_one(
     capture: &TranscriptCapture,
     session: &SessionRef,
 ) -> Result<usize> {
+    let session_dir = import_session_dir(home, cwd, session.harness);
+    import_one_with_session_dir(
+        endpoint,
+        workspace,
+        project,
+        home,
+        cwd,
+        capture,
+        session,
+        session_dir.as_deref(),
+    )
+    .await
+}
+
+fn import_session_dir(home: &Path, cwd: &Path, harness: ManagedHarness) -> Option<PathBuf> {
     let roots = LaunchRoots { home, cwd };
-    let session_dir =
-        build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
-            .ok()
-            .and_then(|plan| plan.session_dir);
+    build_launch_plan_with_env(harness, None, Vec::new(), None, &[], Some(roots))
+        .ok()
+        .and_then(|plan| plan.session_dir)
+}
+
+fn cached_session_dir(
+    cache: &mut Vec<(ManagedHarness, Option<PathBuf>)>,
+    harness: ManagedHarness,
+    resolve: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((_, session_dir)) = cache.iter().find(|(cached, _)| *cached == harness) {
+        return session_dir.clone();
+    }
+    let session_dir = resolve();
+    cache.push((harness, session_dir.clone()));
+    session_dir
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_one_with_session_dir(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    capture: &TranscriptCapture,
+    session: &SessionRef,
+    session_dir: Option<&Path>,
+) -> Result<usize> {
     import_exact_session(
         endpoint,
         workspace,
@@ -550,7 +822,7 @@ async fn import_one(
         cwd,
         session.harness,
         &session.native_session_id,
-        session_dir.as_deref(),
+        session_dir,
         None,
         capture,
     )
@@ -646,6 +918,7 @@ async fn import_exported_transcript(
     transcript: ai_memory_workstream::ExportedTranscript,
     capture: &TranscriptCapture,
 ) -> Result<usize> {
+    let i18n = &endpoint.i18n;
     let sid = native_session_id;
     let agent = harness.agent_kind().as_str();
     let resolved = resolve_occurred_at(&transcript.events);
@@ -703,6 +976,17 @@ async fn import_exported_transcript(
     )?);
 
     post_hook_items(endpoint, &items).await?;
+    // The import is partial by design here, so it is reported on stderr even
+    // under `--quiet`: the automatic worker's stderr is the operator's log.
+    let skipped = transcript
+        .losses
+        .iter()
+        .filter(|loss| loss.starts_with(OVERSIZED_RECORD_LOSS))
+        .count();
+    if skipped > 0 {
+        eprintln!(
+            "{}", i18n.format("cli-backfill-ai-memory-session-skipped-skipped-oversized-transcript-record-s-the-rest-was", &[("value0", harness.as_str().to_string()), ("value1", run::display_session_id(display_id(sid)).to_string()), ("value2", format!("{}", skipped))]));
+    }
     Ok(content)
 }
 
@@ -1099,7 +1383,11 @@ async fn post_hook_items(endpoint: &ServerEndpoint, items: &[HookItem]) -> Resul
     Ok(())
 }
 
-fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()> {
+fn finish(
+    i18n: &ai_memory_core::i18n::Localizer,
+    args: &crate::cli::BackfillArgs,
+    report: &BackfillReport,
+) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
@@ -1109,29 +1397,38 @@ fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()
     }
     if report.skipped_not_admitted {
         println!(
-            "ai-memory: capture mode is allowlist and this checkout has no .ai-memory.toml marker opting in (or its marker is unreadable) — nothing to backfill for {}/{}.",
-            report.workspace, report.project
-        );
+            "{}", i18n.format("cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
         return Ok(());
     }
     if report.skipped_non_empty {
         println!(
-            "ai-memory: {}/{} already has captured sessions — nothing to backfill (use --force to import anyway).",
-            report.workspace, report.project
-        );
+            "{}", i18n.format("cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
         return Ok(());
     }
     if report.dry_run {
         println!(
-            "ai-memory: would import {} local session(s) into {}/{} (dry run).",
-            report.selected, report.workspace, report.project
+            "{}",
+            i18n.format(
+                "cli-backfill-ai-memory-would-import-local-session-s-into-dry-run",
+                &[
+                    ("value0", format!("{}", report.selected)),
+                    ("value1", report.workspace.to_string()),
+                    ("value2", report.project.to_string())
+                ]
+            )
         );
         return Ok(());
     }
     if report.imported_sessions == 0 && report.failed_sessions == 0 {
         println!(
-            "ai-memory: no local session history found to backfill for {}/{}.",
-            report.workspace, report.project
+            "{}",
+            i18n.format(
+                "cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
         );
         return Ok(());
     }
@@ -1185,6 +1482,24 @@ mod tests {
     }
 
     #[test]
+    fn session_directory_resolution_is_cached_per_harness() {
+        let mut cache = Vec::new();
+        let mut calls = 0;
+        let first = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("crush-data"))
+        });
+        let second = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("wrong"))
+        });
+
+        assert_eq!(first, Some(PathBuf::from("crush-data")));
+        assert_eq!(second, first);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn member_sessions_path_encodes_each_name_as_one_segment() {
         assert_eq!(
             member_sessions_path("team", "app").unwrap(),
@@ -1202,6 +1517,150 @@ mod tests {
         // whatever it is given, so a literal 0 yields nothing.
         assert!(select_sessions(vec![session("a", 1)], 0).is_empty());
         assert_eq!(select_sessions(vec![session("a", 1)], 1).len(), 1);
+    }
+
+    /// #1287: a burst of SessionStart hooks in one directory must spawn one
+    /// backfill. Only the first claim wins; another directory is unaffected.
+    #[test]
+    fn only_one_session_start_claims_the_backfill_per_checkout() {
+        let data = tempfile::tempdir().unwrap();
+        let app = Path::new("/home/me/projects/app");
+        let other = Path::new("/home/me/projects/other");
+
+        let claim = claim_inflight(data.path(), app).unwrap();
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "second burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "third burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), other).is_some(),
+            "separate checkout"
+        );
+
+        assert!(release_inflight(data.path(), app, &claim));
+        assert!(
+            claim_inflight(data.path(), app).is_some(),
+            "free again after release"
+        );
+    }
+
+    /// A worker that died without releasing its marker must not block the
+    /// checkout forever.
+    #[test]
+    fn a_stale_inflight_marker_is_replaced() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        claim_inflight(data.path(), cwd).unwrap();
+
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        assert!(
+            claim_inflight(data.path(), cwd).is_some(),
+            "stale marker is taken over"
+        );
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "the new claim holds"
+        );
+    }
+
+    /// A worker's refresh makes an old marker fresh again, so a long backfill
+    /// keeps its claim; the refreshed marker retains its ownership token.
+    #[test]
+    fn a_refreshed_marker_is_not_taken_over() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        let claim = claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(refresh_inflight(data.path(), cwd, &claim));
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "a live worker keeps it"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), claim.as_str());
+    }
+
+    /// Once a stale marker has been taken over, the previous worker cannot
+    /// refresh or release the replacement marker even if it resumes later.
+    #[test]
+    fn stale_takeover_refuses_the_previous_owners_refresh_and_release() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        let previous = claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let replacement = claim_inflight(data.path(), cwd).unwrap();
+        assert_ne!(previous, replacement);
+        assert!(!refresh_inflight(data.path(), cwd, &previous));
+        assert!(!release_inflight(data.path(), cwd, &previous));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            replacement.as_str(),
+            "the replacement owner remains intact"
+        );
+        assert!(refresh_inflight(data.path(), cwd, &replacement));
+        assert!(release_inflight(data.path(), cwd, &replacement));
+        assert!(!marker.exists());
+    }
+
+    /// The stale takeover leaves no `.stale.*` file behind and exactly one
+    /// marker in place.
+    #[test]
+    fn a_stale_takeover_leaves_one_marker_and_no_debris() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        claim_inflight(data.path(), cwd).unwrap();
+        let names: Vec<String> = std::fs::read_dir(marker.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "marker plus its stable lock: {names:?}");
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight.lock")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".stale.")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -1473,8 +1932,8 @@ mod tests {
     async fn real_hook_router_replay_is_idempotent_and_reports_outcomes() {
         use ai_memory_core::{ActiveProject, IngestMetrics, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
-            hook_router,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
         use ai_memory_wiki::Wiki;
@@ -1502,6 +1961,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
@@ -1516,6 +1976,9 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
+            skip_wiki_checkpoints: false,
+            index_file_paths: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
@@ -1673,8 +2136,8 @@ mod tests {
     async fn two_sequential_recovery_intervals_on_one_resumed_session_replay_exactly_once() {
         use ai_memory_core::{ActiveProject, IngestMetrics, ObservationKind, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
-            hook_router,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
         use ai_memory_wiki::Wiki;
@@ -1702,6 +2165,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
@@ -1716,6 +2180,9 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
+            skip_wiki_checkpoints: false,
+            index_file_paths: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-resumed-across-two-offline-intervals";
@@ -2081,6 +2548,190 @@ mod tests {
         let (only, _limit_hit) =
             collect_local_sessions_with(home.path(), cwd.path(), Some("nope"), |_| None).await;
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
+    }
+
+    // These exercise the real listing cap with more than 200 files/rows.
+    // Setup, listing and cleanup take more than a second alone on macOS,
+    // even with the SQLite fixture inserted in one transaction.
+    mod slow_explicit_session_lookup {
+        use super::*;
+
+        #[tokio::test]
+        async fn collect_local_sessions_explicit_file_target_bypasses_listing_cap() {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let session_dir = home
+                .path()
+                .join(".claude/projects")
+                .join(ai_memory_workstream::claude_project_dir_name(cwd.path()));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let target = "11111111-2222-4333-8444-000000000000";
+            for index in 0..=PER_HARNESS_SCAN_LIMIT {
+                let id = format!("11111111-2222-4333-8444-{index:012}");
+                let header = serde_json::json!({ "sessionId": id, "cwd": cwd.path() });
+                let path = session_dir.join(format!("{id}.jsonl"));
+                std::fs::write(&path, format!("{header}\n")).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + index as u64),
+                    ))
+                    .unwrap();
+            }
+
+            let (listed, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), None, |_| None).await;
+            assert_eq!(listed.len(), PER_HARNESS_SCAN_LIMIT);
+            assert_eq!(limit_hit, vec![ManagedHarness::Claude]);
+            assert!(
+                listed
+                    .iter()
+                    .all(|session| session.native_session_id != target)
+            );
+
+            let (selected, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), Some(target), |_| None).await;
+            assert_eq!(selected.len(), 1, "the explicit old session must be found");
+            assert_eq!(selected[0].harness, ManagedHarness::Claude);
+            assert_eq!(selected[0].native_session_id, target);
+            assert_eq!(
+                selected[0].updated_at,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            );
+            assert!(
+                limit_hit.is_empty(),
+                "an exact lookup is not a capped listing"
+            );
+
+            for missing in ["no-such-session", "../outside", ""] {
+                let (selected, _) =
+                    collect_local_sessions_with(home.path(), cwd.path(), Some(missing), |_| None)
+                        .await;
+                assert!(selected.is_empty(), "must not select {missing:?}");
+            }
+            let foreign = tempfile::tempdir().unwrap();
+            let (selected, _) =
+                collect_local_sessions_with(home.path(), foreign.path(), Some(target), |_| None)
+                    .await;
+            assert!(
+                selected.is_empty(),
+                "the exact ID must still belong to this cwd"
+            );
+        }
+
+        #[tokio::test]
+        async fn collect_local_sessions_explicit_sql_target_bypasses_listing_cap() {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let store = home.path().join("opencode");
+            std::fs::create_dir_all(&store).unwrap();
+            let mut db = rusqlite::Connection::open(store.join("opencode.db")).unwrap();
+            let transaction = db.transaction().unwrap();
+            for table in ["session", "session_v2"] {
+                transaction.execute_batch(&format!(
+                "CREATE TABLE {table}(id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);"
+            ))
+            .unwrap();
+                for index in 0..=PER_HARNESS_SCAN_LIMIT {
+                    transaction
+                        .execute(
+                            &format!("INSERT INTO {table} VALUES (?1, ?2, ?3)"),
+                            rusqlite::params![
+                                format!("{table}-{index:04}"),
+                                cwd.path().to_string_lossy(),
+                                1_700_000_000_000_i64 + index as i64,
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+            let session_dir_for = |harness| {
+                matches!(
+                    harness,
+                    ManagedHarness::OpenCode | ManagedHarness::OpenCode2
+                )
+                .then(|| store.clone())
+            };
+            let (listed, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), None, session_dir_for).await;
+            assert_eq!(listed.len(), 2 * PER_HARNESS_SCAN_LIMIT);
+            assert_eq!(
+                limit_hit,
+                vec![ManagedHarness::OpenCode, ManagedHarness::OpenCode2]
+            );
+
+            for (table, harness) in [
+                ("session", ManagedHarness::OpenCode),
+                ("session_v2", ManagedHarness::OpenCode2),
+            ] {
+                let target = format!("{table}-0000");
+                let (selected, limit_hit) = collect_local_sessions_with(
+                    home.path(),
+                    cwd.path(),
+                    Some(&target),
+                    session_dir_for,
+                )
+                .await;
+                assert_eq!(selected.len(), 1, "the explicit old {harness:?} session");
+                assert_eq!(selected[0].harness, harness);
+                assert_eq!(selected[0].native_session_id, target);
+                assert_eq!(
+                    selected[0].updated_at,
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
+                );
+                assert!(limit_hit.is_empty());
+
+                let foreign = tempfile::tempdir().unwrap();
+                let (selected, _) = collect_local_sessions_with(
+                    home.path(),
+                    foreign.path(),
+                    Some(&target),
+                    session_dir_for,
+                )
+                .await;
+                assert!(
+                    selected.is_empty(),
+                    "must not import a foreign {harness:?} session"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_local_sessions_explicit_crush_target_keeps_subagents_excluded() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = cwd.path().join(".crush");
+        std::fs::create_dir_all(&store).unwrap();
+        let db = rusqlite::Connection::open(store.join("crush.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, updated_at INTEGER); \
+             INSERT INTO sessions VALUES ('parent', NULL, 1700000000); \
+             INSERT INTO sessions VALUES ('child', 'parent', 1700000001); \
+             INSERT INTO sessions VALUES ('invalid-time', NULL, -1);",
+        )
+        .unwrap();
+        let session_dir_for = |harness| (harness == ManagedHarness::Crush).then(|| store.clone());
+        let (selected, limit_hit) =
+            collect_local_sessions_with(home.path(), cwd.path(), Some("parent"), session_dir_for)
+                .await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].harness, ManagedHarness::Crush);
+        assert_eq!(selected[0].native_session_id, "parent");
+        assert_eq!(
+            selected[0].updated_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        assert!(limit_hit.is_empty());
+        for id in ["child", "invalid-time", "missing"] {
+            let (selected, _) =
+                collect_local_sessions_with(home.path(), cwd.path(), Some(id), session_dir_for)
+                    .await;
+            assert!(selected.is_empty(), "must not select {id}");
+        }
     }
 
     /// GHSA-gcpc-88hm-3xqr: a planted Claude transcript reads one file under
@@ -2835,6 +3486,7 @@ mod tests {
             json: false,
             quiet: true,
             auto: true,
+            inflight_claim: None,
             server_url: server_url.map(str::to_owned),
             server_profile: server_profile.map(str::to_owned),
         }
@@ -2908,6 +3560,34 @@ mod tests {
         assert!(
             sentinel_path(&config.data_dir, &cwd).exists(),
             "the opt-out must still record the attempt so it does not re-spawn"
+        );
+    }
+
+    /// The worker frees the marker the hook claimed, however it ends, so the
+    /// next SessionStart can spawn again when one is needed.
+    #[tokio::test]
+    async fn an_auto_run_releases_the_marker_its_hook_claimed() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.backfill_on_start = false;
+        config.server_url = "http://127.0.0.1:9".to_string();
+        let cwd = data_dir.path().join("checkout");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let claim = claim_inflight(&config.data_dir, &cwd).unwrap();
+        let mut args = spawned_args(None, None);
+        args.inflight_claim = Some(claim.as_str().to_owned());
+
+        run_in(&config, args, cwd.clone()).await.unwrap();
+        assert!(
+            !inflight_path(&config.data_dir, &cwd).exists(),
+            "the worker must release its marker"
+        );
+        assert!(
+            claim_inflight(&config.data_dir, &cwd).is_some(),
+            "free for the next run"
         );
     }
 }

@@ -46,7 +46,7 @@ pub struct SpoolState {
     pub oldest_age_ms: Option<u64>,
     /// Failed delivery attempts summed over the queued events.
     pub retries_total: u64,
-    /// Most events the spool holds before it evicts the oldest.
+    /// Most events the spool holds before it drops newly captured events.
     pub capacity: usize,
 }
 
@@ -138,10 +138,34 @@ pub struct HealthCheck {
     pub fix: Option<String>,
 }
 
+/// How old the oldest spooled event may get before the spool counts as stuck.
+/// A healthy session drains at its next boundary (session start, stop,
+/// pre-compact, session end) or at the threshold catch-up, well inside this.
+/// An unreachable endpoint never charges an attempt, so for it age is the
+/// only signal.
+const SPOOL_STUCK_AFTER_MS: u64 = 15 * 60 * 1000;
+
+fn spool_is_stuck(spool: &SpoolState) -> bool {
+    spool.pending > 0
+        && (spool.retries_total > 0
+            || spool
+                .oldest_age_ms
+                .is_none_or(|age| age >= SPOOL_STUCK_AFTER_MS))
+}
+
 /// The checks that fail for `s`, most severe first. An empty list is a
 /// healthy server.
 #[must_use]
 pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
+    localized_checks(&ai_memory_core::i18n::Localizer::default(), s)
+}
+
+/// Health checks rendered in the requesting operator's interface language.
+#[must_use]
+pub fn localized_checks(
+    i18n: &ai_memory_core::i18n::Localizer,
+    s: &HealthSnapshot,
+) -> Vec<HealthCheck> {
     let mut out = Vec::new();
     let mut push = |id, status, detail: String, fix: Option<&str>| {
         out.push(HealthCheck {
@@ -157,11 +181,7 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "hook_shed",
             CheckStatus::Warn,
-            format!(
-                "{shed} hook event(s) were answered 429 since the server started \
-                 ({} saturated, {} rate-limited); clients spool and retry them.",
-                s.ingest.shed_saturated, s.ingest.shed_rate_limited
-            ),
+            i18n.format("web-health-detail-shed-hook-event-s-were-answered-429-since-the-server-started-saturated-rate", &[("value0", format!("{}", shed)), ("value1", format!("{}", s.ingest.shed_saturated)), ("value2", format!("{}", s.ingest.shed_rate_limited))]),
             None,
         );
     }
@@ -169,9 +189,9 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "hook_failed",
             CheckStatus::Error,
-            format!(
-                "{} hook delivery(ies) failed to store since the server started.",
-                s.ingest.failed
+            i18n.format(
+                "web-health-detail-hook-delivery-ies-failed-to-store-since-the-server-started",
+                &[("value0", format!("{}", s.ingest.failed))],
             ),
             None,
         );
@@ -183,7 +203,13 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "write_queue",
             CheckStatus::Warn,
-            format!("The write queue holds {queued} of {capacity} commands."),
+            i18n.format(
+                "web-health-detail-the-write-queue-holds-queued-of-capacity-commands",
+                &[
+                    ("value0", format!("{}", queued)),
+                    ("value1", format!("{}", capacity)),
+                ],
+            ),
             None,
         );
     }
@@ -192,18 +218,17 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
             push(
                 "spool_evicting",
                 CheckStatus::Error,
-                format!(
-                    "The hook spool is full ({} events): each new event evicts the oldest \
-                     undelivered one.",
-                    spool.pending
-                ),
+                i18n.format("web-health-detail-the-hook-spool-is-full-events-newly-captured-events-are-dropped-until-space", &[("value0", format!("{}", spool.pending))]),
                 Some(fix_lines::RECOVER),
             );
-        } else if spool.pending > 0 {
+        } else if spool_is_stuck(&spool) {
             push(
                 "spool_pending",
                 CheckStatus::Warn,
-                format!("{} hook event(s) wait in the local spool.", spool.pending),
+                i18n.format("web-health-detail-hook-event-s-wait-in-the-local-spool-and-delivery-looks-stuck-oldest-failed", &[("value0", format!("{}", spool.pending)), ("value1", spool.oldest_age_ms.map_or_else(
+                        || i18n.text("web-health-detail-age-unknown"),
+                        |ms| i18n.format("web-health-detail-min", &[("value0", format!("{}", ms / 60_000))])
+                    ).to_string()), ("value2", format!("{}", spool.retries_total))]),
                 Some(fix_lines::RECOVER),
             );
         }
@@ -213,16 +238,20 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
             push(
                 "journal_unreadable",
                 CheckStatus::Error,
-                "The recovery journal could not be read.".to_owned(),
+                i18n.text("web-health-detail-the-recovery-journal-could-not-be-read"),
                 Some(fix_lines::RECOVER),
             );
         } else if journal.pending > 0 {
             push(
                 "journal_pending",
                 CheckStatus::Warn,
-                format!(
-                    "{} run(s) wait in the recovery journal ({} degraded, {} finish-failed).",
-                    journal.pending, journal.degraded, journal.finish_failed
+                i18n.format(
+                    "web-health-detail-run-s-wait-in-the-recovery-journal-degraded-finish-failed",
+                    &[
+                        ("value0", format!("{}", journal.pending)),
+                        ("value1", format!("{}", journal.degraded)),
+                        ("value2", format!("{}", journal.finish_failed)),
+                    ],
                 ),
                 Some(fix_lines::RECOVER),
             );
@@ -232,30 +261,48 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "llm_provider",
             CheckStatus::Error,
-            format!(
-                "The LLM provider's last call failed{}.",
-                s.providers
-                    .llm
-                    .last_error_status
-                    .map(|status| format!(" (HTTP {status})"))
-                    .unwrap_or_default()
+            i18n.format(
+                "web-health-detail-the-llm-provider-s-last-call-failed",
+                &[(
+                    "value0",
+                    s.providers
+                        .llm
+                        .last_error_status
+                        .map(|status| {
+                            i18n.format(
+                                "web-health-detail-http-status",
+                                &[("value0", format!("{}", status))],
+                            )
+                        })
+                        .unwrap_or_default()
+                        .to_string(),
+                )],
             ),
             s.providers.llm.retry_hint.as_deref(),
         );
+    }
+    for chain in &s.providers.llm_task_chains {
+        if chain.status == ProviderHealthStatus::Error {
+            push(
+                "llm_task_provider",
+                CheckStatus::Error,
+                i18n.format(
+                    "web-health-detail-llm-task-failed",
+                    &[("value0", chain.task.config_key().to_owned())],
+                ),
+                None,
+            );
+        }
     }
     if s.providers.embedding.status == ProviderHealthStatus::Error {
         push(
             "embedding_provider",
             CheckStatus::Error,
-            format!(
-                "The embedding provider's last call failed{}; searches run without the \
-                 vector stream until it answers.",
-                s.providers
+            i18n.format("web-health-detail-the-embedding-provider-s-last-call-failed-searches-run-without-the-vector-st", &[("value0", s.providers
                     .embedding
                     .last_error_status
-                    .map(|status| format!(" (HTTP {status})"))
-                    .unwrap_or_default()
-            ),
+                    .map(|status| i18n.format("web-health-detail-http-status", &[("value0", format!("{}", status))]))
+                    .unwrap_or_default().to_string())]),
             None,
         );
     }
@@ -275,10 +322,7 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
             push(
                 "stale_vectors",
                 CheckStatus::Warn,
-                format!(
-                    "{stale} stored vector(s) were made under another provider, model or \
-                     dimension and are ignored."
-                ),
+                i18n.format("web-health-detail-stale-stored-vector-s-were-made-under-another-provider-model-or-dimension-an", &[("value0", format!("{}", stale))]),
                 Some(fix_lines::EMBED_FORCE),
             );
         }
@@ -288,10 +332,7 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
             push(
                 "missing_vectors",
                 CheckStatus::Warn,
-                format!(
-                    "{missing} latest page(s) have no vector ({failed} after a failed or \
-                     skipped embed)."
-                ),
+                i18n.format("web-health-detail-missing-latest-page-s-have-no-vector-failed-after-a-failed-or-skipped-embed", &[("value0", format!("{}", missing)), ("value1", format!("{}", failed))]),
                 Some(fix_lines::EMBED),
             );
         }
@@ -300,11 +341,7 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "storage_reclaim",
             CheckStatus::Warn,
-            format!(
-                "{} of the {}-byte database is reclaimable; compacting blocks writes while \
-                 it runs.",
-                s.storage.reclaimable_bytes, s.storage.database_bytes
-            ),
+            i18n.format("web-health-detail-of-the-byte-database-is-reclaimable-compacting-blocks-writes-while-it-runs", &[("value0", format!("{}", s.storage.reclaimable_bytes)), ("value1", format!("{}", s.storage.database_bytes))]),
             Some(fix_lines::COMPACT),
         );
     }
@@ -312,9 +349,9 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
         push(
             "consolidation_failed",
             CheckStatus::Warn,
-            format!(
-                "{} session consolidation job(s) gave up after their retries.",
-                s.consolidation.failed
+            i18n.format(
+                "web-health-detail-session-consolidation-job-s-gave-up-after-their-retries",
+                &[("value0", format!("{}", s.consolidation.failed))],
             ),
             None,
         );
@@ -406,10 +443,39 @@ mod tests {
     }
 
     #[test]
+    fn a_young_spool_awaiting_its_boundary_drain_is_healthy() {
+        let mut snapshot = healthy();
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS - 1),
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert!(checks(&snapshot).is_empty());
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(1_000),
+            retries_total: 1,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: None,
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+    }
+
+    #[test]
     fn spool_and_journal_point_at_recover() {
         let mut snapshot = healthy();
         snapshot.process.spool = Some(SpoolState {
             pending: 3,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS),
             capacity: 500,
             ..SpoolState::default()
         });

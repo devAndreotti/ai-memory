@@ -11,10 +11,31 @@
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; search (global FTS5, or scoped through `memory_query`'s hybrid ranker, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; search (global FTS5, or scoped through `memory_query`'s hybrid ranker, single or multi-project); read the cross-project and in-project link graphs; aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
 | `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy. Use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
+
+The built-in web navigation also reads `GET /web/inbox/notifications` (replace
+`/web` with the configured mount). It returns `pending`, `project_count` and up
+to five `projects`, each with `workspace`, `project` and `pending`, filtered by
+the viewer's repository access. The response is protected and non-consuming,
+uses `Cache-Control: no-store`, and contains no message body or subject.
+Notification links open `/web/inbox?workspace=...&project=...&state=pending`.
+The optional `state` filter (`pending`, `claimed`, `cancelled`, or empty for
+all) is applied before history pagination, and unknown states are refused.
+Received mail defaults to `pending` when `state` is omitted, and an empty
+`state=` shows all history. Sent mail defaults to all states.
+
+Project and session HTML views accept `calls_q` (a literal model, harness or
+response substring, at most 256 characters), `calls_sort=tokens|recent`,
+`calls_signal=all|signals` and `calls_offset`. The database applies scope and
+ownership, search, signal filtering and ordering before it selects the
+fifty-response page. Totals and signal averages still cover all authorized
+responses in that scope. These HTML query parameters are separate from
+observation pagination, and they add no write capability or new `/api/v1`
+endpoint. Project and session usage refresh every ten seconds while visible,
+and the search controls and focus stay in place.
 
 `/api/v1/*` and `/admin/*` are dual-auth surfaces:
 
@@ -47,10 +68,15 @@ observations in capture order, a page at a time, through the same readers,
 visibility rule and caps as §4.11 and §4.12; `offset`, `limit` clamped
 `1..=200`, default `50`, and `at` to jump to the page holding a 1-based
 position). Both follow the same per-project read rule as the page view.
+The builtin wiki also serves `GET {web_slug}/graph` (the HTML twin of
+§4.9: a circular SVG of projects plus a table of page-level edges) and
+`GET {web_slug}/w/{workspace}/{project}/graph` (the HTML twin of §4.9.1).
 The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
 lists pending auto-improvement proposals and posts approve and reject to the
 existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
-403 page, not the change-password redirect. The root-only
+403 page, not the change-password redirect. A browser on the GET-only legacy
+Basic credential sees each proposal's `ai-memory pending-writes` commands in
+place of the buttons, since its posts would be refused. The root-only
 `GET {web_slug}/health` page follows the same gate: hook counters (accepted,
 shed, 429), writer queue, the spool and recovery journal under the server's
 data directory, the consolidation queue, embedder and provider state, and the
@@ -196,7 +222,9 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/pages
 ]
 ```
 
-`404` if the workspace or project doesn't exist.
+`404` if the workspace or project doesn't exist. A page whose `expires_at`
+TTL has passed is left out, as search and `recent` leave it out; the
+single-page read below still returns it.
 
 ### 4.4 Page (read full)
 
@@ -306,8 +334,10 @@ Rules:
 GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 ```
 
-`is_latest = 1` pages ordered by `updated_at` DESC. `limit` clamped
-`1..=100`, default `10`.
+`is_latest = 1` pages whose `expires_at` TTL has not passed, ordered by
+`updated_at` DESC by instant, with path ascending for equal timestamps.
+Fractional-second precision in the serialized timestamps does not change this
+order. `limit` clamped `1..=100`, default `10`.
 
 Every reader surface uses the same `kind` contract. An explicit frontmatter
 `kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,
@@ -492,11 +522,17 @@ either response, `handoff` is `null` when no open handoff matches the scope:
 
 ```http
 GET /api/v1/graph
+GET /api/v1/graph?workspace={workspace}&project={project}
 ```
 
 Returns every resolved wikilink whose endpoints sit in different
 projects, with both endpoints' workspace + project + path. Useful for
-rendering a project-level dependency view in the SPA.
+rendering a project-level dependency view in the SPA. Omit the query
+string for the whole graph. `workspace` and `project` must be provided
+together and keep only edges that touch that project; passing only one
+of them is `400`. An unknown or unreadable project is the same refusal
+as the other scoped routes (`404` / `403`). With authorization on, an
+edge still requires both ends to be readable.
 
 ```json
 {
@@ -513,8 +549,32 @@ rendering a project-level dependency view in the SPA.
 }
 ```
 
-Global today (no workspace / project filter); narrower query params
-are a follow-up.
+### 4.9.1 Project link graph
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/graph
+```
+
+Latest unexpired pages in that project and the resolved same-project
+wikilinks among them. Cross-project and unresolved links are omitted.
+When the project has more than 120 live pages, the response keeps the
+pages with the most same-project neighbours and then the most recently
+updated, and sets `truncated` to `true`. The same per-project read rule
+as the page list applies.
+
+```json
+{
+  "workspace": "default",
+  "project": "ai-memory",
+  "truncated": false,
+  "nodes": [
+    { "path": "decisions/0014-storage.md", "title": "Storage", "degree": 2 }
+  ],
+  "edges": [
+    { "from_path": "concepts/wiki.md", "to_path": "decisions/0014-storage.md" }
+  ]
+}
+```
 
 ### 4.10 Browser tab icon
 
@@ -544,7 +604,12 @@ row is anchored in the project OR at least one of its observations landed
 there, so a session that changed repositories mid-flight shows up in both.
 `observation_count` counts only this project's rows. `limit` clamped
 `1..=100`, default `20`; `offset` default `0`; `include_open` default
-`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+`false` (only effectively ended sessions). Substantive observations in the
+requested project after the persisted end make the read view open the session
+again: `ended_at` is `null`, and `include_open=false` excludes it.
+Lifecycle-only observations do not reopen it. The stored end stays the writer's
+finalization watermark, and this read changes neither history nor handoff
+admission. Owner-filtered like handoffs: a
 caller the server can name sees their own sessions plus unattributed ones;
 an unnamed caller sees unattributed ones only. Never cached (`no-store`).
 
@@ -883,7 +948,8 @@ const search = await fetch(`${API}/search`, {
 `curl` smoke test:
 
 ```bash
-TOKEN=$(ai-memory generate-auth-token)
+# Use the bearer already configured on the running server.
+TOKEN='<server-configured bearer token>'
 curl -fsS "http://127.0.0.1:49374/api/v1/workspaces" -H "Authorization: Bearer $TOKEN" | jq
 ```
 
@@ -900,7 +966,7 @@ Read these:
 | Page-history readers (`page_versions`, `page_version_body`) and the bounded diff | `crates/ai-memory-store/src/reader.rs`, `crates/ai-memory-web/src/diff.rs` |
 | Scoped search ranker shared with `memory_query` (`hybrid_search_scopes`) | `crates/ai-memory-web/src/recall.rs`, `crates/ai-memory-store/src/reader.rs` |
 | Health panel checks and fix lines | `crates/ai-memory-web/src/health.rs`, `crates/ai-memory-core/src/fix_lines.rs` |
-| 27 integration tests covering every endpoint (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/routes.rs` |
+| Integration tests for API and web routes (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/suite/routes.rs` |
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |
 
@@ -947,3 +1013,41 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 
 For status updates on any of these, the issue tracker is the source of
 truth.
+
+### Browser inbox exception
+
+The `/api/v1` surface and wiki editing stay read-only. The built-in web UI adds
+`/web/inbox` and `POST /web/messages` (under the configured base path and web
+slug). The POST queues a sanitized, admitted message for an existing project and
+harness. It requires write access to the source and destination, a JSON body,
+the UI header and the normal browser-session CSRF checks. It does not mutate
+wiki pages, pop messages or run an agent. See
+[agent messaging](agent-messaging.md#in-the-web-ui).
+
+Three additional POST routes support editing queued messages: `/web/messages/{id}/edit` holds it
+out of the queue and returns its text, `/web/messages/{id}/save` replaces the
+subject and text and requeues it, and `/web/messages/{id}/release` requeues it
+unchanged. The body names the mailbox (`workspace`, `project`), and `save` adds
+`subject` and `body`. They need the same checks as sending, plus write access to
+the project the message came from. A message outside the expected state
+returns 409.
+
+## Bundled documentation for agents
+
+The documentation catalog is at `GET /api/v1/docs?q=token`. Each entry has an
+`id`, title, description, category and repository `source` path.
+`GET /api/v1/docs/{id}` returns that metadata plus `markdown`, the binary's
+package `version`, a selected `release` and the available `releases`. These are
+read-only product guides, independent of project scopes and database content.
+They use the same authentication as the other API routes. Search is limited to
+200 characters, and unknown document ids and releases return 404.
+
+The browser uses `/web/docs` and `/web/docs/{id}`. A `.md` suffix returns
+`text/markdown` instead of HTML. The changelog defaults to Unreleased, and
+archived series default to their first release. Use `?release=3.2.2` for one
+release or `?release=all` for a whole series. The guides and changelog files are
+compiled into the binary, including source-built Docker images, so no internet
+connection or running LLM is needed. Repository links outside the curated
+catalog open on GitHub. These pages describe shipped capabilities and do not
+expose the running server's configuration or credentials. Apply your configured
+base path and web slug to these examples.

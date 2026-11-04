@@ -5,8 +5,8 @@
 //! pieces of state:
 //!
 //! 1. The per-agent lifecycle-hook event lists ai-memory wires up
-//!    (Claude/Grok share `CLAUDE_CODE_EVENTS`; Codex, Cursor, Gemini,
-//!    and Antigravity define their own profiles) — kept in sync between
+//!    (`CLAUDE_CODE_EVENTS`; Grok's own `GROK_EVENTS`; Codex, Cursor,
+//!    Gemini, and Antigravity define their own profiles) — kept in sync between
 //!    hook-bundle generation (setup-agent) and config rendering
 //!    (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
@@ -30,15 +30,23 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
+/// `PostToolUse` fires only when a tool succeeds; `PostToolUseFailure` fires
+/// when it fails (<https://code.claude.com/docs/en/hooks>). Without the second
+/// entry every failed command, build and test run was invisible. It reuses the
+/// post-tool-use script: the server aliases the event and reads the outcome
+/// from the payload.
+///
 /// Adding a hook event means updating this list AND adding the matching `.sh`
-/// and `.ps1` files under the agents that use this profile (`claude-code` and
-/// `grok`). Agents with different vocabularies keep their own event arrays
-/// below. The install-hooks parity test fails if a bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
+/// and `.ps1` files under `hooks/claude-code/` (a reused script like
+/// post-tool-use needs no new file). Agents with different vocabularies keep
+/// their own event arrays below. The install-hooks parity test fails if a
+/// bundle drifts.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
@@ -49,9 +57,29 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
-/// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
-/// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
-/// fires `PostToolUse` on successful calls only and reports failures
+/// Grok Build CLI: Claude Code's JSON shape and the nine events Grok is known
+/// to fire. `PostToolUseFailure` waits until Grok's vocabulary is verified.
+/// Its script bundle is `hooks/grok/`.
+pub(crate) const GROK_EVENTS: [(&str, &str); 9] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
+/// A settings-file timeout raises that budget (up to Claude's 60-second cap),
+/// leaving room for a slow local spool fsync without making other hooks wait.
+pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
+
+/// Kimi Code lifecycle events ai-memory hooks: the same ten events as
+/// Claude Code (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` included. Kimi
+/// Code fires `PostToolUse` on successful calls only and reports failures
 /// separately. The failure entry reuses the post-tool-use script — the
 /// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
 /// outcome from the payload.
@@ -84,7 +112,7 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// its native camelCase one — this lets it free-ride on the same key-based
 /// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
 /// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
-/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// Same vocabulary as `KIMI_CODE_EVENTS` and `CLAUDE_CODE_EVENTS`, including
 /// `PostToolUseFailure`, which Copilot (per
 /// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
 /// instead of `PostToolUse` when a tool call errors — the server already
@@ -144,6 +172,97 @@ pub(crate) const MUSE_EVENTS: [(&str, &str); 8] = [
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
+];
+
+/// Tencent CodeBuddy Code lifecycle events ai-memory hooks (#1299). Each pair
+/// is `(event-name-in-~/.codebuddy/settings.json, native hook-event script
+/// stem)`; CodeBuddy has no script bundle, so the `.sh` name only carries the
+/// event token the native command is rendered with.
+///
+/// The reporter's mapping on v2.164–v2.167: Claude Code's vocabulary minus
+/// the subagent events. `PostToolUseFailure` is not in that mapping.
+/// `SessionEnd` is wired for the interactive exit; headless `codebuddy -p`
+/// is a separate follow-up.
+pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// Qoder CLI/IDE events used for capture and handoff delivery. Qoder exposes
+/// additional policy and notification events that do not carry memory data.
+pub(crate) const QODER_EVENTS: [(&str, &str); 8] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// IBM Bob IDE's common lifecycle vocabulary. Bob Shell also supports these
+/// five events; its additional compaction events are intentionally omitted so
+/// one global settings file remains valid in both products. Bob has no
+/// `SessionEnd`, and `Stop` is an agent-turn boundary rather than a reliable
+/// process-exit boundary.
+pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// DeepSeek Harness (DSH) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-the-Claude-Code-hooks.json, POSIX hook-script-filename)`.
+///
+/// DSH has no native hook protocol: capture runs through the official
+/// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude Code
+/// `hooks.json` and delivers exactly these seven events — `PreCompact` and
+/// `SessionEnd` are not delivered, and `SessionStart` runs detached, so the
+/// bundle never fetches a handoff and finished sessions close with
+/// `ai-memory finalize-session --agent dsh`. Adding a hook event means
+/// updating this list AND adding the matching `.sh` and `.ps1` files under
+/// `hooks/dsh/`; the install-hooks parity test fails if the bundle drifts.
+pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Qwen Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.qwen/settings.json, native hook-event script stem)`;
+/// Qwen has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+/// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
+/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// documents `SubagentStart`/`SubagentStop` for user-spawned agents
+/// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
+/// `finalize-session` step is needed.
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
@@ -297,6 +416,8 @@ const CAPTURE_NON_FILE_TOOLS: string[] = __AI_MEMORY_NON_FILE_TOOLS__;
 const CAPTURE_INLINE_CODE_TOOLS: string[] = __AI_MEMORY_INLINE_CODE_TOOLS__;
 const CAPTURE_OUTPUT_READER_TOOLS: string[] = __AI_MEMORY_OUTPUT_READER_TOOLS__;
 const CAPTURE_MAX_COMMAND_CHARS = __AI_MEMORY_MAX_COMMAND_CHARS__;
+// Longest checkout-relative path the file index keeps; generated from `ai_memory_core::FILE_PATH_MAX_CHARS`.
+const CAPTURE_FILE_PATH_MAX_CHARS = __AI_MEMORY_FILE_PATH_MAX_CHARS__;
 // Bounds on the other markers one call may make the policy read; mirror `capture_lookup_locations` and `foreign_capture_decision`.
 const CAPTURE_MAX_LOOKUP_LOCATIONS = 4096;
 const CAPTURE_MAX_FOREIGN_MARKERS = 16;
@@ -474,19 +595,25 @@ function captureShellCommand(args: Record<string, unknown> | undefined): string 
 // `~` in it was outside quotes: a quoted tilde, or one in an argv element or a
 // quoted message, is literal, except under PowerShell, which reads `~` itself.
 // `expanded` holds the words of each script with such syntax as the shell expands them where that changes the directory a path names (a zsh glob group kept in its word, ANSI-C numeric escapes decoded), for the marker lookup only; mirrors `ShellWords::expanded`.
-type CaptureSplit = { words: [string, boolean][]; opaque: boolean; expanded: [string, boolean][] };
-function captureShellSplit(command: string | string[], windows = false): CaptureSplit { const split: CaptureSplit = { words: [], opaque: false, expanded: [] }; const readings = (text: string): [string, boolean][] => { const texts = [text]; const plain = windows ? captureWithoutWindowsEscapes(text) : undefined; if (plain !== undefined) texts.push(plain); const out: [string, boolean][] = []; for (const t of texts) { out.push([t, false]); if (windows && t.includes("\\")) out.push([t, true]); } return out; }; if (typeof command === "string") { split.opaque = captureUnevaluatedExpansion(command); if (split.opaque) split.expanded.push(...captureMarkedWords(command, true)); for (const [text, literal] of readings(command)) captureNestedWords(captureMarkedWords(text, false, literal), CAPTURE_MAX_SHELL_NESTING, split, literal); } else { split.opaque = command.some((item) => captureUnevaluatedExpansion(item)) || captureInlineCode(command); for (const item of command) if (captureUnevaluatedExpansion(item)) split.expanded.push(...captureMarkedWords(item, true)); command.forEach((item, index) => { const script = captureShellScript(command, index); for (const [text, literal] of readings(item)) captureArgvItem(text, script, split, literal); }); } if (windows) for (const word of split.words) word[1] = true; if (split.words.some(([word, tilde]) => tilde && captureShellArguments(word).some(([argument]) => captureUnknownDirectory(argument)))) split.opaque = true; return split; }
-function captureArgvItem(item: string, script: boolean, split: CaptureSplit, literal = false): void { const tokens = captureMarkedWords(item, false, literal); if (tokens.length === 1 && tokens[0][0] === item) { capturePushWord(item, false, split); return; } if ([...item].length <= 256) split.words.push([item, false]); captureNestedWords(captureLiteralTildes(tokens, script), CAPTURE_MAX_SHELL_NESTING - 1, split, literal); }
-// Only a script a shell runs expands a tilde; mirrors `literal_tildes`.
-function captureLiteralTildes(tokens: [string, boolean][], script: boolean): [string, boolean][] { return script ? tokens : tokens.map(([token]) => [token, false] as [string, boolean]); }
+// `literal` says, per word, whether its groups and braces are text (quoted, or in an element no shell reads); mirrors `ShellWords`.
+type CaptureSplit = { words: [string, boolean][]; literal: Map<string, [boolean, boolean]>; opaque: boolean; expanded: [string, boolean][] };
+function captureShellSplit(command: string | string[], windows = false): CaptureSplit { const split: CaptureSplit = { words: [], literal: new Map(), opaque: false, expanded: [] }; const readings = (text: string): [string, boolean][] => { const texts = [text]; const plain = windows ? captureWithoutWindowsEscapes(text) : undefined; if (plain !== undefined) texts.push(plain); const out: [string, boolean][] = []; for (const t of texts) { out.push([t, false]); if (windows && t.includes("\\")) out.push([t, true]); } return out; }; if (typeof command === "string") { split.opaque = captureUnevaluatedExpansion(command); if (split.opaque) split.expanded.push(...captureExpandedWords(command)); for (const [text, literal] of readings(command)) captureNestedWords(captureMarkedWords(text, false, literal), CAPTURE_MAX_SHELL_NESTING, split, literal); } else { split.opaque = command.some((item) => captureUnevaluatedExpansion(item)) || captureInlineCode(command); for (const item of command) if (captureUnevaluatedExpansion(item)) split.expanded.push(...captureExpandedWords(item)); command.forEach((item, index) => { const script = captureShellScript(command, index); for (const [text, literal] of readings(item)) captureArgvItem(text, script, split, literal); }); } if (windows) for (const word of split.words) word[1] = true; if (split.words.some(([word, tilde]) => tilde && captureShellArguments(word).some(([argument]) => captureUnknownDirectory(argument)))) split.opaque = true; return split; }
+function captureArgvItem(item: string, script: boolean, split: CaptureSplit, literal = false): void { const tokens = captureMarkedWords(item, false, literal); if (tokens.length === 1 && tokens[0][0] === item) { capturePushWord(item, false, script && tokens[0][2], split); return; } if ([...item].length <= 256) captureAddWord(item, false, !script, !script, split); captureNestedWords(captureLiteralMarks(tokens, script), CAPTURE_MAX_SHELL_NESTING - 1, split, literal); }
+// Only a script a shell runs expands a tilde or a brace; mirrors `literal_marks`.
+function captureLiteralMarks(tokens: [string, boolean, boolean][], script: boolean): [string, boolean, boolean][] { return script ? tokens : tokens.map(([token]) => [token, false, false] as [string, boolean, boolean]); }
+// The words of a script with syntax the matcher does not evaluate, as the shell expands them; mirrors `expanded_words`.
+function captureExpandedWords(script: string): [string, boolean][] { return captureMarkedWords(script, true).map(([word, tilde]) => [word, tilde] as [string, boolean]); }
 // PowerShell's backquote and cmd's caret each stand for the next character; mirrors `without_windows_escapes`.
 function captureWithoutWindowsEscapes(command: string): string | undefined { if (!/[`^]/.test(command)) return undefined; const chars = [...command]; let plain = ""; for (let i = 0; i < chars.length; i++) { if (chars[i] === "`" || chars[i] === "^") { i++; if (i < chars.length) plain += chars[i]; } else plain += chars[i]; } return plain; }
 function captureUnknownDirectory(argument: string): boolean { if (!argument.startsWith("~")) return false; const prefix = argument.slice(1).split(/[\/\\]/)[0]; return prefix !== "" && prefix !== "+"; }
 // Only a script a shell runs expands braces, classes and tildes; a quoted message or pattern does not.
-function captureNestedWords(words: [string, boolean][], depth: number, split: CaptureSplit, literal = false): void { const texts = words.map(([word]) => word); if (captureInlineCode(texts)) split.opaque = true; words.forEach(([word, tilde], index) => { capturePushWord(word, tilde, split); const tokens = captureMarkedWords(word, false, literal); if (tokens.length === 1 && tokens[0][0] === word) return; if (depth === 0) { split.opaque = true; return; } const script = word.includes("$(") || word.includes("`") || captureShellScript(texts, index); if (script && captureUnevaluatedExpansion(word)) { split.opaque = true; split.expanded.push(...captureMarkedWords(word, true)); } captureNestedWords(captureLiteralTildes(tokens, script), depth - 1, split, literal); }); }
+function captureNestedWords(words: [string, boolean, boolean][], depth: number, split: CaptureSplit, literal = false): void { const texts = words.map(([word]) => word); if (captureInlineCode(texts)) split.opaque = true; words.forEach(([word, tilde, bare], index) => { capturePushWord(word, tilde, bare, split); const tokens = captureMarkedWords(word, false, literal); if (tokens.length === 1 && tokens[0][0] === word) return; if (depth === 0) { split.opaque = true; return; } const script = word.includes("$(") || word.includes("`") || captureShellScript(texts, index); if (script && captureUnevaluatedExpansion(word)) { split.opaque = true; split.expanded.push(...captureExpandedWords(word)); } captureNestedWords(captureLiteralMarks(tokens, script), depth - 1, split, literal); }); }
 // Also adds the POSIX reading of a word with `\o` escapes, which the shell reads as `o`, and the reading of each with every parameter default (`${X:-docs/x.md}`) replaced by its operand; a default nested deeper than the matcher reads makes the command unprovable.
-function capturePushWord(word: string, tilde: boolean, split: CaptureSplit): void { capturePushReading(word, tilde, split); if (!word.includes("\\")) return; const chars = [...word]; let plain = ""; for (let i = 0; i < chars.length; i++) { if (chars[i] === "\\") { i++; if (i < chars.length) plain += chars[i]; } else plain += chars[i]; } if (plain !== word) capturePushReading(plain, tilde, split); }
-function capturePushReading(word: string, tilde: boolean, split: CaptureSplit): void { split.words.push([word, tilde]); const operands = captureParameterOperands(word); if (operands === undefined) return; split.words.push([operands[0], tilde]); if (operands[1]) split.opaque = true; }
+function capturePushWord(word: string, tilde: boolean, bare: boolean, split: CaptureSplit): void { capturePushReading(word, tilde, bare, split); if (!word.includes("\\")) return; const chars = [...word]; let plain = ""; for (let i = 0; i < chars.length; i++) { if (chars[i] === "\\") { i++; if (i < chars.length) plain += chars[i]; } else plain += chars[i]; } if (plain !== word) capturePushReading(plain, tilde, bare, split); }
+// An unquoted `(` ends a word, so one inside a word is text; a brace is text unless it was outside quotes; mirrors `push_word_reading`.
+function capturePushReading(word: string, tilde: boolean, bare: boolean, split: CaptureSplit): void { captureAddWord(word, tilde, true, !bare, split); const operands = captureParameterOperands(word); if (operands === undefined) return; captureAddWord(operands[0], tilde, true, !bare, split); if (operands[1]) split.opaque = true; }
+// Every reading of a word must agree that its groups or braces are text; mirrors `add_word`.
+function captureAddWord(word: string, tilde: boolean, parens: boolean, braces: boolean, split: CaptureSplit): void { const seen = split.literal.get(word); split.literal.set(word, seen ? [seen[0] && parens, seen[1] && braces] : [parens, braces]); split.words.push([word, tilde]); }
 // Mirrors `parameter_operands`: `${NAME:-w}`, `${NAME:=w}`, `${NAME:+w}` (or without `:`) become `w`, nested down to CAPTURE_MAX_SHELL_NESTING levels; the flag is set when one is nested deeper still.
 function captureParameterOperands(word: string): [string, boolean] | undefined { let current = captureReplaceOperands(word); if (current === undefined) return undefined; for (let i = 1; i < CAPTURE_MAX_SHELL_NESTING; i++) { const next = captureReplaceOperands(current); if (next === undefined) return [current, false]; current = next; } return [current, captureReplaceOperands(current) !== undefined]; }
 function captureReplaceOperands(word: string): string | undefined { let output = ""; let rest = word; let changed = false; for (;;) { const start = rest.indexOf("${"); if (start < 0) break; output += rest.slice(0, start); const body = rest.slice(start + 2); const name = (/^[A-Za-z0-9_]*/.exec(body) ?? [""])[0].length; const after = body.slice(name); const operator = /^:[-=+]/.test(after) ? 2 : /^[-=+]/.test(after) ? 1 : 0; const operand = after.slice(operator); let depth = 0; let end = -1; for (let i = 0; i < operand.length; i++) { const c = operand[i]; if (c === "{") depth++; else if (c === "}") { if (depth === 0) { end = i; break; } depth--; } } if (end >= 0 && name > 0 && operator > 0) { output += operand.slice(0, end); changed = true; rest = operand.slice(end + 1); } else { output += "${"; rest = body; } } output += rest; return changed ? output : undefined; }
@@ -497,7 +624,7 @@ function captureShellValueOption(flag: string): boolean { return ["--rcfile","--
 // Inline interpreter code (`python3 -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `lua -e`, `Rscript -e`, `osascript -e`, `deno eval`) builds paths at run time; mirrors `runs_inline_code`.
 function captureInlineCode(words: string[]): boolean { return words.some((word, index) => { const name = captureCommandName(word); const versioned = (prefix: string) => name.startsWith(prefix) && /^[0-9.]*$/.test(name.slice(prefix.length)); if (name === "deno") return words[index + 1] === "eval"; const spec: [string, string[]] | undefined = versioned("python") || versioned("pypy") || name === "py" ? ["c", ["-W","-X","--check-hash-based-pycs"]] : versioned("perl") ? ["eE", ["-I","-M","-m"]] : versioned("ruby") ? ["e", ["-I","-r","-C","-E"]] : ["node","nodejs","bun"].includes(name) ? ["ep", ["-r","--require","--import","--loader","--experimental-loader","-C","--conditions","--input-type","--title","--env-file"]] : versioned("php") ? ["r", ["-d","-c","-z"]] : ["lua","luajit","rscript","osascript"].includes(name) ? ["e", ["-l"]] : undefined; if (!spec) return false; const [letters, values] = spec; for (let i = index + 1; i < words.length; i++) { const flag = words[i]; if (!flag.startsWith("-")) return false; if (["--eval","--print"].includes(flag) || flag.startsWith("--eval=") || flag.startsWith("--print=") || (!flag.startsWith("--") && [...flag.slice(1)].some((c) => letters.includes(c)))) return true; if (values.includes(flag)) i++; } return false; }); }
 // Each word with whether it holds a `~` outside quotes and not after a backslash; mirrors `marked_shell_words`. With `expand`, a zsh glob group stays in its word and ANSI-C numeric and control escapes are decoded; mirrors `shell_tokens`. With `literal`, every backslash is an ordinary character, as PowerShell and cmd read it; mirrors `literal_shell_words`.
-function captureMarkedWords(command: string, expand = false, literal = false): [string, boolean][] { const special = (c: string) => /\s/.test(c) || "|&;<>()`".includes(c); const chars = [...command]; const words: [string, boolean][] = []; let word = ""; let tilde = false; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote === "$") { if (c === "'") quote = ""; else if (c === "\\" && next !== undefined && !literal) { const plain = captureAnsiEscape(next); const numeric = plain === undefined && expand ? captureAnsiNumeric(chars, i + 1) : undefined; if (plain !== undefined) { word += plain; i++; } else if (numeric) { word += numeric[0]; i = numeric[1]; } else { word += c + next; i++; } } else word += c; } else if (quote) { if (c === quote) quote = ""; else if (!literal && quote === '"' && c === "\\" && next === "\n") i++; else if (!literal && quote === '"' && c === "\\" && (next === '"' || next === "\\" || next === "$" || next === "`")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "$" && (next === "'" || next === '"')) { quote = next === "'" ? "$" : '"'; i++; inWord = true; } else if (!literal && c === "\\" && next === "\n") { i++; } else if (!literal && c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (c === "(" && expand && (!inWord || !/[$=]$/.test(word)) && captureGlobGroup(chars, i, inWord) !== undefined) { const end = captureGlobGroup(chars, i, inWord)!; word += chars.slice(i, end + 1).join(""); i = end; inWord = true; } else if (special(c)) { if (inWord) words.push([word, tilde]); word = ""; tilde = false; inWord = false; } else { if (c === "~" && !word.endsWith("\\")) tilde = true; word += c; inWord = true; } } if (inWord) words.push([word, tilde]); return words; }
+function captureMarkedWords(command: string, expand = false, literal = false): [string, boolean, boolean][] { const special = (c: string) => /\s/.test(c) || "|&;<>()`".includes(c); const chars = [...command]; const words: [string, boolean, boolean][] = []; let word = ""; let tilde = false; let bare = false; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote === "$") { if (c === "'") quote = ""; else if (c === "\\" && next !== undefined && !literal) { const plain = captureAnsiEscape(next); const numeric = plain === undefined && expand ? captureAnsiNumeric(chars, i + 1) : undefined; if (plain !== undefined) { word += plain; i++; } else if (numeric) { word += numeric[0]; i = numeric[1]; } else { word += c + next; i++; } } else word += c; } else if (quote) { if (c === quote) quote = ""; else if (!literal && quote === '"' && c === "\\" && next === "\n") i++; else if (!literal && quote === '"' && c === "\\" && (next === '"' || next === "\\" || next === "$" || next === "`")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "$" && (next === "'" || next === '"')) { quote = next === "'" ? "$" : '"'; i++; inWord = true; } else if (!literal && c === "\\" && next === "\n") { i++; } else if (!literal && c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (c === "(" && expand && (!inWord || !/[$=]$/.test(word)) && captureGlobGroup(chars, i, inWord) !== undefined) { const end = captureGlobGroup(chars, i, inWord)!; word += chars.slice(i, end + 1).join(""); i = end; inWord = true; } else if (special(c)) { if (inWord) words.push([word, tilde, bare]); word = ""; tilde = false; bare = false; inWord = false; } else { if (c === "~" && !word.endsWith("\\")) tilde = true; if (c === "{" || c === "}") bare = true; word += c; inWord = true; } } if (inWord) words.push([word, tilde, bare]); return words; }
 // The index of the `)` closing the zsh glob group `(` opens at `open`: inside a word, or at a word's start when a word character follows; undefined for a subshell or when whitespace, a quote, an escape or another operator comes first. Mirrors `glob_group`.
 function captureGlobGroup(chars: string[], open: number, inWord: boolean): number | undefined { let depth = 0; for (let i = open; i < chars.length; i++) { const c = chars[i]; if (/\s/.test(c) || "'\"\\;&<>`".includes(c)) return undefined; if (c === "(") depth++; else if (c === ")" && --depth === 0) { const next = chars[i + 1]; return inWord || (next !== undefined && !/\s/.test(next) && !"|&;<>()`".includes(next)) ? i : undefined; } } return undefined; }
 // A numeric or control ANSI-C escape whose letter or first digit is at `at` (`\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\NNN`, `\cX`): the character and the index of its last source character, or undefined. Mirrors `ansi_c_numeric_escape`.
@@ -540,8 +667,10 @@ function captureTool(payload: Record<string, unknown>): { family: CaptureProtoco
 function captureSearchScope(name: string, args: unknown): { roots: string[]; patterns: string[] } | undefined { if (args === undefined || args === null) return { roots: [], patterns: [] }; if (typeof args !== "object" || Array.isArray(args)) return undefined; const o = args as Record<string, unknown>; const roots: string[] = []; const patterns: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile","dir_path","directory","DirectoryPath","SearchDirectory","SearchPath"]) if (k in o) { if (typeof o[k] !== "string") return undefined; roots.push(o[k] as string); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; roots.push(...(o.paths as string[])); } for (const k of [...(["glob","find","find_by_name"].includes(name) ? ["pattern","Pattern"] : []), "glob","include","file_pattern","file_glob","Includes"]) { if (!(k in o)) continue; const v = o[k]; if (typeof v === "string") patterns.push(v); else if (Array.isArray(v) && v.every((x) => typeof x === "string")) patterns.push(...(v as string[])); else return undefined; } return roots.length + patterns.length <= CAPTURE_MAX_CANDIDATES && [...roots, ...patterns].every((p) => p.trim() && [...p].length <= CAPTURE_MAX_PATH_CHARS) ? { roots, patterns } : undefined; }
 // The files an `apply_patch` patch names in its Add/Update/Delete File and Move to headers, for the cross-checkout lookup only; mirrors `patch_paths`.
 function capturePatchPaths(name: string, args: unknown): string[] | undefined { if (name !== "apply_patch" && name !== "patch") return undefined; const o = args as Record<string, unknown> | undefined; const text = typeof args === "string" ? args : o && typeof o === "object" ? ["command","patch","patchText","input"].map((k) => o[k]).find((v): v is string => typeof v === "string") : undefined; if (text === undefined) return undefined; const paths: string[] = []; for (const line of text.split(/\r?\n/)) { const trimmed = line.trimStart(); const header = ["*** Add File:","*** Update File:","*** Delete File:","*** Move to:"].find((h) => trimmed.startsWith(h)); if (!header) continue; const path = trimmed.slice(header.length).trim(); if (!path || [...path].length > CAPTURE_MAX_PATH_CHARS || paths.length === CAPTURE_MAX_CANDIDATES) return undefined; paths.push(path); } return paths.length ? paths : undefined; }
-// How to follow a lookup location with glob syntax: null when it has none (a parameter expansion's braces are not syntax; the shell split also reads each default in its place), undefined when a brace or group spans a separator or an alternative of `..` or `~…` leaves the root (one a brace expansion builds included), else its literal root and one step per remaining segment ("*" any child directory, "?<glob>" a child the `*`/`?` glob names without regard to ASCII case, "**" any depth, ending the walk; anything else that child); mirrors `glob_walk`.
-function captureGlobWalk(location: string): { root: string; steps: string[] } | null | undefined { if (location.includes("${") || !/[*?\[{(]/.test(location)) return null; const parsed = captureNormalize(location); if (!parsed) return null; const p = parsed.path; let root: string; let tail: string; if (p.startsWith("//")) { const parts = p.slice(2).split("/"); root = `//${parts[0]}/${parts[1]}`; tail = parts.slice(2).join("/"); } else if (/^[A-Za-z]:\//.test(p)) { root = p.slice(0, 3); tail = p.slice(3); } else { root = "/"; tail = p.slice(1); } const segments = tail.split("/").filter(Boolean); const syntax = (segment: string) => /[*?\[{(]/.test(segment); const first = segments.findIndex(syntax); if (first < 0) return null; const steps: string[] = []; for (let index = first; index < segments.length; index++) { const segment = segments[index]; if (!syntax(segment)) { steps.push(segment); continue; } const count = (c: string) => segment.split(c).length - 1; const leaves = (text: string) => text.split(/[{},()|@!+]/).some((piece) => piece === ".." || piece.startsWith("~")); const alternatives = segment.includes("{") ? captureBraceAlternatives(segment) : []; if (leaves(segment) || (alternatives === undefined ? captureBraceOverflowLeaves(segment) : alternatives.some((alternative) => /[\/\\]/.test(alternative) || leaves(alternative) || (index < segments.length - 1 && captureCouldNameParent(alternative)))) || count("{") !== count("}") || count("(") !== count(")")) return undefined; if (segment.includes("**")) { steps.push("**"); break; } steps.push(/[\[{(]/.test(segment) ? "*" : `?${segment}`); } for (const segment of segments.slice(0, first)) root += `${root.endsWith("/") ? "" : "/"}${segment}`; return { root: parsed.windows ? root.replace(/\//g, "\\") : root, steps }; }
+// A quoted brace that lists alternatives is text to the shell, but a program that globs its own argument expands it, so each alternative is looked up too; past the alternatives bound it reads as syntax again. Mirrors `quoted_brace_readings`.
+function captureQuotedBraceReadings(text: string, literal: [boolean, boolean]): [string, [boolean, boolean]][] { if (!literal[1] || !text.includes("{")) return [[text, literal]]; const alternatives = captureBraceAlternatives(text); if (alternatives === undefined) return [[text, [literal[0], false]]]; return alternatives.length > 1 ? [text, ...alternatives].map((reading) => [reading, literal] as [string, [boolean, boolean]]) : [[text, literal]]; }
+// How to follow a lookup location with glob syntax: null when it has none (a parameter expansion's braces are not syntax; the shell split also reads each default in its place), undefined when a brace or group spans a separator or an alternative of `..` or `~…` leaves the root (one a brace expansion builds included), else its literal root and one step per remaining segment ("*" any child directory, "?<glob>" a child the `*`/`?` glob names without regard to ASCII case, "**" any depth, ending the walk; anything else that child); a group or brace `literal` marks as quoted text is not syntax; mirrors `glob_walk_with`.
+function captureGlobWalk(location: string, literal: [boolean, boolean] = [false, false]): { root: string; steps: string[] } | null | undefined { const [parens, braces] = literal; const syntax = (segment: string) => /[*?\[]/.test(segment) || (!braces && segment.includes("{")) || (!parens && segment.includes("(")); if (location.includes("${") || !syntax(location)) return null; const parsed = captureNormalize(location); if (!parsed) return null; const p = parsed.path; let root: string; let tail: string; if (p.startsWith("//")) { const parts = p.slice(2).split("/"); root = `//${parts[0]}/${parts[1]}`; tail = parts.slice(2).join("/"); } else if (/^[A-Za-z]:\//.test(p)) { root = p.slice(0, 3); tail = p.slice(3); } else { root = "/"; tail = p.slice(1); } const segments = tail.split("/").filter(Boolean); const first = segments.findIndex(syntax); if (first < 0) return null; const steps: string[] = []; for (let index = first; index < segments.length; index++) { const segment = segments[index]; if (!syntax(segment)) { steps.push(segment); continue; } const count = (c: string) => segment.split(c).length - 1; const leaves = (text: string) => text.split(/[{},()|@!+]/).some((piece) => piece === ".." || piece.startsWith("~")); const alternatives = !braces && segment.includes("{") ? captureBraceAlternatives(segment) : []; if (leaves(segment) || (alternatives === undefined ? captureBraceOverflowLeaves(segment) : alternatives.some((alternative) => /[\/\\]/.test(alternative) || leaves(alternative) || (index < segments.length - 1 && captureCouldNameParent(alternative)))) || (!braces && count("{") !== count("}")) || (!parens && count("(") !== count(")"))) return undefined; if (segment.includes("**")) { steps.push("**"); break; } steps.push(/[\[{(]/.test(segment) ? "*" : `?${segment}`); } for (const segment of segments.slice(0, first)) root += `${root.endsWith("/") ? "" : "/"}${segment}`; return { root: parsed.windows ? root.replace(/\//g, "\\") : root, steps }; }
 // Every word a brace expansion makes of `text` (a comma list or an integer or single-character sequence, nested and repeated); any other `{…}` stays. Undefined past CAPTURE_MAX_BRACE_ALTERNATIVES; mirrors `brace_alternatives`.
 function captureBraceAlternatives(text: string): string[] | undefined { if (text.split("{").length - 1 > CAPTURE_MAX_BRACE_ALTERNATIVES) return undefined; const words: string[] = []; const sequence = (body: string): string[] | null | undefined => { const parts = body.split(".."); if (parts.length < 2 || parts.length > 3) return null; let step = 1; if (parts.length === 3) { if (!/^[+-]?\d+$/.test(parts[2])) return null; step = Math.max(Math.abs(Number(parts[2])), 1); } const integer = (part: string) => /^[+-]?\d+$/.test(part); let from: number; let to: number; let numeric: boolean; if (integer(parts[0]) && integer(parts[1])) { from = Number(parts[0]); to = Number(parts[1]); numeric = true; } else { const a = [...parts[0]]; const b = [...parts[1]]; if (a.length !== 1 || b.length !== 1) return null; from = a[0].codePointAt(0)!; to = b[0].codePointAt(0)!; numeric = false; } const count = Math.floor(Math.abs(to - from) / step) + 1; if (count > CAPTURE_MAX_BRACE_ALTERNATIVES) return undefined; const out: string[] = []; for (let i = 0, value = from; i < count; i++, value += from <= to ? step : -step) out.push(numeric ? String(value) : String.fromCodePoint(value)); return out; }; const expand = (chars: string[]): boolean => { for (let open = 0; open < chars.length; open++) { if (chars[open] !== "{") continue; let depth = 0; let close = -1; const commas: number[] = []; for (let i = open; i < chars.length; i++) { if (chars[i] === "{") depth++; else if (chars[i] === "}") { depth--; if (depth === 0) { close = i; break; } } else if (chars[i] === "," && depth === 1) commas.push(i); } if (close < 0) continue; let pieces: string[][]; if (!commas.length) { const words = sequence(chars.slice(open + 1, close).join("")); if (words === undefined) return false; if (words === null) continue; pieces = words.map((word) => [...word]); } else { pieces = []; let start = open + 1; for (const end of [...commas, close]) { pieces.push(chars.slice(start, end)); start = end + 1; } } for (const piece of pieces) if (!expand([...chars.slice(0, open), ...piece, ...chars.slice(close + 1)])) return false; return true; } if (words.length === CAPTURE_MAX_BRACE_ALTERNATIVES) return false; words.push(chars.join("")); return true; }; return expand([...text]) ? words : undefined; }
 // The bounds of a brace sequence body (`1..3`, `a..e`, `x..y..n`): first and last value and whether they are integers (else code points); undefined when it is not one. Mirrors `brace_sequence_bounds`.
@@ -590,8 +719,20 @@ type CaptureTool = ReturnType<typeof captureTool>;
 function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposition { if (config.state === "invalid" && (tool.family === "file" || tool.family === "search-list" || tool.shell || tool.reader)) return "metadata-only"; if (config.state !== "active") return "keep"; if (tool.reader) return "metadata-only"; if (tool.family === "search-list") return "drop"; if (tool.family === "file") { if (!tool.paths) return "metadata-only"; const parsed = tool.paths.map((p) => { const resolved = captureResolve(p, config.base, config.windowsHost); const normalized = resolved?.map((path) => captureNormalize(path, config.windowsHost)); return normalized?.every(Boolean) ? normalized as { path: string; windows: boolean }[] : undefined; }); if (parsed.some((p) => !p)) return "metadata-only"; const candidates = (parsed as { path: string; windows: boolean }[][]).flat(); const spoolBudget = { work: 0 }; if (tool.globs) { const match = captureMatchGlobs(tool.paths, config); if (match !== false) return match ? "drop" : "metadata-only"; for (const p of tool.paths) { const readings = captureAllReadings(captureResolve(p, config.base, config.windowsHost), config.windowsHost); if (!readings) continue; for (const candidate of readings) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; } return "keep"; } const budget = { work: 0 }; for (const raw of candidates) { const candidate = { path: captureFold(raw.path), windows: raw.windows }; for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows || captureFoldCase, budget)) return "drop"; const match = captureGlob(pattern.path, candidate.path, pattern.windows || captureFoldCase, budget); if (match === undefined) return "metadata-only"; if (match) return "drop"; } } for (const candidate of candidates) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; return "keep"; } if (tool.family === "non-file" && (tool.inline || (tool.command !== undefined && captureCommandOversized(tool.command)))) return "metadata-only"; if (tool.family === "non-file" && tool.command !== undefined) { const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); const matched = captureMatchCommand(split.words, config, tool.workdir); if (matched.match !== false) return "drop"; if (split.opaque || matched.spool || (config.windowsHost && tool.workdir !== undefined && captureWindowsUnplaceable(tool.workdir, config.base))) return "metadata-only"; } return "keep"; }
 const captureRank: Record<CaptureDisposition, number> = { keep: 0, "metadata-only": 1, drop: 2 };
 // Every other marker governing a path the call names (a file-tool target or the files an `apply_patch` names, a search/list directory, file or path-like glob argument, or a shell argument with a separator resolved from its workdir, plus that directory) inspects it too, so a checkout's `ignore_paths` hold for a call made from elsewhere. Lexical; each directory is looked up once and remembered for every lookup that passes it; a glob location is looked up from its literal root (before the walk, whose one listing may spend the time budget) and, when that root lies outside the event's own checkout, every directory it could pass through is checked for a marker of its own; a glob whose `..` follows a `**` is looked up in every reading. Locations outside the own checkout come first: there unreadable targets, glob syntax the walk cannot follow, and anything past the bounds are unprovable, while running out of budget inside the own checkout ends the lookup. Mirrors `capture_lookup_locations` and `foreign_capture_decision`.
-function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Set<string>(); let overflow = false; const add = (path: string, base: string): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; locations.add(location); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); for (const [word, tilde] of [...split.words, ...split.expanded]) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (/[\/\\]/.test(expanded)) add(expanded, base); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Map<string, [boolean, boolean]>(); let overflow = false; const add = (path: string, base: string, literal: [boolean, boolean] = [false, false]): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; const seen = locations.get(location); locations.set(location, seen ? [seen[0] && literal[0], seen[1] && literal[1]] : literal); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); const words: [string, boolean, [boolean, boolean]][] = [...split.words.map(([word, tilde]) => [word, tilde, split.literal.get(word) ?? [false, false]] as [string, boolean, [boolean, boolean]]), ...split.expanded.map(([word, tilde]) => [word, tilde, [false, false]] as [string, boolean, [boolean, boolean]])]; for (const [word, tilde, literal] of words) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); for (const [text, reading] of captureQuotedBraceReadings(expanded, literal)) if (/[\/\\]/.test(text)) add(text, base, reading); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations.keys()].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations.keys()].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location, locations.get(location)); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
+// Whether `key` is a file index key: non-empty, at most CAPTURE_FILE_PATH_MAX_CHARS, not rooted (`/`, `\` or a drive letter) and with no `..` segment; mirrors `valid_file_path_key`.
+function captureFileKey(key: string): boolean { return !!key && [...key].length <= CAPTURE_FILE_PATH_MAX_CHARS && !/^[\/\\]/.test(key) && !/^[A-Za-z]:/.test(key) && !key.split(/[\/\\]/).includes(".."); }
+// The nearest directory at or above `dir` holding `.git` (a worktree's `.git` file counts), the filesystem root included; mirrors `marker::checkout_root`.
+function captureCheckoutRoot(dir: string): string | undefined { for (let current = dir; ; current = dirname(current)) { if (captureExists(captureChild(current, ".git"))) return current; if (dirname(current) === current) return undefined; } }
+// A path's prefix (a Windows drive, `//server/share`, or a verbatim `\\?\` one), whether it is rooted, and its segments with `.` and `..` folded lexically, as Rust's `Path` reads it on that host: on Windows `\` and `/` both separate, except after a verbatim prefix, where only `\` does; elsewhere `\` is a filename character, which the policy's `captureNormalize` folds and the index must not.
+function captureFileParts(path: string, windowsHost: boolean): { prefix: string; rooted: boolean; segments: string[] } { const verbatim = windowsHost ? /^\\{2}\?\\(?:UNC\\[^\\]+\\[^\\]+|[A-Za-z]:(?=\\|$)|[^\\]+)/.exec(path) : null; const unc = windowsHost && !verbatim ? /^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)/.exec(path) : null; const drive = windowsHost && !verbatim && !unc ? /^[A-Za-z]:/.exec(path) : null; const prefix = verbatim ? (/^\\{2}\?\\[A-Za-z]:$/.test(verbatim[0]) ? verbatim[0].toUpperCase() : verbatim[0]) : unc ? `//${unc[1]}/${unc[2]}` : drive ? drive[0].toUpperCase() : ""; const rest = path.slice((verbatim ?? unc ?? drive)?.[0].length ?? 0); const rooted = !!verbatim || !!unc || (windowsHost ? /^[\\/]/ : /^\//).test(rest); return { prefix, rooted, segments: captureFoldSegments(rest.split(verbatim ? "\\" : windowsHost ? /[\\/]/ : "/"), rooted) }; }
+// Path segments with empty and `.` ones dropped and `..` folded, as `lexically_normalize` does: a `..` above the root is dropped, one leading a relative path is kept.
+function captureFoldSegments(parts: string[], rooted: boolean): string[] { const segments: string[] = []; for (const x of parts) { if (!x || x === ".") continue; if (x === ".." && segments.length && segments[segments.length - 1] !== "..") segments.pop(); else if (x !== ".." || !rooted) segments.push(x); } return segments; }
+// `target` read from the lexical cwd `base` the way `Path::join` reads it, component by component (a rooted target keeps only the base's drive or share, a drive-relative one replaces the base, and a relative one is appended, so its `/` separates even under a verbatim base), made relative to `checkout` and `/`-separated, or why it cannot be; mirrors the path steps of `file_path_field`. The Windows rules are std's: https://doc.rust-lang.org/std/path/struct.PathBuf.html#method.push and https://doc.rust-lang.org/std/path/enum.Prefix.html.
+function captureFileRelative(target: string, base: string, checkout: string, windowsHost: boolean): { path: string } | { skipped: string } { const own = captureFileParts(target, windowsHost); const from = captureFileParts(base, windowsHost); const joined = own.prefix ? own : { prefix: from.prefix, rooted: own.rooted || from.rooted, segments: own.rooted ? own.segments : captureFoldSegments([...from.segments, ...own.segments], from.rooted) }; const root = captureFileParts(checkout, windowsHost); if (joined.prefix !== root.prefix || joined.rooted !== root.rooted || root.segments.some((segment, index) => joined.segments[index] !== segment)) return { skipped: "outside_checkout" }; const key = joined.segments.slice(root.segments.length).join("/"); return captureFileKey(key) ? { path: key } : { skipped: "refused" }; }
+// The reserved `_ai_memory_file` field of a kept file-tool post (#1843): the one file the call names, relative to the checkout root of the lexical cwd, or why it has none; undefined when the call names no single file. An event without a cwd has no checkout to key the path to, so it is `no_checkout` rather than an absent field, which the server would count as an older client. The key is relative to the event's own checkout: these integrations do not reroute a tool event into the checkout an absolute target names, as the native `tool_location_routing_cwd` does, so such a target is `outside_checkout` here. Lexical like the policy, so a symlinked cwd is not resolved, and relative to the nearest `.git` rather than the marker, so two worktrees produce the same key. The path rules follow the OS the plugin runs on, as the native client's `Path` does, not the cwd's spelling (a POSIX `//home/u` is no share), and the base is the cwd as spelled, not the policy's Windows respelling (`\\?\C:\repo` stays verbatim); mirrors `file_path_field`.
+function captureFileField(tool: CaptureTool, cwd: string | undefined): { version: 1; path?: string; skipped?: string } | undefined { const targets = tool.paths ?? tool.patch; if (tool.family !== "file" || targets?.length !== 1 || tool.globs) return undefined; const base = cwd && resolve(cwd); const root = base ? captureCheckoutRoot(base) : undefined; return { version: 1, ...(root === undefined ? { skipped: "no_checkout" } : captureFileRelative(targets[0], base, root, typeof process !== "undefined" && process.platform === "win32")) }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined, event?: string): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } const file = event === "post-tool-use" && disposition === "keep" ? captureFileField(tool, cwd) : undefined; if (config.state === "inactive") return { disposition, payload: file ? { ...payload, _ai_memory_file: file } : payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol, ...(file ? { _ai_memory_file: file } : {}) } }; return { disposition, protocol, payload }; }
 "##;
     let names = |names: &[&str]| {
         let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
@@ -623,6 +764,10 @@ function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined
             "__AI_MEMORY_MAX_COMMAND_CHARS__",
             &capture_policy::MAX_SHELL_COMMAND_CHARS.to_string(),
         )
+        .replace(
+            "__AI_MEMORY_FILE_PATH_MAX_CHARS__",
+            &ai_memory_core::FILE_PATH_MAX_CHARS.to_string(),
+        )
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
@@ -648,7 +793,7 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -660,7 +805,7 @@ pub(crate) fn build_claude_code_payload(
             None,
             None,
         ),
-    )
+    ))
 }
 
 pub(crate) fn build_claude_code_payload_with_data_dir(
@@ -711,7 +856,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     capture_assistant: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -720,11 +865,24 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
             .with_capture_assistant(capture_assistant),
-    )
+    ))
+}
+
+fn with_claude_session_end_timeout(mut payload: Value) -> Value {
+    if let Some(handler) = payload
+        .pointer_mut("/hooks/SessionEnd/0/hooks/0")
+        .and_then(Value::as_object_mut)
+    {
+        handler.insert(
+            "timeout".into(),
+            Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS),
+        );
+    }
+    payload
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
-/// Grok shares Claude Code's JSON shape and event vocabulary, but uses
+/// Grok shares Claude Code's JSON shape (`GROK_EVENTS`), but uses
 /// its own script bundle so script fallback keeps `agent=grok` and never
 /// destructively fetches handoffs on SessionStart.
 #[must_use]
@@ -734,7 +892,7 @@ pub(crate) fn build_grok_payload(
     auth_token: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -744,6 +902,36 @@ pub(crate) fn build_grok_payload(
             "grok",
             None,
             None,
+        ),
+    )
+}
+
+/// DeepSeek Harness (DSH) hook payload: a Claude Code `hooks.json` document
+/// the official `@deepseek-ai/dsh-hooks-claude-code` bridge consumes via its
+/// `configPath` setting. Commands are rendered for the current platform
+/// (native `ai-memory hook --event … --agent dsh` commands by default, so
+/// capture gets the local spool and capture-policy v1 enforcement; script
+/// commands under an `AI_MEMORY_HOOK_PLATFORM` override). The payload only
+/// covers [`DSH_EVENTS`] — no `PreCompact` or `SessionEnd`.
+#[must_use]
+pub(crate) fn build_dsh_hooks_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DSH_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::current(),
+            "dsh",
+            data_dir,
+            project_strategy,
         ),
     )
 }
@@ -918,25 +1106,61 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// Hermes Agent tool events ai-memory hooks. Each pair is
 /// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
 ///
-/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// Verified against Hermes v0.22.2 (`agent/shell_hooks.py`): a configured
 /// `command` is split into argv by `shlex.split` and executed **without a
 /// shell**, with the event JSON on stdin — so the generated block invokes the
 /// native `hook` subcommand, the same shape Zero and ZCode use, and no
-/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
-/// payload carries `tool_name` / `tool_input`, the envelope the router already
-/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
-/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
-/// double-close a Hermes session.
-pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+/// `.sh`/`.ps1` bundle is staged. Hermes fires a shell hook for every event it
+/// defines, with one stdin envelope (`hook_event_name`, `tool_name`,
+/// `tool_input`, `session_id`, `cwd`, `extra`).
+pub(crate) const HERMES_TOOL_EVENTS: [(&str, &str); 2] = [
     ("pre_tool_call", "pre-tool-use"),
     ("post_tool_call", "post-tool-use"),
 ];
 
+/// Hermes session lifecycle events, mapped by meaning rather than name:
+///
+/// - `on_session_start` fires on a new session's first turn. Hermes ignores
+///   its stdout, so it only records the start; the handoff is never fetched
+///   there, because that fetch claims it.
+/// - `pre_llm_call` fires before every turn with the prompt in
+///   `extra.user_message`. Its `{"context": ...}` stdout carries any pending
+///   handoff into the turn, including after a native Hermes session resumes.
+/// - `on_session_end` fires at the end of **every turn**, not of the session,
+///   so it is a turn boundary (`stop`).
+/// - `on_session_finalize` is the real end: CLI exit, `/new`, gateway
+///   shutdown. A gateway session that expires idle is never finalized, which
+///   `ai-memory finalize-session --agent hermes` covers.
+///
+/// `post_llm_call` (assistant text) and `subagent_*` are not wired: assistant
+/// capture is native-only, and a delegated child is not a session of its own.
+pub(crate) const HERMES_LIFECYCLE_EVENTS: [(&str, &str); 4] = [
+    ("on_session_start", "session-start"),
+    ("pre_llm_call", "user-prompt-submit"),
+    ("on_session_end", "stop"),
+    ("on_session_finalize", "session-end"),
+];
+
+/// Which Hermes events the generated `hooks:` block wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HermesHookSet {
+    /// Tool and lifecycle events: ai-memory owns the whole Hermes session.
+    Full,
+    /// Tool events only. The community ai-memory memory-provider plugin
+    /// already posts prompts and session ends and claims the handoff, so a
+    /// second lifecycle path would capture each prompt twice and race it for
+    /// the handoff.
+    ToolsOnly,
+}
+
 /// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
-/// fire-and-forget, so this only bounds a hung `hook` invocation.
+/// fire-and-forget and the prompt-time handoff fetch has its own short
+/// timeout, so this only bounds a hung `hook` invocation. Hermes bounds a
+/// blocking hook's callback at 30 s by default, and `pre_llm_call` holds
+/// the turn while it runs, so the entry stays well under that.
 pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
 
 /// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
@@ -954,6 +1178,7 @@ pub(crate) fn build_hermes_hooks_yaml(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    hook_set: HermesHookSet,
 ) -> String {
     build_hermes_hooks_yaml_for_platform(
         server_url,
@@ -964,7 +1189,18 @@ pub(crate) fn build_hermes_hooks_yaml(
             data_dir,
             project_strategy,
         ),
+        hook_set,
     )
+}
+
+/// The events [`build_hermes_hooks_yaml`] wires for `hook_set`, tool events
+/// first.
+pub(crate) fn hermes_events(hook_set: HermesHookSet) -> Vec<(&'static str, &'static str)> {
+    let mut events = HERMES_TOOL_EVENTS.to_vec();
+    if hook_set == HermesHookSet::Full {
+        events.extend(HERMES_LIFECYCLE_EVENTS);
+    }
+    events
 }
 
 /// Platform-forced variant, so a test can pin POSIX/Windows instead of
@@ -973,9 +1209,10 @@ fn build_hermes_hooks_yaml_for_platform(
     server_url: &str,
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
+    hook_set: HermesHookSet,
 ) -> String {
     let mut out = String::from("hooks:\n");
-    for (hermes_event, our_event) in HERMES_EVENTS {
+    for (hermes_event, our_event) in hermes_events(hook_set) {
         // The native platforms derive the event token from the script stem, so
         // the synthetic filename carries the ai-memory event name.
         let command = hook_command(
@@ -1026,7 +1263,7 @@ pub(crate) fn build_grok_payload_with_data_dir(
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -1137,6 +1374,112 @@ pub(crate) fn build_muse_hooks_payload(
         }
     }
     payload
+}
+
+/// `{"hooks": <event map>}` for Tencent CodeBuddy Code (#1299). The `hooks`
+/// key of `~/.codebuddy/settings.json` holds Claude Code's nested shape
+/// (`"Event": [{"matcher": "", "hooks": [{"type": "command", "command": …}]}]`).
+/// CodeBuddy runs each `command` with the Claude Code-shaped event JSON on
+/// stdin, so every entry invokes the native `ai-memory hook` command; there
+/// is no script bundle, whatever `AI_MEMORY_HOOK_PLATFORM` asks for. An empty
+/// matcher fires on every tool and every SessionStart source.
+pub(crate) fn build_codebuddy_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &CODEBUDDY_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qoder's `~/.qoder/settings.json`.
+pub(crate) fn build_qoder_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QODER_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qoder",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for IBM Bob's
+/// `~/.bob/settings/settings.json`. Bob's outer event groups have the same
+/// nested shape as Claude Code, but `matcher` is valid only on tool events;
+/// omitting it matches every tool and keeps lifecycle entries schema-valid.
+/// Bob runs the command through the platform shell with the event JSON on
+/// stdin, so each entry invokes ai-memory's native hook command directly.
+pub(crate) fn build_ibm_bob_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &IBM_BOB_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::NestedWithoutMatcher,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "ibm-bob",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qwen Code's `~/.qwen/settings.json`. The
+/// `hooks` key holds Claude Code's nested shape (`"Event": [{"matcher": "",
+/// "hooks": [{"type": "command", "command": …}]}]`). Qwen runs each
+/// `command` with the Claude Code-shaped event JSON on stdin
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>),
+/// so every entry invokes the native `ai-memory hook` command; there is no
+/// script bundle. An empty matcher fires on every tool and every
+/// SessionStart source.
+pub(crate) fn build_qwen_code_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QWEN_CODE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qwen-code",
+            data_dir,
+            project_strategy,
+        ),
+    )
 }
 
 /// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for
@@ -1358,8 +1701,16 @@ pub(crate) const ANTIGRAVITY_TOOL_EVENTS: [(&str, &str); 2] = [
     ("PostToolUse", "post-tool-use.sh"),
 ];
 
-pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
-    [("PreInvocation", "session-start.sh"), ("Stop", "stop.sh")];
+/// `SessionStart` starts a conversation and delivers the handoff.
+/// `PreInvocation` fires before every model call; its invocation zero starts
+/// a user turn, where the native hook recovers the turn's prompts from the
+/// transcript, and stands in for `SessionStart` on builds that have none.
+/// `Stop` ends one execution loop; a finished, idle one is a turn checkpoint.
+pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 3] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreInvocation", "pre-invocation.sh"),
+    ("Stop", "stop.sh"),
+];
 
 /// Build the Antigravity CLI (`agy`) `hooks.json` payload.
 ///
@@ -1367,8 +1718,8 @@ pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
 /// maps hook-group names to their event configurations. Each group
 /// can contain any subset of the supported events. Tool events
 /// (`PreToolUse`, `PostToolUse`) use the nested shape with matcher;
-/// lifecycle events (`PreInvocation`, `Stop`) use a flat handler
-/// list where matcher is ignored.
+/// lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use a flat
+/// handler list where matcher is ignored.
 ///
 /// The output is `{ "ai-memory": { <events> } }`.
 pub(crate) fn build_antigravity_payload_with_data_dir(
@@ -1999,19 +2350,48 @@ fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
 /// binary. A missing file or a failed resolution falls back to
 /// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
 /// hook command.
+///
+/// A binary inside the Nix store also falls back to the bare command: the
+/// store path names one immutable package version, which `nix-collect-garbage`
+/// deletes after the next profile switch, while the profile's `bin/` on PATH
+/// keeps pointing at the current build.
+///
+/// A binary in a Scoop version directory (`apps\<app>\<version>\`) is
+/// embedded through the app's `current` junction when it exists: `scoop
+/// update` installs the next version beside it and `scoop cleanup` deletes
+/// the old one, while `current` follows the active version.
 fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    embedded_exe_with(raw, Path::is_file)
+}
+
+/// [`embedded_exe_from`] with the existence probe injected, so the store-path
+/// fallback is testable on hosts without a `/nix/store`.
+fn embedded_exe_with(raw: Option<PathBuf>, is_file: impl Fn(&Path) -> bool) -> PathBuf {
     let Some(exe) = raw else {
         return PathBuf::from(FALLBACK_HOOK_EXE);
     };
-    if exe.is_file() {
+    if is_nix_store_path(&exe) {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    }
+    if let Some(current) = crate::install_layout::scoop_current_links(&exe)
+        .into_iter()
+        .find(|link| is_file(link))
+    {
+        return current;
+    }
+    if is_file(&exe) {
         return exe;
     }
     let stripped = strip_deleted_suffix(exe);
-    if stripped.is_file() {
+    if is_file(&stripped) {
         stripped
     } else {
         PathBuf::from(FALLBACK_HOOK_EXE)
     }
+}
+
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
 }
 
 /// [`embedded_exe_from`] over this process's own executable.
@@ -2089,44 +2469,8 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
-            let event = script
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            // Antigravity's executor wraps the whole command in `cmd /c "…"`
-            // and does not strip inner quotes, so it needs the bare form
-            // (#611); every other Windows agent keeps the double-quoted form.
-            let bare = windows_hook_command_is_bare(context.agent);
-            let quote = if bare {
-                NativeQuote::WindowsBare
-            } else {
-                NativeQuote::Windows
-            };
-            let quote_field = |s: &str| {
-                if bare {
-                    s.to_string()
-                } else {
-                    win_double_quote(s)
-                }
-            };
-            let mut cmd = format!(
-                "{}{}{} hook --event {event} --agent {agent} --server-url {}",
-                powershell_call_operator(context.agent),
-                quote_field(&exe),
-                native_data_dir_arg(context.data_dir, quote),
-                quote_field(server_url),
-                agent = context.agent,
-            );
-            if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
-            }
-            cmd.push_str(&native_project_strategy_arg(
-                context.project_strategy,
-                quote,
-            ));
-            cmd.push_str(native_capture_assistant_arg(context, event));
-            cmd
+            let exe = hook_embedded_exe_path();
+            windows_native_hook_command_with_exe(&exe, script, server_url, auth_token, context)
         }
         HookCommandPlatform::PosixNative => {
             // Native POSIX (opt-in): invoke the binary directly so the hook
@@ -2164,6 +2508,53 @@ fn powershell_encoded_command(program: &str) -> String {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     base64::engine::general_purpose::STANDARD.encode(utf16_le)
+}
+
+fn windows_native_hook_command_with_exe(
+    exe: &Path,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let exe = exe.to_string_lossy();
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    // Antigravity's executor wraps the whole command in `cmd /c "…"` and
+    // does not strip inner quotes, so it needs the bare form (#611); every
+    // other Windows agent keeps the double-quoted form.
+    let bare = windows_hook_command_is_bare(context.agent);
+    let quote = if bare {
+        NativeQuote::WindowsBare
+    } else {
+        NativeQuote::Windows
+    };
+    let quote_field = |s: &str| {
+        if bare {
+            cmd_bare_escape(s)
+        } else {
+            win_double_quote(s)
+        }
+    };
+    let mut cmd = format!(
+        "{}{}{} hook --event {event} --agent {agent} --server-url {}",
+        powershell_call_operator(context.agent),
+        quote_field(&exe),
+        native_data_dir_arg(context.data_dir, quote),
+        quote_field(server_url),
+        agent = context.agent,
+    );
+    if let Some(t) = auth_token {
+        cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
+    }
+    cmd.push_str(&native_project_strategy_arg(
+        context.project_strategy,
+        quote,
+    ));
+    cmd.push_str(native_capture_assistant_arg(context, event));
+    cmd
 }
 
 fn windows_native_exec_spec(
@@ -2232,10 +2623,10 @@ enum NativeQuote {
     /// Windows, but with NO surrounding double quotes. Antigravity's hook
     /// executor runs the `command` string through `cmd /c "<string>"`, and
     /// cmd does not strip the inner quotes, so a quoted `"C:\…\ai-memory.exe"`
-    /// is reported as "not recognized" and crashes the session (#611). The
-    /// whole-string wrapping means a bare path is what actually runs; a path
-    /// with a space in it is a known residual limitation (as it was before
-    /// the native-hook rendering added quotes).
+    /// is reported as "not recognized" and crashes the session (#611).
+    /// Spaces and cmd metacharacters are caret-escaped per field instead
+    /// (#1767). A literal `"` is stripped so it cannot be written back into
+    /// the command. `%` is left unchanged: caret does not stop percent expansion.
     WindowsBare,
 }
 
@@ -2258,7 +2649,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     match quote {
         NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
         NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
-        NativeQuote::WindowsBare => format!(" --data-dir {path}"),
+        NativeQuote::WindowsBare => format!(" --data-dir {}", cmd_bare_escape(&path)),
     }
 }
 
@@ -2272,7 +2663,9 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     match quote {
         NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
         NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
-        NativeQuote::WindowsBare => format!(" --project-strategy {strategy}"),
+        NativeQuote::WindowsBare => {
+            format!(" --project-strategy {}", cmd_bare_escape(strategy))
+        }
     }
 }
 
@@ -2305,6 +2698,22 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+/// Quote one argument for the native shell used by copy-pasteable commands.
+pub(crate) fn native_shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        if s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '%' | '+' | '=' | ',')
+        }) {
+            s.to_owned()
+        } else {
+            powershell_quote(s)
+        }
+    } else {
+        shell_quote(s)
+    }
 }
 
 fn powershell_quote(s: &str) -> String {
@@ -2341,7 +2750,15 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Grok 1.0.41: every ai-memory hook failed with a ParserError in the
     // session's `hook_execution` updates, and its hooks guide documents the
     // PowerShell `$VAR` rewrite).
-    if matches!(agent, "codex" | "grok") {
+    // Copilot CLI selects the `command` fallback as its PowerShell command on
+    // Windows; without `&`, its quoted executable is only a string expression
+    // and every fail-closed PreToolUse hook denies the tool (#1462).
+    // Gemini CLI has run every hook command through PowerShell `-Command` on
+    // Windows since 0.23.0 (google-gemini/gemini-cli#15343: `HookRunner`
+    // spawns `getShellConfiguration()`). A command that fails to parse exits
+    // 1, which Gemini treats as a non-blocking error, so the session runs on
+    // and captures nothing (#1484).
+    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
         "& "
     } else {
         ""
@@ -2350,6 +2767,50 @@ fn powershell_call_operator(agent: &str) -> &'static str {
 
 fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
+}
+
+/// Escape one field for Antigravity's bare command (#1767).
+///
+/// The executor wraps the whole string in `cmd /c "…"` and does not strip
+/// inner quotes (#611), so this must not emit `"`. Escape only characters
+/// inside the field; the caller keeps the separating spaces bare.
+///
+/// Existing `^` is doubled first. `Felipe^ Leite` therefore becomes
+/// `Felipe^^^ Leite`: `^^` is a literal caret and `^ ` is a literal space.
+/// `Felipe^^ Leite` is one escape short and cmd still splits the token.
+fn cmd_bare_escape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    for c in field.chars() {
+        if c == '"' {
+            continue;
+        }
+        if c == '^' {
+            out.push_str("^^");
+            continue;
+        }
+        if matches!(c, ' ' | '\t' | '&' | '|' | '<' | '>' | '(' | ')') {
+            out.push('^');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[test]
+fn powershell_call_operator_is_limited_to_known_powershell_runners() {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+        assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
+    }
+
+    for agent in [
+        "claude-code",
+        "kiro-cli",
+        "opencode",
+        "qwen-code",
+        "antigravity-cli",
+    ] {
+        assert_eq!(powershell_call_operator(agent), "", "agent: {agent}");
+    }
 }
 
 /// #515: Codex evaluates its Windows hook command with PowerShell, where a
@@ -2384,6 +2845,141 @@ fn grok_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// Copilot CLI evaluates its Windows `command` fallback in PowerShell. A
+/// quoted executable therefore needs the call operator, including when its
+/// path and data directory contain spaces.
+#[test]
+fn copilot_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Copilot must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Copilot hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
+/// so a quoted executable needs the call operator, including when its path
+/// and data directory contain spaces.
+#[test]
+fn gemini_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Gemini must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+/// Runs the command the way Gemini CLI does: PowerShell `-Command`, with the
+/// exit-code check Gemini appends to every PowerShell hook command.
+#[cfg(windows)]
+#[test]
+fn gemini_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|session-start|--agent|gemini-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let mut command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    command.push_str("; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Gemini hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -2586,7 +3182,13 @@ async function drainHookSpool(): Promise<void> {
         "X-AI-Memory-Client": AGENT,
       };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
+      // `proxy: false` connects directly. Node's fetch ignores the key.
+      // A redirect is refused, not followed: a gateway's login page answers
+      // 200, and the entry would be deleted as delivered.
       const resp = await fetch(entry.url, {
+        proxy: false,
+        redirect: "error",
         method: "POST",
         headers,
         body: entry.body,
@@ -2716,6 +3318,21 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
                 || call.contains("        headers,\n"),
             "{name}: a fetch without the client marker:\n{call}"
         );
+        // Bun's fetch sends even a loopback request through an environment
+        // proxy, which a sandbox with an empty NO_PROXY (ai-jail) answers
+        // with a 4xx; the native hook and the shell bundle skip proxies too.
+        assert!(
+            call.contains("proxy: false,"),
+            "{name}: a fetch that can reach an environment proxy:\n{call}"
+        );
+        // A followed redirect lets a gateway's login page count as a
+        // delivery (deleting a spooled event) or arrive as the handoff, and a
+        // 307 or 308 replays the body to the redirect target. The native hook
+        // client refuses redirects for the same reasons (#1818).
+        assert!(
+            call.contains("redirect: \"error\","),
+            "{name}: a fetch that follows redirects:\n{call}"
+        );
     }
     assert!(
         requests >= 3,
@@ -2784,9 +3401,79 @@ mod tests {
         );
     }
 
+    fn rendered_exec_command(exe: &Path) -> String {
+        let spec = windows_native_exec_spec_with_exe(
+            exe,
+            Path::new("/hooks/post-tool-use.sh"),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            ),
+        );
+        let HookHandlerSpec::Exec { command, .. } = spec else {
+            panic!("expected exec spec")
+        };
+        command
+    }
+
+    /// The existence probe reports the store binary as present, so only the
+    /// store-path guard can produce the bare command: without it the hook
+    /// would name a path garbage collection later deletes.
+    #[test]
+    fn hook_rendered_from_a_nix_store_exe_names_the_bare_command() {
+        let store = PathBuf::from("/nix/store/abc123xyz-ai-memory-2.6.3/bin/ai-memory");
+        let exe = embedded_exe_with(Some(store.clone()), |_| true);
+        assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(rendered_exec_command(&exe), FALLBACK_HOOK_EXE);
+        let deleted = PathBuf::from(format!("{} (deleted)", store.display()));
+        assert_eq!(
+            embedded_exe_with(Some(deleted), |_| true),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_rendered_from_a_normal_exe_keeps_the_absolute_path() {
+        for normal in [
+            "/usr/bin/ai-memory",
+            "/home/dev/.nix-profile/bin/ai-memory",
+            "/opt/nix/store/bin/ai-memory",
+        ] {
+            let exe = embedded_exe_with(Some(PathBuf::from(normal)), |_| true);
+            assert_eq!(exe, PathBuf::from(normal));
+            assert_eq!(rendered_exec_command(&exe), normal);
+        }
+    }
+
+    #[test]
+    fn hook_rendered_from_a_scoop_version_dir_uses_the_current_link() {
+        let versioned = PathBuf::from("/Users/me/scoop/apps/ai-memory/3.4.0/ai-memory.exe");
+        let current = PathBuf::from("/Users/me/scoop/apps/ai-memory/current/ai-memory.exe");
+        assert_eq!(
+            embedded_exe_with(Some(versioned.clone()), |_| true),
+            current
+        );
+        assert_eq!(embedded_exe_with(Some(current.clone()), |_| true), current);
+        // Control: without a `current` link the version path is all there is.
+        assert_eq!(
+            embedded_exe_with(Some(versioned.clone()), |path| path == versioned),
+            versioned
+        );
+    }
+
     #[test]
     fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
         let exe = hook_embedded_exe_path();
+        // A test binary built inside a Nix sandbox runs from the store, where
+        // the resolver deliberately renders the bare command.
+        if std::env::current_exe().is_ok_and(|current| is_nix_store_path(&current)) {
+            assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
+            return;
+        }
         assert!(exe.is_file(), "{} should exist", exe.display());
         assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
     }
@@ -2867,7 +3554,7 @@ mod tests {
         let fixture = include_str!("../../../ai-memory-hooks/tests/fixtures/capture-policy.json");
         let fixture = serde_json::to_string(fixture).unwrap();
         let source = format!(
-            r#"import {{ closeSync, mkdirSync, opendirSync as realOpendirSync, openSync as realOpenSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from "node:fs";
+            r#"import {{ closeSync, mkdirSync, opendirSync as realOpendirSync, openSync as realOpenSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, symlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -3035,6 +3722,12 @@ for (const [payload, label] of [[bash("cat sub/**/../README.md"), "con-own-globs
 // Double-quoted scripts, POSIX classes, extglobs, brace-built dot-globs and oversized expansions that could leave reach checkout A's policy; an oversized expansion that cannot leave is kept (v2.6.3 kept it). Mirrors the additions to `constructed_parent_steps_answer_to_another_checkout`.
 for (const [command, label] of [["bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"", "con-dq-ansi"], ["eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"", "con-dq-eval"], ["cat .[[:punct:]]/a/secrets.env", "con-posix-class"], ["cat .@(.)/a/secrets.env", "con-extglob-at"], ["cat .?(.)/a/secrets.env", "con-extglob-optional"], ["cat .*(.)/a/secrets.env", "con-extglob-star"], ["cat .+(.)/a/secrets.env", "con-extglob-plus"], ["cat .{{*,x}}/a/secrets.env", "con-brace-dot-glob"], ["cat .{{-..~}}/a/secrets.env", "con-oversized-leaves"]]) check(capturePolicy(bash(command), conB).disposition !== "keep", label);
 for (const [command, label] of [["bash -c \"echo \\$HOME && cat ../a/README.md\"", "con-dq-own"], ["ls .[[:alpha:]]*", "con-posix-own"], ["cat .[[:alpha:]]x/README.md", "con-posix-own-directory"], ["touch test/file{{1..200}}.txt", "con-oversized"], ["mkdir -p build/{{1..100}}/out", "con-oversized-directory"], ["rm -f logs/app.{{1..99}}.log", "con-oversized-dotted"], ["cat data/{{a..h}}{{1..9}}.csv", "con-oversized-product"]]) check(capturePolicy(bash(command), conB).disposition === "keep", label);
+// A quoted `(` or `{{` next to a `/` is text, so with no marker anywhere the call is kept; an unquoted spanning brace still proves nothing, and quoted alternatives are followed into the checkout they name (a broken marker there makes it metadata-only). Mirrors `a_quoted_group_or_brace_next_to_a_separator_is_text` (#1977).
+const quoteWork = join(markerRoot, "quote-work"); const quotePlain = join(quoteWork, "plain"); const quoteA = join(quoteWork, "a");
+for (const dir of [quotePlain, join(quoteA, ".git")]) mkdirSync(dir, {{ recursive: true }});
+writeFileSync(join(quoteA, ".ai-memory.toml"), "[capture"); markerFixtures.set(quoteA, join(quoteA, ".ai-memory.toml"));
+for (const command of ["echo '(a/b)'", "echo 'a/(b'", "echo 'a/{{b'", "echo \"(a/b)\"", "echo a/\\(b", "awk '{{print $1/2}}' f.txt", "jq '(.a // \"x\")' f.json", "jq '{{a: .x, b: (.y/2)}}' f.json", "bash -c \"awk '{{print \\$1/2}}' f.txt\"", "rg -g '{{../plain/x,y}}' key"]) check(capturePolicy(bash(command), quotePlain).disposition === "keep", `quoted-text: ${{command}}`);
+for (const command of ["cat {{x/y,z}}", "cat x/{{y", "bash -c 'cat {{x/y,z}}'", "rg -g '{{../a/x,y}}' key"]) check(capturePolicy(bash(command), quotePlain).disposition === "metadata-only", `quoted-text-syntax: ${{command}}`);
 // A "**" above the checkout skips the own subtree; mirrors `a_globstar_above_the_checkout_skips_the_own_subtree`.
 check(captureMarkersBelow(join(markerRoot, "mono-work"), ["**"], mono, fastBudget())?.includes(join(monoA, ".ai-memory.toml")) === true, "globstar-skips-own-subtree");
 check(captureMarkersBelow(join(markerRoot, "mono-work"), ["**"], undefined, fastBudget()) === undefined, "globstar-own-subtree-exceeds-bound");
@@ -3091,6 +3784,8 @@ emit({{ tool: "edit", args: {{ path: privatePath, nested: {{ body: privateBody }
 const malformedRequest = requests.at(-1) ?? "";
 const malformedQueued = JSON.stringify(queue.at(-1));
 check(JSON.parse(malformedRequest)._ai_memory_capture?.policy_state === "invalid", "malformed-quote-invalid-protocol");
+const invalidSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, malformedQuoteCwd);
+check(invalidSearch.protocol?.policy_state === "invalid" && invalidSearch.protocol.extraction_state === "extracted", "invalid-search-extraction-parity");
 for (const forbidden of [privatePath, privateBody]) check(!malformedQueued.includes(forbidden) && !malformedRequest.includes(forbidden), "malformed-quote-redaction");
 emit({{ tool: "edit", args: {{ path: "C:relative", nested: {{ path: privatePath, body: privateBody }} }}, output: privateBody, error: privateBody, sessionID: "session-safe", cwd: "/cwd-safe", tool_call_id: "call-safe" }}, gatedCwd);
 const metadata = requests.at(-1) ?? "";
@@ -3105,6 +3800,8 @@ for (const forbidden of [privatePath, privatePattern, privateBody]) check(!metad
 const inactivePayload = {{ tool: "edit", args: {{ path: privatePath }}, output: privateBody }};
 const inactive = capturePolicy(inactivePayload, "/no-marker");
 check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
+const activeSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, gatedCwd);
+check(activeSearch.protocol?.policy_state === "active" && activeSearch.protocol.extraction_state === "not-applicable", "active-search-not-applicable");
 const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
 // Windows spellings of an ignored file, and the POSIX sessions they must not touch (shared vectors; mirrors `windows_spelling_fixture_vectors`).
@@ -3165,6 +3862,96 @@ writeFileSync(join(routedRoot, ".ai-memory.toml"), 'server = "team-b"\n');
 writeFileSync(join(routedChild, ".ai-memory.toml"), 'workspace = "child"\n');
 markerFixtures.set(routedChild, join(routedChild, ".ai-memory.toml"));
 check(capturePolicy(bash("echo hi"), routedChild).disposition === "drop", "server-routed-inherited-drops");
+// #1843: a kept file-tool post carries `_ai_memory_file`, the checkout-relative path or why there is none, under an inactive or an active policy; mirrors `post_tool_use_carries_the_file_field_or_its_skip_reason`.
+const fileRepo = join(markerRoot, "file-repo");
+mkdirSync(join(fileRepo, ".git"), {{ recursive: true }});
+mkdirSync(join(fileRepo, "crates"), {{ recursive: true }});
+const fileWorktree = join(markerRoot, "file-worktree");
+mkdirSync(fileWorktree, {{ recursive: true }});
+writeFileSync(join(fileWorktree, ".git"), "gitdir: /elsewhere/.git/worktrees/w\n");
+const filePlain = join(markerRoot, "file-plain");
+mkdirSync(filePlain, {{ recursive: true }});
+const fileLink = join(markerRoot, "file-link");
+symlinkSync(fileRepo, fileLink);
+const fileOf = (payload: Record<string, unknown>, cwd: string | undefined, event: string | undefined) => capturePolicy(payload, cwd, event).payload._ai_memory_file;
+const filePath = (path: string) => JSON.stringify({{ version: 1, path }});
+const fileSkip = (skipped: string) => JSON.stringify({{ version: 1, skipped }});
+const patch = (...headers: string[]) => ({{ tool: "apply_patch", args: {{ patchText: ["*** Begin Patch", ...headers, "*** End Patch"].join("\n") }} }});
+const post = "post-tool-use";
+for (const [payload, cwd, event, expected, label] of [
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, post, filePath("src/lib.rs"), "file-relative"],
+  [{{ tool: "read", args: {{ filePath: "../README.md" }} }}, join(fileRepo, "crates"), post, filePath("README.md"), "file-parent"],
+  [{{ tool: "edit", args: {{ filePath: join(fileRepo, "src", "a.rs") }} }}, fileRepo, post, filePath("src/a.rs"), "file-absolute"],
+  [{{ tool: "write", args: {{ filePath: "x.rs" }} }}, fileWorktree, post, filePath("x.rs"), "file-worktree"],
+  [{{ tool: "read", args: {{ filePath: "/etc/hosts" }} }}, fileRepo, post, fileSkip("outside_checkout"), "file-outside"],
+  [{{ tool: "read", args: {{ filePath: "a.rs" }} }}, filePlain, post, fileSkip("no_checkout"), "file-no-checkout"],
+  [{{ tool: "read", args: {{ filePath: "x".repeat(CAPTURE_FILE_PATH_MAX_CHARS + 1) }} }}, fileRepo, post, fileSkip("refused"), "file-over-long"],
+  [{{ tool: "read", args: {{ filePath: "x".repeat(CAPTURE_FILE_PATH_MAX_CHARS) }} }}, fileRepo, post, filePath("x".repeat(CAPTURE_FILE_PATH_MAX_CHARS)), "file-at-limit"],
+  // The bound counts characters, as `chars().count()` does, not UTF-16 units.
+  [{{ tool: "read", args: {{ filePath: "\u{{1F600}}".repeat(CAPTURE_FILE_PATH_MAX_CHARS) }} }}, fileRepo, post, filePath("\u{{1F600}}".repeat(CAPTURE_FILE_PATH_MAX_CHARS)), "file-at-limit-astral"],
+  [{{ tool: "read", args: {{ filePath: "." }} }}, fileRepo, post, fileSkip("refused"), "file-checkout-root"],
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, "pre-tool-use", undefined, "file-pre-tool-use"],
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, undefined, undefined, "file-no-event"],
+  // Even an absolute target gets no_checkout when the event has no cwd: there is no checkout to key it to.
+  [{{ tool: "read", args: {{ filePath: join(fileRepo, "src", "lib.rs") }} }}, undefined, post, fileSkip("no_checkout"), "file-no-cwd"],
+  [patch("*** Update File: one.rs"), fileRepo, post, filePath("one.rs"), "file-patch-one"],
+  [patch("*** Update File: a.rs", "*** Delete File: b.rs"), fileRepo, post, undefined, "file-patch-two"],
+  [patch("*** Update File: a.rs", "*** Move to: b.rs"), fileRepo, post, undefined, "file-patch-move"],
+  [{{ tool: "read_many_files", args: {{ include: ["src/lib.rs"] }} }}, fileRepo, post, undefined, "file-read-many-glob"],
+  [{{ tool: "read", args: {{ paths: ["a.rs", "b.rs"] }} }}, fileRepo, post, undefined, "file-two-paths"],
+  [bash("cat src/lib.rs"), fileRepo, post, undefined, "file-shell"],
+  [{{ tool: "read", args: {{ filePath: "sub/lib.rs" }} }}, fileLink, post, filePath("sub/lib.rs"), "file-symlinked-cwd"],
+  [{{ tool: "read", args: {{ filePath: join(fileRepo, "lib.rs") }} }}, fileLink, post, fileSkip("outside_checkout"), "file-symlink-target"],
+  // On a POSIX host `\` is a filename character, as for the native `Path`: never a separator, so `..\` is no parent.
+  [{{ tool: "read", args: {{ filePath: "a\\b.rs" }} }}, fileRepo, post, filePath("a\\b.rs"), "file-posix-backslash"],
+  [{{ tool: "read", args: {{ filePath: "..\\x.rs" }} }}, join(fileRepo, "crates"), post, fileSkip("refused"), "file-posix-backslash-parent"],
+  [{{ tool: "read", args: {{ filePath: "C:\\x" }} }}, fileRepo, post, fileSkip("refused"), "file-posix-drive"],
+  // A POSIX cwd spelled with a leading `//` is still POSIX for the index, as for the native client on that OS.
+  [{{ tool: "read", args: {{ filePath: "a\\b.rs" }} }}, `/${{fileRepo}}`, post, filePath("a\\b.rs"), "file-posix-double-slash-cwd"],
+] as [Record<string, unknown>, string | undefined, string | undefined, string | undefined, string][]) {{ const got = JSON.stringify(fileOf(payload, cwd, event)); check(got === expected, `${{label}}: ${{got}}`); }}
+// The path steps alone, so a Windows-flavoured cwd runs on any host: `Path::join` on Windows keeps only the base's drive or share for a rooted target and lets a drive-relative one replace the base.
+for (const [target, base, checkout, windowsHost, expected, label] of [
+  ["src\\a.rs", "C:/repo", "C:/repo", true, {{ path: "src/a.rs" }}, "win-relative"],
+  ["c:\\repo\\b.rs", "C:/repo", "C:/repo", true, {{ path: "b.rs" }}, "win-drive-case"],
+  ["/repo/x.rs", "C:/repo", "C:/repo", true, {{ path: "x.rs" }}, "win-rooted-inside"],
+  ["\\Windows\\win.ini", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-rooted-outside"],
+  ["C:x.rs", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-drive-relative"],
+  ["D:\\x.rs", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-other-drive"],
+  ["..\\..\\x.rs", "C:/repo/sub", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-parent-outside"],
+  ["..\\x.rs", "C:/repo/sub", "C:/repo", true, {{ path: "x.rs" }}, "win-parent-inside"],
+  ["\\\\srv\\share\\repo\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ path: "y.rs" }}, "win-unc"],
+  ["\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ skipped: "outside_checkout" }}, "win-unc-rooted"],
+  ["\\repo\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ path: "y.rs" }}, "win-unc-rooted-inside"],
+  // A verbatim cwd stays verbatim, as `Path` keeps it: its `\\?\C:` prefix is not the `C:` drive.
+  ["\\\\?\\C:\\repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim"],
+  ["C:\\repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-against-drive"],
+  // After a verbatim prefix `/` is part of a name, and `\\?\UNC\` is its own prefix.
+  ["\\\\?\\C:\\repo/sub/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-slash"],
+  ["\\\\?\\C:repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-inexact-drive"],
+  // A target joined onto a verbatim base is parsed on its own, as `PathBuf::push` does, so its `/` still separates.
+  ["src\\a.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "src/a.rs" }}, "win-verbatim-base-relative"],
+  ["sub/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "sub/x.rs" }}, "win-verbatim-base-relative-slash"],
+  ["/repo/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim-base-rooted"],
+  ["..\\x.rs", "\\\\?\\C:\\repo\\sub", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim-base-parent"],
+  ["\\\\?\\UNC\\srv\\share\\repo\\y.rs", "\\\\?\\UNC\\srv\\share\\repo", "\\\\?\\UNC\\srv\\share\\repo", true, {{ path: "y.rs" }}, "win-verbatim-unc"],
+  ["\\\\?\\UNC\\srv\\other\\repo\\y.rs", "\\\\?\\UNC\\srv\\share\\repo", "\\\\?\\UNC\\srv\\share\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-unc-other-share"],
+  ["x.rs", "/", "/", false, {{ path: "x.rs" }}, "posix-root-checkout"],
+  ["\\\\server\\share\\x", "/r", "/r", false, {{ skipped: "refused" }}, "posix-unc-spelling"],
+] as [string, string, string, boolean, Record<string, string>, string][]) {{ const got = JSON.stringify(captureFileRelative(target, base, checkout, windowsHost)); check(got === JSON.stringify(expected), `${{label}}: ${{got}}`); }}
+const fileInactivePayload = bash("cat src/lib.rs");
+check(capturePolicy(fileInactivePayload, fileRepo, post).payload === fileInactivePayload, "file-none-preserves-object");
+const fileActive = marker(active, join(markerRoot, "file-active"));
+mkdirSync(join(fileActive, ".git"), {{ recursive: true }});
+const fileKept = capturePolicy({{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileActive, post);
+check(fileKept.disposition === "keep" && fileKept.payload._ai_memory_capture?.policy_state === "active" && JSON.stringify(fileKept.payload._ai_memory_file) === filePath("src/lib.rs"), "file-active-keep");
+const fileDropped = capturePolicy({{ tool: "read", args: {{ filePath: "secret/key.pem" }} }}, fileActive, post);
+check(fileDropped.disposition === "drop" && fileDropped.payload._ai_memory_file === undefined, "file-ignored-drop");
+const fileMetadata = capturePolicy(patch("*** Update File: one.rs"), fileActive, post);
+check(fileMetadata.disposition === "metadata-only" && fileMetadata.payload._ai_memory_file === undefined, "file-active-patch-metadata-only");
+const fileInvalid = marker("[capture", join(markerRoot, "file-invalid"));
+mkdirSync(join(fileInvalid, ".git"), {{ recursive: true }});
+const fileInvalidResult = capturePolicy({{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileInvalid, post);
+check(fileInvalidResult.disposition === "metadata-only" && fileInvalidResult.payload._ai_memory_file === undefined, "file-invalid-metadata-only");
 "#,
             fixture = fixture,
             policy = ts_capture_policy_v1("denylist"),
@@ -3358,13 +4145,40 @@ if (inheritOnly) {
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
+        assert_eq!(
+            v.pointer("/hooks/SessionEnd/0/hooks/0/timeout"),
+            Some(&Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS))
+        );
+        assert!(
+            v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
+            "only the cancellation-prone SessionEnd budget is raised"
+        );
+        // The failure event shares the post-tool-use handler.
+        assert_eq!(
+            v.pointer("/hooks/PostToolUseFailure/0/hooks/0/command"),
+            v.pointer("/hooks/PostToolUse/0/hooks/0/command"),
+            "the failure event must reuse the post-tool-use handler"
+        );
+    }
+
+    /// Grok's vocabulary is unverified, so its payload keeps nine events.
+    #[test]
+    fn grok_payload_keeps_its_nine_events() {
+        let root = PathBuf::from("/host/hooks/grok");
+        let v = build_grok_payload(&root, "http://localhost:49374", None);
+        let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), GROK_EVENTS.len());
+        assert!(!hooks.contains_key("PostToolUseFailure"));
+        for (event, _) in GROK_EVENTS {
+            assert!(hooks.contains_key(event), "missing event {event}");
+        }
     }
 
     #[test]
     fn grok_native_payload_uses_grok_agent() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
@@ -3383,7 +4197,7 @@ if (inheritOnly) {
     fn grok_script_payload_uses_grok_bundle() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
@@ -3810,24 +4624,53 @@ if (inheritOnly) {
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
-    /// The public entry point must emit a complete `hooks:` map with both tool
-    /// events, whatever platform it renders for (the suite runs on Windows too).
+    /// The public entry point must emit a complete `hooks:` map, whatever
+    /// platform it renders for (the suite runs on Windows too): every tool and
+    /// lifecycle event in full, the tool events alone beside the plugin.
     #[test]
-    fn hermes_hooks_yaml_covers_both_tool_events() {
-        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
-        assert!(yaml.starts_with("hooks:\n"));
-        for (event, _) in HERMES_EVENTS {
-            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
-            assert!(
-                yaml.contains("    - command: '"),
-                "command must be a single-quoted YAML scalar"
+    fn hermes_hooks_yaml_wires_the_full_lifecycle_or_the_tool_events_only() {
+        let full = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::Full,
+        );
+        let tools = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::ToolsOnly,
+        );
+        for (yaml, events) in [
+            (&full, hermes_events(HermesHookSet::Full)),
+            (&tools, hermes_events(HermesHookSet::ToolsOnly)),
+        ] {
+            assert!(yaml.starts_with("hooks:\n"));
+            for (event, _) in &events {
+                assert!(yaml.contains(&format!("\n  {event}:\n")), "missing {event}");
+            }
+            assert_eq!(yaml.matches("    - command: '").count(), events.len());
+            assert_eq!(
+                yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                    .count(),
+                events.len()
             );
         }
+        assert_eq!(hermes_events(HermesHookSet::Full).len(), 6);
         assert_eq!(
-            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
-                .count(),
-            HERMES_EVENTS.len()
+            hermes_events(HermesHookSet::ToolsOnly),
+            HERMES_TOOL_EVENTS.to_vec()
         );
+        for (event, our_event) in HERMES_LIFECYCLE_EVENTS {
+            assert!(!tools.contains(event), "{event} must stay with the plugin");
+            assert!(!tools.contains(&format!("--event {our_event} ")));
+        }
+        // Assistant text is native-only, and subagents are not sessions.
+        for unwired in ["post_llm_call", "subagent_start", "subagent_stop"] {
+            assert!(!full.contains(unwired), "{unwired}");
+        }
     }
 
     /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
@@ -3844,8 +4687,9 @@ if (inheritOnly) {
                 Some(Path::new("/data")),
                 Some("repo-root"),
             ),
+            HermesHookSet::Full,
         );
-        for (_, our_event) in HERMES_EVENTS {
+        for (_, our_event) in hermes_events(HermesHookSet::Full) {
             assert!(
                 yaml.contains(&format!("hook --event {our_event} --agent hermes")),
                 "missing the native command for {our_event}"
@@ -4092,6 +4936,191 @@ if (inheritOnly) {
             other_cmd.contains('"'),
             "non-antigravity Windows agents keep their double quotes: {other_cmd}"
         );
+        assert!(
+            !other_cmd.contains("^ "),
+            "quoted agents must not caret-escape spaces: {other_cmd}"
+        );
+    }
+
+    #[test]
+    fn cmd_bare_escape_escapes_fields_without_emitting_quotes() {
+        assert_eq!(cmd_bare_escape(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(cmd_bare_escape("Felipe Leite"), "Felipe^ Leite");
+        // `^^` is a literal caret and `^ ` is a literal space. Two carets
+        // leave the space unescaped, which cmd still splits.
+        assert_eq!(cmd_bare_escape("Felipe^ Leite"), "Felipe^^^ Leite");
+        assert_eq!(cmd_bare_escape("Felipe (Work)"), "Felipe^ ^(Work^)");
+        assert_eq!(cmd_bare_escape("a&b|c<d>e"), "a^&b^|c^<d^>e");
+        assert!(!cmd_bare_escape("ai\"memory").contains('"'));
+    }
+
+    #[test]
+    fn antigravity_bare_command_caret_escapes_spaced_fields() {
+        let cmd = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com?a=1&b=2",
+            Some("tok en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+                Some("repo root"),
+            ),
+        );
+        assert!(!cmd.contains('"'), "must not reopen #611: {cmd}");
+        assert!(
+            cmd.contains(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(cmd.contains(" --auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains(" --project-strategy repo^ root"), "{cmd}");
+        assert!(cmd.contains("https://memory.example.com?a=1^&b=2"), "{cmd}");
+        assert!(
+            cmd.contains(" hook --event pre-tool-use --agent antigravity-cli"),
+            "separator spaces must stay bare: {cmd}"
+        );
+        assert!(
+            !cmd.contains("^ --"),
+            "do not escape separator spaces: {cmd}"
+        );
+        assert!(
+            !cmd.starts_with('&'),
+            "antigravity must not gain a call operator: {cmd}"
+        );
+
+        let metacharacters = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe (Work)\AppData")),
+                None,
+            ),
+        );
+        assert!(!metacharacters.contains('"'), "{metacharacters}");
+        assert!(
+            metacharacters.contains(r"C:\Users\Felipe^^^ Leite\.local\bin\ai-memory.exe"),
+            "existing caret must be doubled before the space escape: {metacharacters}"
+        );
+        assert!(
+            metacharacters.contains(r"--data-dir C:\Users\Felipe^ ^(Work^)\AppData"),
+            "parentheses must be escaped on the rendered command: {metacharacters}"
+        );
+
+        let quoted_field = windows_native_hook_command_with_exe(
+            Path::new("C:\\Users\\me\\ai\"memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            Some("tok\"en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new("C:\\Users\\me\\App\"Data")),
+                Some("repo\"root"),
+            ),
+        );
+        assert!(
+            !quoted_field.contains('"'),
+            "a quote in a field must not be written back: {quoted_field}"
+        );
+    }
+
+    #[test]
+    fn antigravity_pre_tool_use_escapes_spaces_and_other_agents_keep_quotes() {
+        let ag = build_antigravity_payload_for_platform(
+            Path::new(r"C:\hooks"),
+            "https://memory.example.com",
+            Some("tok en"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+            Some("repo root"),
+        );
+        let cmd = ag
+            .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("PreToolUse command");
+        assert!(!cmd.contains('"'), "{cmd}");
+        assert!(!cmd.starts_with('&'), "{cmd}");
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("hook --event pre-tool-use --agent antigravity-cli"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("--auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains("--project-strategy repo^ root"), "{cmd}");
+
+        for agent in ["grok", "gemini-cli"] {
+            let other = build_antigravity_payload_for_platform(
+                Path::new(r"C:\hooks"),
+                "https://memory.example.com",
+                None,
+                HookCommandPlatform::WindowsNative,
+                agent,
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData")),
+                None,
+            );
+            let other_cmd = other
+                .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+                .and_then(|v| v.as_str())
+                .expect(agent);
+            assert!(
+                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
+            );
+            assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");
+            if agent == "gemini-cli" {
+                assert!(
+                    other_cmd.starts_with("& "),
+                    "gemini call operator must be the command prefix: {other_cmd}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn antigravity_bare_escape_runs_under_cmd_outer_quotes() {
+        let root = std::env::temp_dir().join(format!("ai-memory-1767-{}", std::process::id()));
+        let dir = root.join("Felipe Leite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("where.exe");
+        std::fs::copy(r"C:\Windows\System32\where.exe", &dest).unwrap();
+        let escaped = cmd_bare_escape(&dest.to_string_lossy());
+        let command = format!("{escaped} where");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let quoted = format!("\"{}\" where", dest.display());
+        let rejected = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &quoted])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            !rejected.status.success() && stderr.contains('"'),
+            "inner quotes must still be rejected: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4111,6 +5140,66 @@ if (inheritOnly) {
             let command = definition["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("--agent command-code"), "{command}");
         }
+    }
+
+    #[test]
+    fn qwen_code_profile_uses_nested_native_commands() {
+        let value = build_qwen_code_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        for (event, script) in QWEN_CODE_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert_eq!(definition["matcher"], "", "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent qwen-code")),
+                "{event}: {command}"
+            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
+            assert!(!command.contains(".sh"), "{command}");
+        }
+    }
+
+    #[test]
+    fn ibm_bob_profile_uses_common_events_without_matchers() {
+        let value = build_ibm_bob_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 5);
+        for (event, script) in IBM_BOB_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert!(definition.get("matcher").is_none(), "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent ibm-bob")),
+                "{event}: {command}"
+            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
+            assert!(!command.contains(".sh"), "{command}");
+        }
+        assert!(value["hooks"].get("SessionEnd").is_none());
+        assert!(value["hooks"].get("PreCompact").is_none());
     }
 
     #[test]
@@ -4384,12 +5473,56 @@ $payload = [Console]::In.ReadToEnd()
             "Stop must record a stop observation, not synthesize session-end handoffs: {stop_cmd}"
         );
 
-        // All expected events present
-        for expected in ["PreToolUse", "PostToolUse", "PreInvocation", "Stop"] {
-            assert!(
-                group.contains_key(expected),
-                "missing Antigravity event {expected}"
-            );
+        // All expected events present, each lifecycle event on its own
+        // script: SessionStart starts the conversation, PreInvocation marks
+        // a turn (and stands in for SessionStart on builds without it).
+        assert_eq!(
+            group.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "PreToolUse",
+                "PostToolUse",
+                "SessionStart",
+                "PreInvocation",
+                "Stop"
+            ]
+        );
+        for (event, script) in [
+            ("SessionStart", "session-start.sh"),
+            ("PreInvocation", "pre-invocation.sh"),
+        ] {
+            let cmd = group[event][0]["command"].as_str().unwrap();
+            // The script path's separator and quoting follow the platform
+            // (`'...\session-start.sh'` on Windows), so compare the file name.
+            let file = cmd
+                .trim_end_matches(['\'', '"'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap();
+            assert_eq!(file, script, "{event}: {cmd}");
+        }
+    }
+
+    /// The native command's event token is the script stem, so the native
+    /// hook tells SessionStart and PreInvocation apart by their tokens.
+    #[test]
+    fn antigravity_native_commands_carry_distinct_start_tokens() {
+        let v = build_antigravity_payload_for_platform(
+            Path::new("/host/hooks/antigravity-cli"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::PosixNative,
+            "antigravity-cli",
+            None,
+            None,
+        );
+        for (event, token) in [
+            ("SessionStart", "--event session-start "),
+            ("PreInvocation", "--event pre-invocation "),
+            ("Stop", "--event stop "),
+        ] {
+            let cmd = v["ai-memory"][event][0]["command"].as_str().unwrap();
+            assert!(cmd.contains(token), "{event}: {cmd}");
+            assert!(cmd.contains("--agent antigravity-cli"), "{event}: {cmd}");
         }
     }
 

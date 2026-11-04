@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # install.sh refusals, run against crafted release tarballs in a temp dir:
 # a symlink or hard-link member is refused before anything is unpacked, a
-# plain release installs, and the wget fallback pins https for the default
-# GitHub base (refusing a wget that cannot). Needs no network.
+# plain release installs, the wget fallback pins https for the default
+# GitHub base (refusing a wget that cannot), a binary that does not run is
+# refused from beside the install directory, and a noexec TMPDIR does not
+# refuse a working release. Needs no network and no root.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -59,6 +61,15 @@ plain_tree "${TMP_ROOT}/plain-tree"
 base="$(publish plain "${TMP_ROOT}/plain-tree")"
 run_install plain "file://${base}" || fail "plain release refused: $(cat "${TMP_ROOT}/plain/out.log")"
 [ -x "${TMP_ROOT}/plain/home/.local/lib/ai-memory/ai-memory" ] || fail "plain release not unpacked"
+# The test PATH lacks ~/.local/bin, so the next step names the link by its full
+# path; with the bin dir on PATH it is the bare command.
+grep -Fq "next: ${TMP_ROOT}/plain/home/.local/bin/ai-memory setup" "${TMP_ROOT}/plain/out.log" \
+  || fail "off-PATH next step not absolute: $(cat "${TMP_ROOT}/plain/out.log")"
+base_on_path="$(publish on-path "${TMP_ROOT}/plain-tree")"
+run_install on-path "file://${base_on_path}" PATH="${TMP_ROOT}/on-path/home/.local/bin:${PATH}" \
+  || fail "on-PATH install refused: $(cat "${TMP_ROOT}/on-path/out.log")"
+grep -Fxq "next: ai-memory setup" <(sed 's/^[^:]*: //' "${TMP_ROOT}/on-path/out.log") \
+  || fail "on-PATH next step not the bare command: $(cat "${TMP_ROOT}/on-path/out.log")"
 
 # A symlink member pointing outside the tree is refused, and nothing lands.
 plain_tree "${TMP_ROOT}/symlink-tree"
@@ -131,6 +142,58 @@ run_install wget-mirror "http://mirror.invalid/releases" \
   || fail "mirror wget install failed: $(cat "${TMP_ROOT}/wget-mirror/out.log")"
 if grep -Fq -- "--https-only" "${TMP_ROOT}/wget-mirror/wget.log"; then
   fail "an explicit mirror base must not force --https-only"
+fi
+
+# A work directory that refuses to execute, as /tmp does on a hardened host
+# that mounts it noexec, must not reject a release that runs from its install
+# location. Such a directory is borrowed rather than mounted: /run/lock is a
+# world-writable noexec tmpfs on Debian and Ubuntu, and a probe script that
+# fails to run from a candidate proves the refusal. Skipped where no candidate
+# refuses (macOS, other layouts), so the case needs neither root nor a user
+# namespace.
+noexec_dir() {
+  local candidate probe
+  for candidate in /run/lock /dev/shm "${XDG_RUNTIME_DIR:-}"; do
+    [ -n "${candidate}" ] && [ -d "${candidate}" ] && [ -w "${candidate}" ] || continue
+    probe="$(mktemp "${candidate}/ai-memory-noexec.XXXXXX" 2>/dev/null)" || continue
+    printf '#!/bin/sh\nexit 0\n' >"${probe}"
+    chmod 0755 "${probe}"
+    if "${probe}" 2>/dev/null; then
+      rm -f "${probe}"
+      continue
+    fi
+    rm -f "${probe}"
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  return 1
+}
+if noexec="$(noexec_dir)"; then
+  plain_tree "${TMP_ROOT}/noexec-tree"
+  base="$(publish noexec "${TMP_ROOT}/noexec-tree")"
+  run_install noexec "file://${base}" TMPDIR="${noexec}" \
+    || fail "install from a noexec TMPDIR (${noexec}) refused: $(cat "${TMP_ROOT}/noexec/out.log")"
+  [ -x "${TMP_ROOT}/noexec/home/.local/lib/ai-memory/ai-memory" ] \
+    || fail "install from a noexec TMPDIR unpacked nothing: $(cat "${TMP_ROOT}/noexec/out.log")"
+  printf 'noexec TMPDIR case ran in %s\n' "${noexec}"
+else
+  printf 'noexec TMPDIR case skipped: no writable directory refuses to execute files\n'
+fi
+
+# Control: a release whose binary does not run is still refused, by the smoke
+# test run from beside the install directory, and its staged copy is removed.
+plain_tree "${TMP_ROOT}/broken-tree"
+printf '#!/bin/sh\nexit 1\n' >"${TMP_ROOT}/broken-tree/ai-memory"
+base="$(publish broken "${TMP_ROOT}/broken-tree")"
+if run_install broken "file://${base}"; then
+  fail "a release whose binary does not run was installed"
+fi
+grep -Fq "does not run from ${TMP_ROOT}/broken/home/.local/lib on this machine" \
+  "${TMP_ROOT}/broken/out.log" \
+  || fail "broken binary refusal not explained: $(cat "${TMP_ROOT}/broken/out.log")"
+[ ! -e "${TMP_ROOT}/broken/home/.local/lib/ai-memory" ] || fail "a refused release was installed"
+if ls -d "${TMP_ROOT}/broken/home/.local/lib/ai-memory.new."* >/dev/null 2>&1; then
+  fail "a refused release left its staged copy behind"
 fi
 
 printf 'install.sh checks passed\n'

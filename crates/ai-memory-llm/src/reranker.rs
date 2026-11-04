@@ -23,9 +23,9 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::error::LlmResult;
-use crate::provider::{LlmProvider, complete_structured};
+use crate::provider::{LlmProvider, complete_structured_with_operation_id};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatMessage, ChatRequest, Role};
+use crate::types::{ChatMessage, ChatRequest, LlmOperationId, LlmWorkload, Role};
 
 /// One candidate handed to a reranker.
 #[derive(Debug, Clone)]
@@ -203,7 +203,12 @@ impl Reranker for LlmReranker {
             max_tokens: 4_000,
             temperature: Some(0.0),
         };
-        let response: LlmRerankResponse = complete_structured(&*self.provider, request).await?;
+        let response: LlmRerankResponse = complete_structured_with_operation_id(
+            &*self.provider,
+            request,
+            LlmOperationId::for_workload(LlmWorkload::Rerank),
+        )
+        .await?;
         Ok(map_judgements(&response.scores, candidates))
     }
 }
@@ -232,6 +237,7 @@ pub const RERANK_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct RerankStage {
     reranker: Arc<dyn Reranker>,
     gate: Arc<Semaphore>,
+    timeout: Duration,
 }
 
 impl RerankStage {
@@ -241,7 +247,25 @@ impl RerankStage {
         Self {
             reranker,
             gate: Arc::new(Semaphore::new(RERANK_MAX_IN_FLIGHT)),
+            timeout: RERANK_TIMEOUT,
         }
+    }
+
+    /// Replace the per-call wall-clock budget ([`RERANK_TIMEOUT`] by
+    /// default). Free-tier hosted providers can spend most of the default
+    /// budget on a single slow 503 before a fallback candidate answers.
+    ///
+    /// Example: `RerankStage::new(reranker).with_timeout(Duration::from_secs(60))`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The per-call wall-clock budget every search surface applies.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The wrapped reranker.
@@ -599,6 +623,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingProvider {
         request: std::sync::Mutex<Option<ChatRequest>>,
+        operation_id: std::sync::Mutex<Option<LlmOperationId>>,
     }
 
     #[async_trait]
@@ -634,6 +659,16 @@ mod tests {
                     .collect::<Vec<_>>()
             }))
         }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            *self.operation_id.lock().unwrap() = Some(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
     }
 
     #[tokio::test]
@@ -663,6 +698,10 @@ mod tests {
         assert_eq!(input["candidates"][0]["candidate"], 1);
         assert_eq!(input["candidates"][0]["title"], candidates[0].title);
         assert_eq!(input["candidates"][0]["text"], candidates[0].snippet);
+        assert_eq!(
+            provider.operation_id.lock().unwrap().unwrap().workload(),
+            LlmWorkload::Rerank
+        );
     }
 
     #[tokio::test]

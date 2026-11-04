@@ -12,13 +12,133 @@ use uuid::Uuid;
 /// operations of the same session (or a crash-resumed or re-claimed run)
 /// must not look like one operation on the provider side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LlmOperationId(Uuid);
+pub struct LlmOperationId {
+    id: Uuid,
+    workload: LlmWorkload,
+}
+
+/// Closed workload labels for passive LLM telemetry.
+///
+/// These closed labels select provider routes and prevent prompts, project
+/// names, or other caller-controlled text from becoming metric keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum LlmWorkload {
+    /// A caller used the provider API without assigning a workload.
+    #[default]
+    Unspecified,
+    /// Session-to-page consolidation.
+    Consolidation,
+    /// Post-retrieval relevance reranking.
+    Rerank,
+    /// Reviewed auto-improvement proposal generation.
+    AutoImprove,
+    /// Existing-project bootstrap extraction.
+    Bootstrap,
+    /// Opt-in query answer or project briefing synthesis.
+    QueryAnswer,
+    /// LLM-assisted wiki lint.
+    Lint,
+    /// Profile classification or extraction.
+    Profile,
+    /// Cross-session dream merge.
+    Dream,
+    /// Cross-trajectory experience abstraction.
+    Experience,
+}
+
+impl LlmWorkload {
+    /// Every workload in stable wire order.
+    pub const ALL: [Self; 10] = [
+        Self::Unspecified,
+        Self::Consolidation,
+        Self::Rerank,
+        Self::AutoImprove,
+        Self::Bootstrap,
+        Self::QueryAnswer,
+        Self::Lint,
+        Self::Profile,
+        Self::Dream,
+        Self::Experience,
+    ];
+
+    /// Parse one of the supported snake-case task configuration keys.
+    #[must_use]
+    pub fn from_config_key(key: &str) -> Option<Self> {
+        match key {
+            "consolidation" => Some(Self::Consolidation),
+            "rerank" => Some(Self::Rerank),
+            "auto_improve" => Some(Self::AutoImprove),
+            "bootstrap" => Some(Self::Bootstrap),
+            "query_answer" => Some(Self::QueryAnswer),
+            "lint" => Some(Self::Lint),
+            "profile" => Some(Self::Profile),
+            "dream" => Some(Self::Dream),
+            "experience" => Some(Self::Experience),
+            _ => None,
+        }
+    }
+
+    /// Stable snake-case configuration key, including the unspecified label.
+    #[must_use]
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Consolidation => "consolidation",
+            Self::Rerank => "rerank",
+            Self::AutoImprove => "auto_improve",
+            Self::Bootstrap => "bootstrap",
+            Self::QueryAnswer => "query_answer",
+            Self::Lint => "lint",
+            Self::Profile => "profile",
+            Self::Dream => "dream",
+            Self::Experience => "experience",
+        }
+    }
+
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Consolidation => "consolidation",
+            Self::Rerank => "rerank",
+            Self::AutoImprove => "auto-improve",
+            Self::Bootstrap => "bootstrap",
+            Self::QueryAnswer => "query-answer",
+            Self::Lint => "lint",
+            Self::Profile => "profile",
+            Self::Dream => "dream",
+            Self::Experience => "experience",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
 
 impl LlmOperationId {
     /// Generate a fresh time-ordered operation identifier.
     #[must_use]
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self::for_workload(LlmWorkload::Unspecified)
+    }
+
+    /// Generate an operation identifier carrying a passive workload label.
+    #[must_use]
+    pub fn for_workload(workload: LlmWorkload) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            workload,
+        }
+    }
+
+    /// Workload assigned by the call site.
+    #[must_use]
+    pub const fn workload(self) -> LlmWorkload {
+        self.workload
     }
 }
 
@@ -30,7 +150,7 @@ impl Default for LlmOperationId {
 
 impl std::fmt::Display for LlmOperationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.id.fmt(f)
     }
 }
 
@@ -405,7 +525,7 @@ fn split_entry(entry: &str, position: usize) -> crate::error::LlmResult<(&str, &
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtraHeaders, ReasoningEffort};
+    use super::{ExtraHeaders, LlmOperationId, LlmWorkload, ReasoningEffort};
     use rstest::rstest;
 
     const ALL_EFFORTS: [ReasoningEffort; 9] = [
@@ -419,6 +539,38 @@ mod tests {
         ReasoningEffort::Ultra,
         ReasoningEffort::Persistent,
     ];
+
+    #[test]
+    fn workload_labels_are_stable_and_do_not_change_the_wire_operation_id() {
+        for workload in LlmWorkload::ALL {
+            let value = serde_json::to_value(workload).unwrap();
+            assert_eq!(value, serde_json::json!(workload.as_str()));
+            assert_eq!(
+                serde_json::from_value::<LlmWorkload>(value).unwrap(),
+                workload
+            );
+            let wire_id = LlmOperationId::for_workload(workload).to_string();
+            assert_eq!(wire_id.len(), 36);
+            assert_eq!(
+                uuid::Uuid::parse_str(&wire_id).unwrap().get_version_num(),
+                7
+            );
+            assert!(!wire_id.contains(workload.as_str()));
+        }
+    }
+
+    #[test]
+    fn task_config_keys_are_exact_and_reversible() {
+        for workload in LlmWorkload::ALL {
+            let expected = (workload != LlmWorkload::Unspecified).then_some(workload);
+            assert_eq!(
+                LlmWorkload::from_config_key(workload.config_key()),
+                expected
+            );
+        }
+        assert_eq!(LlmWorkload::from_config_key("auto-improve"), None);
+        assert_eq!(LlmWorkload::from_config_key("Query_Answer"), None);
+    }
 
     #[test]
     fn reasoning_effort_roundtrips() {

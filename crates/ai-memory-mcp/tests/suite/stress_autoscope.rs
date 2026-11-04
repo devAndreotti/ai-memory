@@ -95,7 +95,7 @@ impl Harness {
         // Seed N distinct projects, each with a unique marker page so MCP
         // reads can verify they resolved into the right active_project.
         //
-        // The FTS5 tokenizer is `unicode61 ... tokenchars '/_-'`, so
+        // The FTS5 tokenizer is `unicode61 ... tokenchars '_-'`, so
         // `_` is part of a token (NOT a separator). A body like
         // "PROJ_1_BODY" tokenizes as a single token and a `PROJ` query
         // misses it. Use space-separated words instead: a shared word
@@ -140,7 +140,7 @@ impl Harness {
             move || Ok(server.clone()),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true),
         );
 
@@ -161,6 +161,7 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: ai_memory_hooks::IngestGates::default(),
+            cwd_probes: ai_memory_hooks::CwdProbes::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             profile_notify: None,
@@ -171,12 +172,15 @@ impl Harness {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
+            skip_wiki_checkpoints: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
             )),
             home_dir: None,
             trusted_proxy_identity: false,
+            index_file_paths: false,
         });
 
         let router = Router::new()
@@ -683,11 +687,17 @@ async fn burst_above_max_entries_does_not_corrupt() {
         h.await.expect("burst hook join");
     }
 
-    // Settle: every spawned process_envelope must drain.
-    for _ in 0..50 {
+    // The hook response is deliberately fire-and-forget: 202 can arrive before
+    // any spawned `process_envelope` publishes the shared fallback. Poll the
+    // invariant this test later relies on instead of racing a fixed sleep on
+    // slower Windows runners.
+    for _ in 0..200 {
+        if h.active_project.get().is_some() {
+            break;
+        }
         tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Now BURST_SIZE parallel reads. Every read must return a JSON-RPC
     // 200 — no panic, no 500. The CONTENT may be any of the projects

@@ -26,7 +26,7 @@ use crate::client::{ApiClient, ApiPage};
 use crate::mcp::{self, McpClient, Precondition, PreconditionFailed, Scope};
 use crate::page_file::{self, PageMeta};
 use crate::state::{self, PageState, SyncState};
-use crate::sync::{self, Mode, RunArgs};
+use crate::sync::{self, Mode, RunArgs, write_if_unchanged};
 use crate::{MAX_BODY_BYTES, MAX_PAGES, paths};
 
 /// Server frontmatter keys a `memory_write_page` import writes back, or
@@ -324,8 +324,12 @@ pub async fn run(args: &SyncArgs, mode: SyncMode) -> Result<Outcome> {
         Mode::DryRun
     };
     let dest_root = sync::resolve_dest(&run_args.dest, fs_mode)?;
+    let _write_lock = (mode == SyncMode::Apply)
+        .then(|| state::acquire_write_lock(&dest_root))
+        .transpose()?;
     let stateless_check = mode == SyncMode::Check && !state::state_path(&dest_root).exists();
-    let old_state = state::load(&dest_root)?;
+    let scope = state::SyncScope::of(&run_args.server, &run_args.workspace, &run_args.project);
+    let old_state = sync::baseline_for(state::load(&dest_root)?, &scope, run_args.adopt_scope)?;
     let api = ApiClient::new(&run_args.server, run_args.token.clone())?;
 
     let plan = build_plan(
@@ -464,9 +468,15 @@ async fn build_plan(
         let mut etag = None;
         let mut rendered = None;
         if on_server.contains(&path) {
-            let hint = disk
-                .as_ref()
-                .and(base.and_then(|base| base.etag.as_deref()));
+            // An edited file needs metadata and a version id from the same
+            // read we classify. Following a 304 with a full read could pick
+            // up a concurrent edit and import over it without a conflict.
+            let hint = base
+                .filter(|base| {
+                    disk.as_ref()
+                        .is_some_and(|disk| state::sha256_hex(disk) == base.hash)
+                })
+                .and_then(|base| base.etag.as_deref());
             let read = api
                 .read_page(&run_args.workspace, &run_args.project, &path, hint)
                 .await?;
@@ -662,6 +672,21 @@ fn local_pages(
                 });
                 continue;
             }
+            if meta.is_file() {
+                // A bare top-level page is its own family, which the server
+                // side already honours through `family_of`; without this the
+                // repository side of such a family is always empty.
+                if rel.ends_with(".md") {
+                    match paths::validate_page_path(&rel) {
+                        Ok(()) => found.push(rel),
+                        Err(error) => refused.push(Refusal {
+                            path: rel,
+                            reason: format!("cannot import: {error:#}"),
+                        }),
+                    }
+                }
+                continue;
+            }
             if !meta.is_dir() {
                 continue;
             }
@@ -715,6 +740,11 @@ async fn apply_plan(
     plan: Plan,
 ) -> Result<Applied> {
     let mut new_state = old_state.clone();
+    new_state.scope = Some(state::SyncScope::of(
+        &args.server,
+        &args.workspace,
+        &args.project,
+    ));
     new_state.pages.extend(plan.adopted);
     for path in &plan.forget {
         new_state.pages.remove(path);
@@ -782,13 +812,13 @@ async fn apply_plan(
         );
     }
     for delete in &plan.server_deletes {
-        let result = match &delete.expected_page_id {
-            Some(expected) => mcp.delete_page(&scope, &delete.path, expected).await,
-            None => Err(anyhow::anyhow!(mcp::server_too_old())),
-        };
-        match result {
-            Ok(()) => {
+        match delete_server_page(mcp, &scope, dest_root, delete).await {
+            Ok(true) => {
                 new_state.pages.remove(&delete.path);
+            }
+            Ok(false) => {
+                report_local_change(&delete.path);
+                applied.raced.push(delete.path.clone());
             }
             Err(error) if error.is::<PreconditionFailed>() => {
                 report_race(&delete.path, &error);
@@ -833,29 +863,37 @@ fn report_local_change(path: &str) {
     );
 }
 
-/// Write `bytes` over a repository file only while it is still the file the
-/// plan classified: `expected` is that file's hash, or `None` when there was
-/// no file. Returns `false`, writing nothing, when an edit landed after the
-/// plan (the check and the rename are as close together as `delete_file`'s).
-fn write_if_unchanged(
-    dest_root: &Path,
-    rel: &str,
-    expected: Option<&str>,
-    bytes: &[u8],
-) -> Result<bool> {
-    let current = sync::read_disk(dest_root, rel)?;
-    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
-        return Ok(false);
-    }
-    sync::atomic_write(dest_root, rel, bytes)?;
-    Ok(true)
-}
-
 fn report_race(path: &str, error: &anyhow::Error) {
     println!(
         "  {:<9} {path} — {error}; left for the next sync",
         "CHANGED"
     );
+}
+
+/// A planned server deletion depends on the repository file still being
+/// absent. Recheck immediately before the request, without reading a recreated
+/// file's content; the server separately guards its own version.
+async fn delete_server_page(
+    mcp: &McpClient,
+    scope: &Scope<'_>,
+    dest_root: &Path,
+    delete: &ServerDelete,
+) -> Result<bool> {
+    let target = paths::secure_join(dest_root, &delete.path)?;
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .context(format!("cannot inspect {}", target.display()));
+        }
+    }
+    let expected = delete
+        .expected_page_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!(mcp::server_too_old()))?;
+    mcp.delete_page(scope, &delete.path, expected).await?;
+    Ok(true)
 }
 
 /// Delete one repository file through the same confinement as every write:
@@ -1091,6 +1129,47 @@ mod tests {
         assert_eq!(fs::read(root.join("_rules/a.md")).unwrap(), b"server");
         assert!(write_if_unchanged(&root, "_rules/b.md", None, b"server").unwrap());
         assert_eq!(fs::read(root.join("_rules/b.md")).unwrap(), b"server");
+    }
+
+    #[test]
+    fn local_pages_finds_a_top_level_page_family() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        sync::atomic_write(&root, "README.md", b"---\n---\nbody").unwrap();
+        sync::atomic_write(&root, "decisions/0001-a.md", b"---\n---\nbody").unwrap();
+        fs::write(root.join("notes.txt"), b"not a page").unwrap();
+
+        let mut refused = Vec::new();
+        let refusals = |refused: &[Refusal]| {
+            refused
+                .iter()
+                .map(|refusal| refusal.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let found = local_pages(&root, &["README.md".to_string()], &mut refused).unwrap();
+        assert_eq!(found, vec!["README.md".to_string()]);
+        assert!(refused.is_empty(), "{:?}", refusals(&refused));
+
+        // Controls: a directory family still walks, a non-`.md` top-level
+        // file is not a page, and an unnamed family contributes nothing.
+        let found = local_pages(&root, &["decisions".to_string()], &mut refused).unwrap();
+        assert_eq!(found, vec!["decisions/0001-a.md".to_string()]);
+        let found = local_pages(&root, &["notes.txt".to_string()], &mut refused).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        let found = local_pages(&root, &["absent.md".to_string()], &mut refused).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert!(refused.is_empty(), "{:?}", refusals(&refused));
+
+        // Such a page, absent from the server and from state, is an import.
+        assert_eq!(
+            decide(
+                Some(b"---\n---\nbody"),
+                None,
+                ServerSide::Absent,
+                Policy::default()
+            ),
+            Action::Import { create: true }
+        );
     }
 
     #[test]

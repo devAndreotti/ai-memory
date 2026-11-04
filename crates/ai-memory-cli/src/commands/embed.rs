@@ -17,6 +17,25 @@ struct EmbedRequest {
     all_projects: bool,
 }
 
+/// Turn a live-mode `/admin/embed` report into an exit status.
+///
+/// The server answers 200 even when pages failed so the operator can
+/// read the counts out of the body; the exit code must carry that
+/// signal too, or a run in which every page failed still reads as
+/// success to a script. Absent fields count as zero, so a partial or
+/// older report with no `failed` key cannot fail the command.
+fn check_report(report: &serde_json::Value) -> Result<()> {
+    let embedded = report["embedded"].as_u64().unwrap_or(0);
+    let failed = report["failed"].as_u64().unwrap_or(0);
+    let skipped = report["skipped"].as_u64().unwrap_or(0);
+    if failed == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{failed} page(s) failed to embed ({embedded} embedded, {skipped} skipped); run `ai-memory embed` again to retry them"
+    )
+}
+
 /// Run the `embed` subcommand.
 ///
 /// Sends the request to the server over HTTP and prints the JSON
@@ -25,8 +44,10 @@ struct EmbedRequest {
 ///
 /// # Errors
 /// Returns an error if the server is unreachable or returns a non-2xx
-/// response.
+/// response, or (live mode only) if the report shows pages that failed
+/// to embed — the full report is still printed to stdout first.
 pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     // Model migrations must reach stale rows in every project namespace.
     // Without an explicit `--project`, `--force` / `--reembed` fans out
@@ -63,9 +84,20 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     if args.dry_run {
         let would = report["would_embed"].as_u64().unwrap_or(0);
         let skipped = report["skipped"].as_u64().unwrap_or(0);
-        println!("dry-run: would embed {would} page(s), {skipped} already up-to-date");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-embed-dry-run-would-embed-would-page-s-skipped-already-up-to-date",
+                &[
+                    ("value0", format!("{}", would)),
+                    ("value1", format!("{}", skipped))
+                ]
+            )
+        );
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
+        // Live mode: the report is on stdout, the exit code must agree.
+        check_report(&report)?;
     }
     Ok(())
 }
@@ -75,6 +107,35 @@ mod tests {
     use crate::cli::{Cli, Command};
     use crate::config::{Config, RuntimeEnv};
     use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn check_report_accepts_a_clean_live_report() {
+        let report = json!({ "embedded": 7, "failed": 0, "skipped": 2 });
+        super::check_report(&report).expect("failed == 0 must succeed");
+    }
+
+    #[test]
+    fn check_report_fails_with_the_counts_when_pages_failed() {
+        let report = json!({ "embedded": 3, "failed": 2, "skipped": 1 });
+        let err = super::check_report(&report).expect_err("failed > 0 must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("2 page(s) failed to embed"), "message: {msg}");
+        assert!(msg.contains("3 embedded"), "message: {msg}");
+        assert!(msg.contains("1 skipped"), "message: {msg}");
+        assert!(
+            msg.contains("run `ai-memory embed` again"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_report_treats_absent_fields_as_zero() {
+        let empty = json!({});
+        super::check_report(&empty).expect("absent failed must count as 0");
+        let embedded_only = json!({ "embedded": 4, "skipped": 1 });
+        super::check_report(&embedded_only).expect("a report without a failed key must succeed");
+    }
 
     #[test]
     fn force_without_project_enables_all_projects() {

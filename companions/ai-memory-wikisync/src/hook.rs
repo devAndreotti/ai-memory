@@ -12,12 +12,11 @@
 //! `AI_MEMORY_AUTH_TOKEN` from the environment like any other run.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{paths, sync};
+use crate::{atomic, paths, sync};
 
 pub const BEGIN_MARKER: &str = "# >>> ai-memory-wikisync >>>";
 pub const END_MARKER: &str = "# <<< ai-memory-wikisync <<<";
@@ -189,11 +188,17 @@ fn hooks_path_config(git: &GitDirs) -> Result<Option<PathBuf>> {
 fn sets_hooks_path(config: &str) -> bool {
     let mut in_core = false;
     for line in config.lines() {
-        let line = line.trim();
+        let mut line = line.trim();
         if let Some(section) = line.strip_prefix('[') {
             let name = section.split([']', ' ', '"']).next().unwrap_or_default();
             in_core = name.eq_ignore_ascii_case("core");
-            continue;
+            // Git reads what follows a section header on the same physical
+            // line as settings of that section, so `[core] hooksPath = x`
+            // must be examined rather than skipped with the header.
+            match line.split_once(']') {
+                Some((_, rest)) if !rest.trim().is_empty() => line = rest.trim(),
+                _ => continue,
+            }
         }
         let key = line.split(['=', ' ', '\t']).next().unwrap_or_default();
         if in_core && key.eq_ignore_ascii_case("hookspath") {
@@ -313,37 +318,14 @@ fn merge_hook(existing: Option<&str>, block: &str, append: bool) -> Result<Strin
     Ok(format!("{text}{separator}{block}"))
 }
 
-/// Replace the hook atomically (tmp + fsync + rename) with mode 0755.
+/// Replace the hook atomically (unpredictable tmp + fsync + rename) with
+/// mode 0755. The staging name is unpredictable and exclusively created
+/// (GHSA-jr85-7366-xrm2), so a symlink planted in the hooks directory is
+/// neither followed nor raced.
 fn write_hook(hook: &Path, text: &str) -> Result<()> {
     let dir = hook.parent().context("hook path has no directory")?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let tmp = dir.join(".post-merge.wikisync-tmp");
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e))
-                .context(format!("cannot clear stale {}", tmp.display()));
-        }
-    }
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("cannot create {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("cannot make {} executable", tmp.display()))?;
-        }
-        file.write_all(text.as_bytes())
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, hook).with_context(|| format!("cannot move {} into place", tmp.display()))
+    atomic::write_atomic(hook, text.as_bytes(), atomic::KeepMode::Exact(0o755))
 }
 
 /// Entry point behind `install-hook`.
@@ -467,11 +449,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
+            text.contains(&format!(
                 "( command -v ai-memory-wikisync >/dev/null && ai-memory-wikisync sync \
-                 --workspace 'demo' --project 'app' --dest 'docs/wiki' --include 'decisions' ) \
-                 || true"
-            ),
+                 --workspace 'demo' --project 'app' --dest '{}' --include 'decisions' ) \
+                 || true",
+                Path::new("docs").join("wiki").display()
+            )),
             "{text}"
         );
         for flag in [
@@ -601,6 +584,24 @@ mod tests {
     }
 
     #[test]
+    fn hooks_path_on_a_section_header_line_is_refused() {
+        assert!(sets_hooks_path("[core] hooksPath = .githooks\n"));
+        assert!(sets_hooks_path("[Core] HooksPath=.githooks\n"));
+        // The remainder belongs to the section just opened, not to whatever
+        // section preceded it, and a bare header still sets nothing.
+        assert!(!sets_hooks_path("[core]\n[hooks] hookspath = x\n"));
+        assert!(!sets_hooks_path("[core]\n\tbare = false\n"));
+
+        let (_tmp, root) = repo();
+        fs::write(root.join(".git/config"), "[core] hooksPath = .githooks\n").unwrap();
+        let err = install(&install_args(&root.join("docs/wiki")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("core.hooksPath"), "{err}");
+        assert!(!hook_of(&root).exists());
+    }
+
+    #[test]
     fn a_worktree_installs_into_the_shared_hooks_dir() {
         let (_tmp, root) = repo();
         let wt_gitdir = root.join(".git/worktrees/feature");
@@ -616,7 +617,13 @@ mod tests {
 
         install(&install_args(&worktree.join("docs/wiki"))).unwrap();
         let text = fs::read_to_string(hook_of(&root)).unwrap();
-        assert!(text.contains("--dest 'docs/wiki'"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "--dest '{}'",
+                Path::new("docs").join("wiki").display()
+            )),
+            "{text}"
+        );
 
         // A worktree config can set hooksPath too.
         fs::write(wt_gitdir.join("config.worktree"), "[core]\nhooksPath = x\n").unwrap();
@@ -638,6 +645,40 @@ mod tests {
         let err = install(&args).unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "#!/bin/sh\n");
+    }
+
+    /// GHSA-jr85-7366-xrm2: `write_hook` staged at
+    /// `.post-merge.wikisync-tmp` — predictable, cleared with
+    /// remove-then-create, so a re-planted symlink won the race and was
+    /// created through. The staging name is unpredictable and exclusively
+    /// created now: the canary keeps its bytes, the hook is still installed,
+    /// and the plant is never even removed. With the old code this fails on
+    /// the plant assertion: the remove-then-create dance deleted it.
+    #[cfg(unix)]
+    #[test]
+    fn write_hook_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let (tmp, root) = repo();
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "#!/bin/sh\nuntouched\n").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".git/hooks/.post-merge.wikisync-tmp"))
+            .unwrap();
+
+        install(&install_args(&root.join("docs/wiki"))).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "#!/bin/sh\nuntouched\n",
+            "the planted symlink was followed"
+        );
+        let hook = fs::read_to_string(hook_of(&root)).unwrap();
+        assert!(hook.contains(BEGIN_MARKER), "{hook}");
+        assert!(
+            fs::symlink_metadata(root.join(".git/hooks/.post-merge.wikisync-tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the predictable staging name was touched"
+        );
     }
 
     #[test]

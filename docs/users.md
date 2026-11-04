@@ -71,6 +71,10 @@ Human password login is **not** a bearer rung. A browser session cookie never
 authenticates `/mcp`, `/hook`, `/handoff`, or `/workstream/*`, and a password
 never authenticates as `Authorization: Bearer`.
 
+The optional [management console](management-ui.md) exposes existing user
+administration and adds authorized self-service session deletion and personal
+API-key management in the browser.
+
 ## Human login (password + web session)
 
 The console signs in with username and password. The engine issues an
@@ -133,10 +137,13 @@ root_subject = "<root-subject>"
   root bearer is absent.
 - Only set it when the server is reachable *only* through that proxy.
 - `secure_cookie` is independent of proxy identity. Human auth requires it on
-  every non-loopback listener; ai-memory treats it as the explicit signal that
-  a trusted reverse proxy terminates HTTPS for `/web` and never trusts
-  forwarded protocol headers to infer that fact. Direct HTTP browsers will not
-  send a Secure cookie.
+  every non-loopback listener by default; ai-memory treats it as the explicit
+  signal that a trusted reverse proxy terminates HTTPS for `/web` and never
+  trusts forwarded protocol headers to infer that fact. Direct HTTP browsers
+  will not send a Secure cookie. `serve --allow-insecure-human-auth` (or
+  `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) is the explicit, dangerous
+  exception for a private LAN whose operator accepts that passwords,
+  credentials, cookies, and memory data travel unencrypted.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
   appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`).
@@ -221,6 +228,13 @@ to, and consumed by, the next session to start, whoever it belongs to.
   descending and then agent name. An unknown scope returns 404 without creating
   it. Like every `/admin/*` route, this endpoint is root-only when the
   deployment distinguishes operators.
+- The web session views (a project's Sessions, Agents and Token usage tabs,
+  each agent's page and each session's page) and the read-only
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` and
+  `.../sessions/{id}/observations` routes follow the same rule for a user:
+  their own sessions plus the shared ones, and another operator's session
+  reads as not found. The root operator sees every operator's sessions there,
+  matching the dashboard's counts, which already include everyone.
 - The read-only handoff listing (`GET
   /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
   fields (`summary`, `open_questions`, `next_steps`) to a caller the server
@@ -415,8 +429,15 @@ passwords and sessions do not use it.
 sessions can operate without a machine-root bearer; native API-key lookup
 still requires the original pepper. If `api_credentials` contains rows and
 the pepper is missing or blank, `serve` refuses startup before applying
-human bootstrap. Restore the original pepper from configuration backup
-rather than deleting identities or keys.
+human bootstrap. Current databases also keep an Argon2id verifier and refuse
+a different pepper instead of starting with keys that can only return 401.
+Restore the original pepper from a separately protected configuration backup
+rather than deleting identities or keys: `ai-memory backup` includes only a
+`config.toml` inside the data dir, while packaged systemd units load one from
+outside it. A restore of a snapshot created before the verifier existed fails
+closed when keys are present. Load the original pepper and explicitly confirm
+it with `ai-memory restore --accept-legacy-api-key-pepper`; the staged database
+is sealed before it replaces live data.
 
 ### 2. Add another human
 
@@ -507,12 +528,17 @@ the data dir, both `0600` (the data dir itself is `0700`):
 
 | file | read by |
 |---|---|
-| `<data_dir>/auth-token` | the native `ai-memory hook` command |
+| `<data_dir>/auth-token` | the native `ai-memory hook` command, and `ai-memory mcp-bridge` when no bearer is configured (ahead of a discovered loopback root token) |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`install-mcp --apply --auth-token …` writes the same pair for a Claude Code
+(`--session-aware`) or Muse bridge entry and leaves the key out of that entry,
+unless a different key is already stored there or the hooks sign in with OIDC.
+
 `ai-memory uninstall` deletes both files when it removes the hooks (a full
-uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
-skills` keep them for the hooks still installed.
+uninstall, or `--only hooks` while no Claude Code or Muse bridge entry
+remains); `--only mcp`, `--only instructions` and `--only skills` keep them for
+the hooks still installed.
 
 It is deliberately **not** written into the agent's own config any more. Before
 #552 it went onto the hook's command line (`--auth-token <token>` for native
@@ -545,6 +571,12 @@ just failed.
 Until you re-run `install-hooks`, the hooks still hold the old token and there
 is nothing newer to retry with, so those events stay queued and age out on the
 normal retry budget rather than blocking the rest of the spool (#493).
+
+The same re-run rotates the MCP bridge's key when the bridge reads the stored
+file, which is the case for an entry written without a key. An entry that still
+carries the old key in `AI_MEMORY_AUTH_TOKEN` (written by the print path, or by
+`install-mcp` before the key moved to the data dir) keeps sending it: re-run
+`install-mcp --apply` without `--auth-token` to drop it.
 
 ## Running for a team
 
@@ -618,7 +650,7 @@ finds. To populate `token_pepper` without losing your current
 config:
 
 1. **Back up the existing config** (`cp config.toml config.toml.bak`).
-2. **Generate a pepper**: `ai-memory generate-auth-token 32`. This
+2. **Generate a pepper**: `ai-memory generate-auth-token --bytes 32`. This
    prints a hex string of the same shape `init` would have
    generated.
 3. **Add the `[auth]` block** to your `config.toml`:
@@ -708,6 +740,11 @@ operator honest, not to enforce.
 Without `--as-user`, hooks install the same way they always have:
 the bearer authenticates and attribution flows from the token's owner
 (root user or DB user) at write time.
+
+The MCP side needs no second copy of the key. `ai-memory install-mcp
+--client claude-code --session-aware --apply` on the same data dir writes a
+bridge entry without a key, and the bridge sends the key the hooks hold, so
+MCP calls and captured events attribute to the same user.
 
 ## Per-project access
 
@@ -803,3 +840,21 @@ ones who should keep access; nothing is granted automatically.
   authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.
+- **Self-issued keys outlive a password reset or a disable.** A key a user
+  issued through the self-service routes is an ordinary native key. Resetting
+  that user's password or disabling the account ends their browser sessions
+  but leaves every key they issued active; revoke those keys separately
+  (`ai-memory api-key revoke`, or the self-service revoke route while the user
+  can still sign in).
+
+### Opt-in browser surfaces
+
+Two HTTP surfaces reuse the browser sign-in and are off unless `serve` is
+started with their runtime flag. Both need `--transport http`; machine bearers
+and sessions that still owe a password change are refused, and every mutation
+needs the CSRF cookie/header pair.
+
+| Flag | Environment variable | What it serves |
+|---|---|---|
+| `--enable-session-management` | `AI_MEMORY_ENABLE_SESSION_MANAGEMENT=true` | Session inspection and purging of sessions the user owns. See [session-management.md](session-management.md). |
+| `--enable-self-service-keys` | `AI_MEMORY_ENABLE_SELF_SERVICE_KEYS=true` | Each user issues, lists and revokes their own `aim_` keys, up to 20 active keys, labels of 1 to 128 characters. See [self-service-keys.md](self-service-keys.md). |

@@ -37,6 +37,46 @@ use serde::{Deserialize, Serialize};
 use crate::error::WikiError;
 use crate::{Markdown, WikiResult};
 
+/// Why a `reject`-policy webhook stopped [`AdmissionChain::run`]. It travels
+/// as the source of the returned `WikiError::Io`, whose message is this
+/// one's, so callers that only log or display the error see no change.
+#[derive(Debug)]
+pub(crate) struct AdmissionFailure {
+    /// The webhook could not give a verdict (transport error, timeout, 5xx),
+    /// as opposed to answering with a refusal.
+    unavailable: bool,
+    message: String,
+}
+
+impl std::fmt::Display for AdmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdmissionFailure {}
+
+impl AdmissionFailure {
+    fn into_error(unavailable: bool, message: String) -> WikiError {
+        WikiError::Io(std::io::Error::other(Self {
+            unavailable,
+            message,
+        }))
+    }
+}
+
+/// `true` when `err` came from [`AdmissionChain::run`] because a webhook was
+/// unreachable, timed out or answered 5xx, rather than refusing the page.
+pub(crate) fn is_admission_unavailable(err: &WikiError) -> bool {
+    match err {
+        WikiError::Io(io) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<AdmissionFailure>())
+            .is_some_and(|failure| failure.unavailable),
+        _ => false,
+    }
+}
+
 /// Lifecycle operation that triggered the chain. Webhooks subscribe via
 /// [`WebhookConfig::events`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -52,6 +92,13 @@ pub enum AdmissionOp {
     /// A single page is being deleted (`Wiki::delete_page`). Carries the
     /// page path; no body. Lets a mirror `git rm` the file.
     Delete,
+    /// A hook event ledger file (`log-YYYY-MM.md`) is being deleted by the
+    /// opt-in ledger retention pass of the forget sweep
+    /// (`Wiki::delete_event_ledger`). Carries the ledger file name in the
+    /// page path; no body, and no `pages` row to touch (ledgers are files,
+    /// not pages). Fired **before** the file is removed, so a `reject`-policy
+    /// webhook keeps it; a mirror subscribed to it can `git rm` the file.
+    DeleteEventLedger,
     /// A whole project is being purged (`Wiki::purge_project` →
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
@@ -107,6 +154,7 @@ impl AdmissionOp {
             AdmissionOp::WritePage => "write_page",
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
+            AdmissionOp::DeleteEventLedger => "delete_event_ledger",
             AdmissionOp::PurgeProject => "purge_project",
             AdmissionOp::PurgeSession => "purge_session",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
@@ -311,9 +359,28 @@ impl AdmissionChain {
                 webhooks.len()
             ))));
         }
-        let client = reqwest::Client::builder().build().map_err(|e| {
-            WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
-        })?;
+
+        // Validate each webhook URL scheme before any HTTP client is built.
+        // Only http and https are accepted; file://, ftp://, custom schemes,
+        // or bare hostnames would otherwise let an attacker that controls the
+        // operator config redirect writes to local files or unexpected
+        // network targets.
+        for hook in &webhooks {
+            if !is_supported_webhook_url(&hook.url) {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "admission webhook '{}' has unsupported URL scheme '{}'; \
+                     only http:// and https:// are allowed",
+                    hook.name, hook.url,
+                ))));
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirects())
+            .build()
+            .map_err(|e| {
+                WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
+            })?;
         Ok(Self {
             webhooks: Arc::new(webhooks),
             client,
@@ -431,16 +498,27 @@ impl AdmissionChain {
                     );
                     tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission error response");
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(err_msg)));
+                        let unavailable = status.is_server_error()
+                            || matches!(
+                                status,
+                                reqwest::StatusCode::REQUEST_TIMEOUT
+                                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                            );
+                        return Err(AdmissionFailure::into_error(unavailable, err_msg));
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(webhook = %hook.name, error = %e, "admission request failed");
+                    let detail = format_request_error(&e);
+                    tracing::warn!(
+                        webhook = %hook.name,
+                        error = %detail,
+                        "admission request failed",
+                    );
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(format!(
-                            "admission webhook {} request failed: {}",
-                            hook.name, e
-                        ))));
+                        return Err(AdmissionFailure::into_error(
+                            true,
+                            format!("admission webhook {} request failed: {detail}", hook.name),
+                        ));
                     }
                 }
             }
@@ -565,11 +643,16 @@ impl AdmissionChain {
                 }
             }
             Err(e) => {
-                tracing::warn!(webhook = %hook.name, error = %e, "admission notify request failed");
+                let detail = format_request_error(&e);
+                tracing::warn!(
+                    webhook = %hook.name,
+                    error = %detail,
+                    "admission notify request failed",
+                );
                 if matches!(hook.failure_policy, FailurePolicy::Reject) {
                     return Err(WikiError::Io(std::io::Error::other(format!(
-                        "admission webhook {} request failed: {}",
-                        hook.name, e
+                        "admission webhook {} request failed: {detail}",
+                        hook.name
                     ))));
                 }
             }
@@ -670,7 +753,12 @@ impl AdmissionChain {
                     tracing::warn!(webhook = %name, status = %resp.status(), "admission async error response");
                 }
                 Err(e) => {
-                    tracing::warn!(webhook = %name, error = %e, "admission async request failed");
+                    let detail = format_request_error(&e);
+                    tracing::warn!(
+                        webhook = %name,
+                        error = %detail,
+                        "admission async request failed",
+                    );
                 }
             }
         });
@@ -683,6 +771,59 @@ impl AdmissionChain {
 /// timeout and an unreachable host all continue the operation unchanged.
 fn decides(hook: &WebhookConfig) -> bool {
     hook.blocking && matches!(hook.failure_policy, FailurePolicy::Reject)
+}
+
+/// Accept only `http://` and `https://` admission webhook URLs.
+///
+/// Rejects `file://`, `ftp://`, custom schemes, and bare hostnames — any of
+/// those would let a misconfigured or attacker-controlled operator config
+/// send page payloads to the local filesystem, non-HTTP services, or
+/// unresolvable targets. Relative URLs are also refused: every webhook must
+/// be an absolute, network-addressable endpoint.
+fn is_supported_webhook_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Same redirect hop limit as `reqwest`'s default policy.
+const MAX_WEBHOOK_REDIRECTS: usize = 10;
+
+/// Follow a redirect only when it stays on the scheme, host, and port of the
+/// previous request.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.origin() == attempt.url().origin());
+        if !same_origin {
+            let target = attempt.url().origin().ascii_serialization();
+            attempt.error(format!(
+                "refused a redirect to another origin ({target}); set the endpoint to its final URL"
+            ))
+        } else if attempt.previous().len() > MAX_WEBHOOK_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Format a `reqwest::Error` together with its `Error::source` chain so
+/// custom redirect-policy refusals and transport causes survive stringification.
+fn format_request_error(err: &reqwest::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn webhook_timeout(timeout_ms: u64) -> Duration {

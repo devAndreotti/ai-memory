@@ -103,7 +103,17 @@ pub enum PolicyState {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExtractionState {
-    /// Tool does not require path extraction.
+    /// No path extraction applied to this event. Two cases produce it:
+    ///
+    /// - An active policy met a search/list tool ([`ToolFamily::SearchList`]).
+    ///   The policy drops it whatever its arguments say, so no path is
+    ///   extracted or counted. Under an inactive or invalid policy the same
+    ///   tool reports [`Self::Extracted`]: the state depends on the policy,
+    ///   not only on the tool.
+    /// - `ai-memory hook --check-capture` evaluated no policy at all, because
+    ///   the event is not a tool event or no working directory was found. The
+    ///   report then pairs it with `policy_state: inactive` and
+    ///   `tool_family: unknown`.
     NotApplicable,
     /// Direct fields were extracted successfully.
     Extracted,
@@ -134,6 +144,126 @@ pub enum ToolFamily {
 pub(crate) struct ToolObservationMetadata {
     pub(crate) tool_family: ToolFamily,
     pub(crate) tool_call_id: Option<String>,
+    /// Set only for an unknown-family call whose name is a strictly
+    /// validated MCP tool name; see [`mcp_tool_name`].
+    pub(crate) mcp_tool: Option<McpToolName>,
+}
+
+/// The server and tool an MCP tool name identifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpToolName {
+    pub(crate) server: String,
+    pub(crate) tool: String,
+}
+
+/// Longest MCP tool name kept. Hermes clamps its generated names to the 64
+/// characters OpenAI-compatible providers accept (`tools/mcp_tool_schema.py`,
+/// v0.22.2); a longer name is not a shape any documented harness sends.
+const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
+
+/// The server and tool of an `mcp__<server>__<tool>` tool name, the shape
+/// Claude Code (<https://code.claude.com/docs/en/hooks>, "Match MCP tools",
+/// plugin servers as `mcp__plugin_<plugin>_<server>__<tool>`), Codex
+/// (<https://learn.chatgpt.com/docs/hooks>, `mcp__fs__read`) and Hermes Agent
+/// (`mcp_prefixed_tool_name`, v0.22.2; server and tool reduced to
+/// `[A-Za-z0-9_]`) put in a tool hook's `tool_name`.
+///
+/// An MCP tool's arguments have no known path shape, so it stays an unknown
+/// family and keeps no input or output. Only the two names are kept, and only
+/// when the whole name is at most 64 ASCII letters, digits, `_` or `-`: an
+/// identifier, never free text. The server ends at the first `__`.
+pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
+    if name.len() > MAX_MCP_TOOL_NAME_CHARS
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then(|| McpToolName {
+        server: server.to_owned(),
+        tool: tool.to_owned(),
+    })
+}
+
+/// Longest harness tool name kept by `[ingest] record_tool_names`, the same
+/// bound as an MCP tool name: every documented harness tool name fits.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Longest skill or subagent identifier kept by `[ingest] record_tool_names`.
+/// Plugin skills carry a `plugin:skill` prefix, so this is wider than a name.
+const MAX_TOOL_DESCRIPTOR_CHARS: usize = 128;
+
+/// A closed-tool call's own name, plus the one identifier that says which
+/// skill or subagent it ran. Kept only when the operator opts in with
+/// `[ingest] record_tool_names`; [`crate::HookEnvelope::record_tool_name`]
+/// writes it into the observation.
+///
+/// Never an argument. A shell command, a prompt, a path or a URL stays out:
+/// the name and the two descriptors are kept only when they are short
+/// identifiers, so free text a harness put in those fields is refused whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedToolName {
+    pub(crate) name: String,
+    /// `tool_input.skill` of Claude Code's `Skill` tool.
+    pub(crate) skill: Option<String>,
+    /// `tool_input.subagent_type` of Claude Code's `Agent` (formerly `Task`)
+    /// tool.
+    pub(crate) subagent_type: Option<String>,
+}
+
+/// The tool name a closed-tool event carries, read from the same adapter
+/// fields [`tool_observation_metadata`] uses, and refused unless it is at most
+/// 64 ASCII letters, digits, `_` or `-`.
+///
+/// The skill and subagent identifiers are Claude Code's own `tool_input`
+/// fields (<https://code.claude.com/docs/en/hooks>, "PreToolUse input": the
+/// `Agent` tool's `subagent_type`; the `Skill` tool's `skill`), so they are
+/// read for Claude Code only. Each is kept when it is at most 128 ASCII
+/// letters, digits, `_`, `-`, `.` or `:`.
+pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<RecordedToolName> {
+    let (name, _) = tool_payload_fields(agent, raw)?;
+    if !valid_tool_name(name) {
+        return None;
+    }
+    let input = if agent == AgentKind::ClaudeCode {
+        raw.get("tool_input")
+    } else {
+        None
+    };
+    let descriptor = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_descriptor(value))
+            .map(str::to_owned)
+    };
+    Some(RecordedToolName {
+        name: name.to_owned(),
+        skill: (name == "Skill").then(|| descriptor("skill")).flatten(),
+        subagent_type: matches!(name, "Agent" | "Task")
+            .then(|| descriptor("subagent_type"))
+            .flatten(),
+    })
+}
+
+/// A harness tool name as `[ingest] record_tool_names` keeps it: an
+/// identifier, never free text.
+pub(crate) fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_CHARS
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_tool_descriptor(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOOL_DESCRIPTOR_CHARS
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
 /// Safe outcome class for a completed tool call.
@@ -152,6 +282,36 @@ impl ToolOutcome {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Cline CLI/SDK hooks nest the call at `tool_call` / `tool_result` (`name`,
+/// `id`, `input`; live Cline CLI 3.0.74 in #1950). The VS Code extension's
+/// documented envelope uses `preToolUse` / `postToolUse` with `toolName` (or
+/// the older `tool`) and `parameters` (ClineignoreGuard.sh handles both).
+/// Prefer the nested call when it names the tool so the call id is kept.
+fn cline_tool_fields(object: &Map<String, Value>) -> Option<(&str, Option<&str>, Option<&Value>)> {
+    let nested = object
+        .get("tool_call")
+        .or_else(|| object.get("tool_result"))
+        .and_then(Value::as_object);
+    if let Some(tool) = nested
+        && let Some(name) = tool.get("name").and_then(Value::as_str)
+    {
+        return Some((
+            name,
+            tool.get("id").and_then(Value::as_str),
+            tool.get("input"),
+        ));
+    }
+    let envelope = object
+        .get("preToolUse")
+        .or_else(|| object.get("postToolUse"))
+        .and_then(Value::as_object)?;
+    let name = envelope
+        .get("toolName")
+        .or_else(|| envelope.get("tool"))
+        .and_then(Value::as_str)?;
+    Some((name, None, envelope.get("parameters")))
 }
 
 /// The raw tool name and tool-call id of a tool payload, per agent.
@@ -181,6 +341,9 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
+        // CodeBuddy Code sends the same Claude Code fields (#1299).
+        // DSH's Claude Code hooks bridge forwards the same Claude Code
+        // snake_case fields for PreToolUse / PostToolUse.
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -189,7 +352,12 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Grizzybot
         | AgentKind::Zcode
         | AgentKind::CopilotCli
-        | AgentKind::Muse => (
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob
+        | AgentKind::Dsh
+        | AgentKind::QwenCode
+        | AgentKind::Qoder => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -206,6 +374,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
+        // Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+        // `tool_input` but no tool-call id (docs/hooks/reference.md and
+        // `hookEventHandler.ts`, v0.66.0).
+        AgentKind::GeminiCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -225,6 +397,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // reaches a hook payload (verified against the 0.240.0 tool schemas,
         // #1240).
         AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
+        AgentKind::Cline => {
+            let (name, id, _) = cline_tool_fields(object)?;
+            (name, id)
+        }
         _ => return None,
     };
     Some((name, id))
@@ -244,6 +420,9 @@ pub(crate) fn tool_observation_metadata(
     let has_args = !require_input
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
+            AgentKind::Cline => cline_tool_fields(object)
+                .and_then(|(_, _, input)| input)
+                .is_some(),
             _ => object
                 .get(
                     if matches!(
@@ -261,6 +440,12 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Grizzybot
                             | AgentKind::Droid
                             | AgentKind::Muse
+                            | AgentKind::CodeBuddy
+                            | AgentKind::IbmBob
+                            | AgentKind::Dsh
+                            | AgentKind::GeminiCli
+                            | AgentKind::QwenCode
+                            | AgentKind::Qoder
                     ) {
                         "tool_input"
                     } else {
@@ -269,9 +454,17 @@ pub(crate) fn tool_observation_metadata(
                 )
                 .is_some(),
         };
-    has_args.then(|| ToolObservationMetadata {
-        tool_family: agent_family(agent, name),
-        tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
+    has_args.then(|| {
+        let tool_family = agent_family(agent, name);
+        ToolObservationMetadata {
+            tool_family,
+            tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
+            mcp_tool: if tool_family == ToolFamily::Unknown {
+                mcp_tool_name(name)
+            } else {
+                None
+            },
+        }
     })
 }
 
@@ -283,6 +476,30 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
         },
+        AgentKind::Cline => {
+            if raw.get("tool_result").is_some() {
+                match raw
+                    .get("tool_result")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("error"))
+                {
+                    Some(Value::Null) | None => ToolOutcome::Success,
+                    Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
+                    Some(_) => ToolOutcome::Error,
+                }
+            } else {
+                match raw
+                    .get("postToolUse")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("success"))
+                    .and_then(Value::as_bool)
+                {
+                    Some(true) => ToolOutcome::Success,
+                    Some(false) => ToolOutcome::Error,
+                    None => ToolOutcome::Success,
+                }
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -290,6 +507,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             Some(true) => ToolOutcome::Success,
             Some(false) => ToolOutcome::Error,
+            None => ToolOutcome::Unknown,
+        },
+        // Gemini CLI's AfterTool `tool_response` has an `error` object only
+        // when the call failed: "If this property is present, the tool call
+        // is considered a failure" (`ToolResult`, packages/core/src/tools/
+        // tools.ts, v0.66.0). A payload without `tool_response` proves nothing.
+        AgentKind::GeminiCli => match raw.get("tool_response").and_then(Value::as_object) {
+            Some(response) => match response.get("error") {
+                None | Some(Value::Null) => ToolOutcome::Success,
+                Some(_) => ToolOutcome::Error,
+            },
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
@@ -308,7 +536,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse
+        // Claude Code's `PostToolUseFailure` carries the same `error` string
+        // (<https://code.claude.com/docs/en/hooks>); an aborted call
+        // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
+        // only on success and has no `error` key.
+        AgentKind::Zcode
+        | AgentKind::Muse
+        | AgentKind::QwenCode
+        | AgentKind::Qoder
+        | AgentKind::ClaudeCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -334,6 +570,26 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
                 .get("error")
                 .and_then(Value::as_str)
                 .is_some_and(|error| !error.is_empty()) =>
+            {
+                ToolOutcome::Error
+            }
+            None => ToolOutcome::Unknown,
+        },
+        // Cursor fires `postToolUseFailure` "when a tool fails, times out, or
+        // is denied", with an `error_message` and a `failure_type` of
+        // `error`, `timeout` or `permission_denied`
+        // (<https://cursor.com/docs/agent/hooks>). An error or a timeout is a
+        // failed call; a denied call is not a tool failure, as for Copilot
+        // CLI, and a future type proves nothing. A message with no type
+        // still names a failure. Its `postToolUse` stays unknown, as Claude
+        // Code's does.
+        AgentKind::Cursor => match raw.get("failure_type").and_then(Value::as_str) {
+            Some("error" | "timeout") => ToolOutcome::Error,
+            Some(_) => ToolOutcome::Unknown,
+            None if raw
+                .get("error_message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| !message.is_empty()) =>
             {
                 ToolOutcome::Error
             }
@@ -1068,6 +1324,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .get("toolCall")
             .and_then(Value::as_object)
             .and_then(|call| Some((call.get("name")?.as_str()?, call.get("args")))),
+        AgentKind::Cline => cline_tool_fields(object).map(|(name, _, input)| (name, input)),
         AgentKind::Grok => object
             .get("tool_name")
             .or_else(|| object.get("toolName"))
@@ -1087,6 +1344,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Codex
         | AgentKind::Cursor
         | AgentKind::GeminiCli
+        | AgentKind::QwenCode
+        | AgentKind::Qoder
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
@@ -1103,7 +1362,15 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // Factory Droid's hooks send the same Claude Code shape (#1240).
         | AgentKind::Droid
         // Meta Muse Code too, with its own tool names (Muse Code 1.4.7).
-        | AgentKind::Muse => object
+        // CodeBuddy Code uses Claude Code's names and the same two fields
+        // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob
+        // DSH's Claude Code hooks bridge forwards the same `tool_name` /
+        // `tool_input` pair, so its file and shell calls read the ignore
+        // paths exactly as Claude Code's do.
+        | AgentKind::Dsh => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1124,6 +1391,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
                     && MUSE_MEMORY_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
                 {
                     muse_memory_paths(value)
+                } else if agent == AgentKind::Cline {
+                    extract_paths(name, value).or_else(|| cline_file_paths(value))
                 } else {
                     extract_paths(name, value)
                 }
@@ -1131,7 +1400,15 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         })
         .flatten();
     let command = (family == ToolFamily::NonFile)
-        .then(|| args.and_then(shell_command))
+        .then(|| {
+            args.and_then(|value| {
+                if agent == AgentKind::Cline {
+                    cline_shell_command(value).or_else(|| shell_command(value))
+                } else {
+                    shell_command(value)
+                }
+            })
+        })
         .flatten();
     let search_paths = (family == ToolFamily::SearchList)
         .then(|| args.and_then(|value| search_direct_paths(agent, value.as_object()?)))
@@ -1203,7 +1480,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // started and returns what it printed, like Codex `write_stdin`.
         output_reader: reads_earlier_output(name)
             || (agent == AgentKind::Muse && name.eq_ignore_ascii_case("bash_input")),
-        powershell: name.eq_ignore_ascii_case("powershell"),
+        // Claude Code's `PowerShell` and DSH's Windows `pwsh` share the
+        // backquote escaping the command splitter has to model.
+        powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
         call_id,
@@ -1246,6 +1525,20 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         // `Execute` already carry shared names.
         match name.to_ascii_lowercase().as_str() {
             "create" | "applypatch" => return ToolFamily::File,
+            _ => {}
+        }
+    }
+    if agent == AgentKind::Cline {
+        // ClineCore built-ins (https://docs.cline.bot/tools-reference/all-cline-tools,
+        // Cline CLI 3.0.74). Shared names (`read_file`, `apply_patch`,
+        // `write_to_file`) stay with [`family`]. Agent-only names stay here so
+        // a same-named tool of another agent is not reclassified (`editor`,
+        // `skills`).
+        match name.to_ascii_lowercase().as_str() {
+            "read_files" | "editor" | "replace_in_file" => return ToolFamily::File,
+            "search_codebase" => return ToolFamily::SearchList,
+            "run_commands" | "execute_command" | "fetch_web_content" | "skills" | "use_skill"
+            | "ask_question" | "submit_and_exit" => return ToolFamily::NonFile,
             _ => {}
         }
     }
@@ -1452,8 +1745,12 @@ pub const SEARCH_LIST_TOOL_NAMES: &[&str] = &[
 /// Gemini CLI's `run_shell_command`, `{command, dir_path?}`) and the Hermes
 /// Agent tools that execute code, drive a browser, or fetch the web
 /// (agent/shell_hooks.py envelope; names from the model_tools registry,
-/// live-captured 2026-10-07). They are non-file rather than unknown because
-/// family `unknown` drops the tool output from observation bodies.
+/// live-captured 2026-10-07). DeepSeek Harness reaches the same shell through
+/// the win32 layer: its POSIX tool is `bash` and its Windows tool is `pwsh`
+/// (`@deepseek-ai/dsh-tool-pwsh`), so both names must classify or an active
+/// `ignore_paths` never reads the command's arguments. They are non-file
+/// rather than unknown because family `unknown` drops the tool output from
+/// observation bodies.
 pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "bash",
     "shell",
@@ -1469,8 +1766,10 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "execute_bash",
     "execute_cmd",
     "powershell",
+    "pwsh",
     "run_shell_command",
     "execute_code",
+    "run_code",
     "browser_exec",
     "browser_navigate",
     "web_extract",
@@ -1479,9 +1778,13 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Non-file tools whose input is program source (Hermes `execute_code`,
-/// `{"code": "..."}`): like `python3 -c`, it builds paths at run time, so
-/// nothing lexical proves it read no ignored file.
-pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code"];
+/// `{"code": "..."}`, and DSH's reserved `run_code` Code Mode transport,
+/// which takes the same `code` field —
+/// <https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/core/tools>):
+/// like `python3 -c`, the program builds its paths at run time, so nothing
+/// lexical proves it read no ignored file. DSH's `headless` profile mounts
+/// Code Mode, so `run_code` is the tool its one-shot runs call.
+pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code", "run_code"];
 
 /// Tools that return output of a command started by an earlier call: Claude
 /// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
@@ -1646,6 +1949,33 @@ fn native_path(candidate: Normalized) -> String {
 /// tool call.
 pub const MAX_LOOKUP_LOCATIONS: usize = 4_096;
 
+/// How many files a file-tool call names, for the file path index (#1843).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTarget {
+    /// No target the extraction can read.
+    NoFile,
+    /// Exactly one literal file, as the tool spelled it.
+    One(String),
+    /// More than one file, a move, or a glob.
+    Many,
+}
+
+/// The file a file-tool call names, or `None` for any other tool. Reads the
+/// direct path arguments, else an `apply_patch` envelope's headers, where a
+/// `Move to` header adds the destination, so a move is [`FileTarget::Many`].
+#[must_use]
+pub fn file_target(agent: AgentKind, raw: &Value) -> Option<FileTarget> {
+    let extracted = extract(agent, raw);
+    if extracted.family != ToolFamily::File {
+        return None;
+    }
+    Some(match extracted.paths.or(extracted.patch_paths).as_deref() {
+        None | Some([]) => FileTarget::NoFile,
+        Some([path]) if !extracted.globs => FileTarget::One(path.clone()),
+        Some(_) => FileTarget::Many,
+    })
+}
+
 /// The absolute locations a recognized file, search/list or shell tool call
 /// names, in their own separator style, for a hook client to find the marker
 /// that governs each: every file-tool target (for `apply_patch`, the files its
@@ -1671,23 +2001,30 @@ pub fn capture_lookup_locations(
     raw: &Value,
     cwd: &str,
     home: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<LookupLocation>> {
     let extracted = extract(agent, raw);
-    let mut seen = std::collections::HashSet::new();
-    let mut locations = Vec::new();
-    let mut push = |candidate: Option<Normalized>| -> Option<()> {
+    let mut seen = std::collections::HashMap::new();
+    let mut locations: Vec<LookupLocation> = Vec::new();
+    let mut push = |candidate: Option<Normalized>, literal: LiteralGroups| -> Option<()> {
         let Some(candidate) = candidate else {
             return Some(());
         };
-        let location = native_path(candidate);
-        if seen.insert(location.clone()) {
-            if locations.len() == MAX_LOOKUP_LOCATIONS {
-                return None;
-            }
-            locations.push(location);
+        let path = native_path(candidate);
+        if let Some(&index) = seen.get(&path) {
+            // Spelled twice, the location reads as syntax wherever either
+            // spelling does.
+            let location: &mut LookupLocation = &mut locations[index];
+            location.literal = location.literal.and(literal);
+            return Some(());
         }
+        if locations.len() == MAX_LOOKUP_LOCATIONS {
+            return None;
+        }
+        seen.insert(path.clone(), locations.len());
+        locations.push(LookupLocation { path, literal });
         Some(())
     };
+    let syntax = LiteralGroups::default();
     // Every reading of a glob whose `..` follows a `**` ([`normalize_readings`]).
     let readings = |path: &str, base: &str| normalize_readings(path, base).ok();
     match (extracted.family, extracted.command.as_ref()) {
@@ -1698,7 +2035,7 @@ pub fn capture_lookup_locations(
                 .or(extracted.patch_paths.as_ref())?;
             for path in paths {
                 for candidate in readings(path, cwd)?? {
-                    push(Some(candidate))?;
+                    push(Some(candidate), syntax)?;
                 }
             }
         }
@@ -1708,7 +2045,7 @@ pub fn capture_lookup_locations(
             for root in &scope.roots {
                 for root in readings(root, cwd)?? {
                     roots.push(native_path(root.clone()));
-                    push(Some(root))?;
+                    push(Some(root), syntax)?;
                 }
             }
             if roots.is_empty() {
@@ -1719,7 +2056,7 @@ pub fn capture_lookup_locations(
             for pattern in scope.patterns.iter().filter(|p| p.contains(['/', '\\'])) {
                 for root in &roots {
                     for candidate in readings(pattern, root)?? {
-                        push(Some(candidate))?;
+                        push(Some(candidate), syntax)?;
                     }
                 }
             }
@@ -1729,15 +2066,25 @@ pub fn capture_lookup_locations(
                 return None;
             }
             let base = command_base(extracted.workdir.as_deref(), cwd);
-            push(normalize_candidate(&base, &base))?;
+            push(normalize_candidate(&base, &base), syntax)?;
             let home = home.and_then(|dir| normalize_root(dir).ok());
             let split = command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
-            for (word, tilde) in split.words.iter().chain(&split.expanded) {
+            let words = split.words.iter().map(|(word, tilde)| {
+                let literal = split.literal.get(word).copied().unwrap_or_default();
+                (word, *tilde, literal)
+            });
+            let expanded = split
+                .expanded
+                .iter()
+                .map(|(word, tilde)| (word, *tilde, syntax));
+            for (word, tilde, literal) in words.chain(expanded) {
                 for (argument, _) in shell_arguments(word) {
-                    let expanded = expand_tilde(argument, *tilde, home.as_deref(), &base);
-                    if expanded.contains(['/', '\\']) {
-                        for candidate in readings(&expanded, &base)?.into_iter().flatten() {
-                            push(Some(candidate))?;
+                    let expanded = expand_tilde(argument, tilde, home.as_deref(), &base);
+                    for (text, literal) in quoted_brace_readings(expanded, literal) {
+                        if text.contains(['/', '\\']) {
+                            for candidate in readings(&text, &base)?.into_iter().flatten() {
+                                push(Some(candidate), literal)?;
+                            }
                         }
                     }
                 }
@@ -1746,6 +2093,67 @@ pub fn capture_lookup_locations(
         _ => {}
     }
     Some(locations)
+}
+
+/// A location [`capture_lookup_locations`] names, and which of its glob
+/// syntax is text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupLocation {
+    /// The absolute location, in its own separator style.
+    pub path: String,
+    literal: LiteralGroups,
+}
+
+impl LookupLocation {
+    /// How to follow the location ([`glob_walk`]), reading a group or brace
+    /// its shell word quoted as text.
+    #[must_use]
+    pub fn walk(&self) -> GlobWalk {
+        glob_walk_with(&self.path, self.literal)
+    }
+}
+
+/// Which groups (`(`…`)`) and braces (`{`…`}`) of a location are text rather
+/// than glob syntax: those a shell word quoted. A shell expands neither
+/// inside quotes, so an unbalanced one there cannot span a separator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiteralGroups {
+    parens: bool,
+    braces: bool,
+}
+
+impl LiteralGroups {
+    /// Text only where both readings say so.
+    fn and(self, other: Self) -> Self {
+        Self {
+            parens: self.parens && other.parens,
+            braces: self.braces && other.braces,
+        }
+    }
+}
+
+/// `text`, and when its braces are quoted text that still lists
+/// alternatives (`'{a/x,b}'`), each alternative too: a program that globs
+/// its argument itself (`rg -g`, `fd`) expands them, so the lookup follows
+/// each one. Past [`MAX_BRACE_ALTERNATIVES`] the braces read as syntax again.
+fn quoted_brace_readings(text: String, literal: LiteralGroups) -> Vec<(String, LiteralGroups)> {
+    if !literal.braces || !text.contains('{') {
+        return vec![(text, literal)];
+    }
+    match brace_alternatives(&text) {
+        Some(alternatives) if alternatives.len() > 1 => std::iter::once(text)
+            .chain(alternatives)
+            .map(|reading| (reading, literal))
+            .collect(),
+        Some(_) => vec![(text, literal)],
+        None => vec![(
+            text,
+            LiteralGroups {
+                braces: false,
+                ..literal
+            },
+        )],
+    }
 }
 
 /// Where a search/list tool reads: see [`Extracted::search_scope`].
@@ -1925,9 +2333,18 @@ pub fn glob_segment_matches(segment: &str, name: &str) -> bool {
 /// only ever adds directories.
 #[must_use]
 pub fn glob_walk(location: &str) -> GlobWalk {
+    glob_walk_with(location, LiteralGroups::default())
+}
+
+/// [`glob_walk`], reading the groups and braces `literal` names as text.
+fn glob_walk_with(location: &str, literal: LiteralGroups) -> GlobWalk {
     // A parameter expansion's braces are not a brace expansion; the shell
     // split also reads the word with each default in its place.
-    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
+    let syntax = |segment: &str| {
+        segment.contains(['*', '?', '['])
+            || (!literal.braces && segment.contains('{'))
+            || (!literal.parens && segment.contains('('))
+    };
     if location.contains("${") || !syntax(location) {
         return GlobWalk::Literal;
     }
@@ -1973,7 +2390,8 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                 .any(|piece| piece == ".." || piece.starts_with('~'))
         };
         let leaves = leaves_at(segment)
-            || (segment.contains('{')
+            || (!literal.braces
+                && segment.contains('{')
                 && match brace_alternatives(segment) {
                     Some(alternatives) => alternatives.iter().any(|alternative| {
                         alternative.contains(['/', '\\'])
@@ -1982,7 +2400,10 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                     }),
                     None => brace_overflow_could_leave(segment),
                 });
-        if leaves || !balanced('{', '}') || !balanced('(', ')') {
+        if leaves
+            || (!literal.braces && !balanced('{', '}'))
+            || (!literal.parens && !balanced('(', ')'))
+        {
             return GlobWalk::Unprovable;
         }
         if segment.contains("**") {
@@ -2309,6 +2730,41 @@ fn muse_memory_paths(args: &Value) -> Option<Vec<String>> {
     Some(vec![format!(".agents/memory/{path}")])
 }
 
+/// ClineCore `read_files` names files in `files[].path` (ReadFilesInputSchema
+/// and ClineignoreGuard.sh). Shared `path` / `paths` for `editor` already go
+/// through [`extract_paths`].
+fn cline_file_paths(args: &Value) -> Option<Vec<String>> {
+    let object = args.as_object()?;
+    let mut paths = direct_paths(object).unwrap_or_default();
+    if let Some(files) = object.get("files") {
+        let entries = files.as_array()?;
+        if entries.len() > MAX_CAPTURE_CANDIDATES
+            || paths.len().checked_add(entries.len())? > MAX_CAPTURE_CANDIDATES
+        {
+            return None;
+        }
+        for entry in entries {
+            match entry {
+                Value::String(path) => paths.push(path.clone()),
+                Value::Object(obj) => {
+                    let path = obj
+                        .get("path")
+                        .or_else(|| obj.get("file_path"))
+                        .or_else(|| obj.get("filePath"))?
+                        .as_str()?;
+                    paths.push(path.to_owned());
+                }
+                _ => return None,
+            }
+        }
+    }
+    (!paths.is_empty()
+        && paths.iter().all(|path| {
+            !path.trim().is_empty() && path.chars().count() <= MAX_CANDIDATE_PATH_CHARS
+        }))
+    .then_some(paths)
+}
+
 /// Directory arguments of Factory Droid's search/list tools: `LS` lists
 /// `directory_path` and `Glob` searches below `folder` (#1240).
 const DROID_SEARCH_ROOT_KEYS: [&str; 2] = ["directory_path", "folder"];
@@ -2351,6 +2807,9 @@ enum ShellCommand<'a> {
 #[derive(Default)]
 struct ShellWords {
     words: Vec<(String, bool)>,
+    /// Which of the groups and braces in each of `words` are text: every
+    /// reading of that word agreed ([`LiteralGroups::and`]).
+    literal: std::collections::HashMap<String, LiteralGroups>,
     opaque: bool,
     /// The words of each script that holds such syntax, read as the shell
     /// expands them where that can change which directory a path names: a
@@ -2432,7 +2891,7 @@ impl ShellCommand<'_> {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
                 if split.opaque {
-                    split.expanded.extend(shell_tokens(command, true));
+                    split.expanded.extend(expanded_words(command));
                 }
                 for (text, literal) in readings(command) {
                     push_nested_words(
@@ -2449,7 +2908,7 @@ impl ShellCommand<'_> {
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
                 for item in items.iter().filter(|item| has_unevaluated_expansion(item)) {
-                    split.expanded.extend(shell_tokens(item, true));
+                    split.expanded.extend(expanded_words(item));
                 }
                 for (index, item) in items.iter().enumerate() {
                     // An element reaches the program as is, so only a script
@@ -2482,32 +2941,51 @@ impl ShellCommand<'_> {
 fn push_argv_item(item: &str, script: bool, literal: bool, split: &mut ShellWords) {
     let tokens = split_words(item, literal);
     if tokens.len() == 1 && tokens[0].0 == item {
-        push_word(item, false, split);
+        let marks = Marks {
+            tilde: false,
+            bare_brace: script && tokens[0].1.bare_brace,
+        };
+        push_word(item, marks, split);
         return;
     }
     // Kept whole, a long script would exhaust the match budget.
     if item.chars().count() <= MAX_ARGV_PATH_CHARS {
-        split.words.push((item.to_owned(), false));
+        // An element reaches the program as is; a script's groups and braces
+        // are the shell's, read through its words below.
+        let literal = LiteralGroups {
+            parens: !script,
+            braces: !script,
+        };
+        add_word(item.to_owned(), false, literal, split);
     }
     push_nested_words(
-        &literal_tildes(tokens, script),
+        &literal_marks(tokens, script),
         MAX_SHELL_NESTING - 1,
         literal,
         split,
     );
 }
 
-/// `tokens` re-split from one word, whose unquoted tildes count only when a
-/// shell runs that word as a script; in a quoted message or pattern
-/// (`-m "fix ~approx"`, `grep '~[a-z]+'`) a tilde is literal.
-fn literal_tildes(tokens: Vec<(String, bool)>, script: bool) -> Vec<(String, bool)> {
+/// `tokens` re-split from one word, whose unquoted tildes and braces count
+/// only when a shell runs that word as a script; in a quoted message or
+/// pattern (`-m "fix ~approx"`, `grep '~[a-z]+'`, `awk '{print $1/2}'`) they
+/// are text.
+fn literal_marks(tokens: Vec<(String, Marks)>, script: bool) -> Vec<(String, Marks)> {
     if script {
         return tokens;
     }
     tokens
         .into_iter()
-        .map(|(token, _)| (token, false))
+        .map(|(token, _)| (token, Marks::default()))
         .collect()
+}
+
+/// The words of a script with syntax the matcher does not evaluate, read as
+/// the shell expands them ([`ShellWords::expanded`]).
+fn expanded_words(script: &str) -> impl Iterator<Item = (String, bool)> {
+    shell_tokens(script, true)
+        .into_iter()
+        .map(|(word, marks)| (word, marks.tilde))
 }
 
 /// `command` without PowerShell's backquote and cmd's caret escapes, each of
@@ -2566,7 +3044,7 @@ const MAX_SHELL_NESTING: usize = 4;
 /// `literal` re-splits each word with its backslashes kept
 /// ([`split_words`]).
 fn push_nested_words(
-    words: &[(String, bool)],
+    words: &[(String, Marks)],
     depth: usize,
     literal: bool,
     split: &mut ShellWords,
@@ -2575,8 +3053,8 @@ fn push_nested_words(
     if runs_inline_code(&texts) {
         split.opaque = true;
     }
-    for (index, (word, tilde)) in words.iter().enumerate() {
-        push_word(word, *tilde, split);
+    for (index, (word, marks)) in words.iter().enumerate() {
+        push_word(word, *marks, split);
         let tokens = split_words(word, literal);
         if tokens.len() == 1 && tokens[0].0 == *word {
             continue;
@@ -2591,9 +3069,9 @@ fn push_nested_words(
         let script = word.contains("$(") || word.contains('`') || is_shell_script(&texts, index);
         if script && has_unevaluated_expansion(word) {
             split.opaque = true;
-            split.expanded.extend(shell_tokens(word, true));
+            split.expanded.extend(expanded_words(word));
         }
-        push_nested_words(&literal_tildes(tokens, script), depth, literal, split);
+        push_nested_words(&literal_marks(tokens, script), depth, literal, split);
     }
 }
 
@@ -2602,15 +3080,24 @@ fn push_nested_words(
 /// Windows path keeps its separators. A word with a parameter default
 /// (`${X:-docs/x.md}`) also adds the reading with the operand in its place,
 /// of the word as written and of its POSIX reading (`${X:-d\ocs/x.md}`).
-/// `tilde` says whether a `~` in the word was outside quotes.
-fn push_word(word: &str, tilde: bool, split: &mut ShellWords) {
-    push_word_reading(word, tilde, split);
+/// `marks` says how the word was quoted.
+fn push_word(word: &str, marks: Marks, split: &mut ShellWords) {
+    push_word_reading(word, marks, split);
     if word.contains('\\') {
         let plain = without_backslash_escapes(word);
         if plain != word {
-            push_word_reading(&plain, tilde, split);
+            push_word_reading(&plain, marks, split);
         }
     }
+}
+
+fn add_word(word: String, tilde: bool, literal: LiteralGroups, split: &mut ShellWords) {
+    split
+        .literal
+        .entry(word.clone())
+        .and_modify(|seen| *seen = seen.and(literal))
+        .or_insert(literal);
+    split.words.push((word, tilde));
 }
 
 /// `word` as a POSIX shell reads its unquoted backslashes: each escapes the
@@ -2628,10 +3115,16 @@ fn without_backslash_escapes(word: &str) -> String {
     plain
 }
 
-fn push_word_reading(word: &str, tilde: bool, split: &mut ShellWords) {
-    split.words.push((word.to_owned(), tilde));
+fn push_word_reading(word: &str, marks: Marks, split: &mut ShellWords) {
+    // An unquoted `(` ends a word, so one inside a word is quoted or
+    // escaped: text, never a group.
+    let literal = LiteralGroups {
+        parens: true,
+        braces: !marks.bare_brace,
+    };
+    add_word(word.to_owned(), marks.tilde, literal, split);
     if let Some((operands, exhausted)) = parameter_operands(word) {
-        split.words.push((operands, tilde));
+        add_word(operands, marks.tilde, literal, split);
         // A default nested deeper than the matcher reads is unprovable.
         split.opaque |= exhausted;
     }
@@ -2945,6 +3438,35 @@ fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
     }
 }
 
+/// ClineCore `run_commands` takes `{commands: ["ls", ...]}` (CLI 3.0.74 live
+/// payload in #1950 and `RunCommandsInputSchema`). Each entry is a complete
+/// command string, or an object with a `command` field. Shared `command` /
+/// `cmd` keys still go through [`shell_command`].
+fn cline_shell_command(args: &Value) -> Option<ShellCommand<'_>> {
+    match args.get("commands") {
+        Some(Value::Array(items)) => {
+            if items.is_empty() || items.len() > MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            let mut lines = Vec::with_capacity(items.len());
+            for item in items {
+                let line = match item {
+                    Value::String(s) => s.as_str(),
+                    Value::Object(obj) => obj.get("command")?.as_str()?,
+                    _ => return None,
+                };
+                if line.trim().is_empty() {
+                    return None;
+                }
+                lines.push(line);
+            }
+            Some(ShellCommand::Argv(lines))
+        }
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(ShellCommand::Line(s)),
+        _ => None,
+    }
+}
+
 /// Splits a command line into words the way a POSIX shell would before
 /// expansion: quotes group, and whitespace and control/redirection operators
 /// separate. A backslash escapes only a character the shell treats specially,
@@ -2960,29 +3482,39 @@ fn shell_words(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`shell_words`], each word with whether it holds a `~` outside quotes and
-/// not after a backslash, the only tilde a shell expands.
-fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
+/// How a shell word was quoted, for the readings that depend on it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    /// A `~` outside quotes and not after a backslash, the only tilde a
+    /// shell expands.
+    tilde: bool,
+    /// A `{` or `}` outside quotes, which a brace expansion may read. A
+    /// quoted one is text to the shell.
+    bare_brace: bool,
+}
+
+/// [`shell_words`], each word with how it was quoted ([`Marks`]).
+fn marked_shell_words(command: &str) -> Vec<(String, Marks)> {
     shell_tokens(command, false)
 }
 
 /// [`marked_shell_words`]; with `expand`, a zsh glob group stays inside its
 /// word (`docs/(a|b)/x`, `(a|b)/x`) instead of splitting it as a subshell, and
 /// the numeric and control escapes of an ANSI-C string are decoded.
-fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
+fn shell_tokens(command: &str, expand: bool) -> Vec<(String, Marks)> {
     tokenize(command, expand, false)
 }
 
 /// [`marked_shell_words`] with every backslash an ordinary character, as
 /// PowerShell and cmd read it: `\\srv\share\x`, bare or double-quoted, keeps
 /// both leading backslashes.
-fn literal_shell_words(command: &str) -> Vec<(String, bool)> {
+fn literal_shell_words(command: &str) -> Vec<(String, Marks)> {
     tokenize(command, false, true)
 }
 
 /// The words of `command` read with POSIX quoting ([`shell_tokens`]), or,
 /// with `literal`, with backslashes kept as written ([`literal_shell_words`]).
-fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
+fn split_words(command: &str, literal: bool) -> Vec<(String, Marks)> {
     if literal {
         literal_shell_words(command)
     } else {
@@ -2991,11 +3523,11 @@ fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
 }
 
 /// [`shell_tokens`]; `literal` reads every backslash as an ordinary character.
-fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
+fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, Marks)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut tilde = false;
+    let mut marks = Marks::default();
     let mut in_word = false;
     let mut quote = None;
     let mut chars = command.chars().peekable();
@@ -3063,19 +3595,20 @@ fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
             }
             (None, c) if c.is_whitespace() || is_operator(c) => {
                 if in_word {
-                    words.push((std::mem::take(&mut word), tilde));
-                    (in_word, tilde) = (false, false);
+                    words.push((std::mem::take(&mut word), std::mem::take(&mut marks)));
+                    in_word = false;
                 }
             }
             (None, c) => {
-                tilde |= c == '~' && !word.ends_with('\\');
+                marks.tilde |= c == '~' && !word.ends_with('\\');
+                marks.bare_brace |= matches!(c, '{' | '}');
                 word.push(c);
                 in_word = true;
             }
         }
     }
     if in_word {
-        words.push((word, tilde));
+        words.push((word, marks));
     }
     words
 }
@@ -4170,6 +4703,16 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// The paths [`capture_lookup_locations`] names, without how each reads.
+    fn location_paths(found: Option<Vec<LookupLocation>>) -> Option<Vec<String>> {
+        found.map(|locations| {
+            locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect()
+        })
+    }
+
     /// The routed `cwd` is built from these paths, so a Windows target keeps
     /// backslashes (as the harness reports every other cwd) while `..` is
     /// still collapsed; a POSIX target is unchanged. Windows CI caught the
@@ -4587,6 +5130,9 @@ mod tests {
             AgentKind::CopilotCli,
             AgentKind::Droid,
             AgentKind::Muse,
+            AgentKind::CodeBuddy,
+            AgentKind::QwenCode,
+            AgentKind::Qoder,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -4726,6 +5272,225 @@ mod tests {
     /// `Execute` is matched like any shell. The same payloads under
     /// `AgentKind::Other` stay unrecognized and keep their output, which is
     /// what the Droid mapping changes.
+    /// CodeBuddy Code sends Claude Code's tool names and fields (#1299), so an
+    /// ignored path in a `Read`, `Write`, `Edit` or `Bash` call drops. Under
+    /// `AgentKind::Other` the same calls are not recognized and keep, so the
+    /// test fails if the CodeBuddy `extract` arm is removed.
+    #[test]
+    fn codebuddy_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "codebuddy-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        for (name, input, control) in [
+            (
+                "Read",
+                json!({"file_path": "secret/a"}),
+                json!({"file_path": "src/lib.rs"}),
+            ),
+            (
+                "Write",
+                json!({"file_path": "/repo/secret/a", "content": "x"}),
+                json!({"file_path": "/repo/src/lib.rs", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "secret/a", "old_string": "a", "new_string": "b"}),
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            (
+                "Bash",
+                json!({"command": "cat secret/a"}),
+                json!({"command": "cat src/lib.rs"}),
+            ),
+        ] {
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Drop,
+                "{name}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the CodeBuddy mapping the call is not recognized"
+            );
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, control)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+    }
+
+    /// Bob's Claude-shaped file and shell calls must pass through the same
+    /// capture exclusions. The legitimate control proves the mapping does not
+    /// discard every Bob tool call.
+    #[test]
+    fn ibm_bob_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |path: &str| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "bob-session",
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_input": {"file_path": path},
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("src/lib.rs"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Other, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the Bob mapping the call is not recognized"
+        );
+    }
+
+    /// DSH's Claude Code hooks bridge forwards Claude Code-shaped tool
+    /// payloads, so a DSH file or shell call must pass through the same
+    /// capture exclusions as the harness it borrows its shape from. Without a
+    /// DSH mapping `extract` returns the default extraction, `inspect` sees
+    /// `ToolFamily::Unknown`, and an active `ignore_paths` keeps the call
+    /// instead of dropping it.
+    #[test]
+    fn dsh_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "dsh-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "src/lib.rs"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        // DSH's Windows shell tool is `pwsh`; the POSIX one is `bash`.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("pwsh", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("bash", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        // DSH's `headless` profile mounts Code Mode, so its one-shot runs call
+        // the reserved `run_code` transport with program source that builds
+        // its paths at run time. Like any other inline-code tool it must fall
+        // back to metadata under an active policy instead of keeping the
+        // program and its output.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call(
+                        "run_code",
+                        json!({
+                            "code": "const r = await tools.read({file_path: 'secret/token'}); console.log(r)",
+                            "description": "read an ignored file",
+                        }),
+                    ),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the DSH mapping the call is not recognized"
+        );
+    }
+
     #[test]
     fn droid_tool_calls_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(
@@ -4816,7 +5581,12 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert_eq!(
-            capture_lookup_locations(AgentKind::Droid, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
         assert_eq!(
@@ -4848,7 +5618,12 @@ mod tests {
         // Droid's directory and glob arguments locate the call in another
         // checkout.
         let elsewhere = |name: &str, input: Value| {
-            capture_lookup_locations(AgentKind::Droid, &call(name, input), "/repo", None)
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &call(name, input),
+                "/repo",
+                None,
+            ))
         };
         assert_eq!(
             elsewhere("LS", json!({"directory_path": "/other/docs"})),
@@ -4886,6 +5661,71 @@ mod tests {
         assert_eq!(
             disposition(AgentKind::Other, &shell("cat docs/adr/1.md")).disposition(),
             CaptureDisposition::Keep
+        );
+    }
+
+    /// Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+    /// `tool_input` but no tool-call id, so the observation metadata reads the
+    /// name alone, and only a BeforeTool with `tool_input` proves its input.
+    #[test]
+    fn gemini_cli_tool_payload_fields_have_no_call_id() {
+        let before = json!({
+            "session_id": "gemini-session",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "ls", "dir_path": "src"}
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::GeminiCli, &before),
+            Some(("run_shell_command", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::GeminiCli, &before, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::GeminiCli, &no_input, true).is_none());
+        let after = tool_observation_metadata(AgentKind::GeminiCli, &no_input, false).unwrap();
+        assert_eq!(after.tool_family, ToolFamily::File);
+    }
+
+    /// A Gemini CLI `tool_response` proves its outcome by the presence of
+    /// `error`; a payload without a `tool_response` proves nothing.
+    #[test]
+    fn gemini_cli_tool_response_error_decides_the_outcome() {
+        let failed = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "missing.md"},
+            "tool_response": {
+                "llmContent": "File not found: missing.md",
+                "returnDisplay": "File not found.",
+                "error": {"message": "File not found: missing.md", "type": "FILE_NOT_FOUND"}
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &failed),
+            ToolOutcome::Error
+        );
+        let succeeded = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "README.md"},
+            "tool_response": {"llmContent": "# Title", "returnDisplay": ""}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &succeeded),
+            ToolOutcome::Success
+        );
+        let null_error = json!({"tool_response": {"llmContent": "ok", "error": null}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &null_error),
+            ToolOutcome::Success
+        );
+        // Control: a BeforeTool has no `tool_response`.
+        let before = json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &before),
+            ToolOutcome::Unknown
         );
     }
 
@@ -4928,6 +5768,232 @@ mod tests {
         assert_eq!(
             agent_family(AgentKind::ClaudeCode, "Create"),
             ToolFamily::Unknown
+        );
+    }
+
+    #[test]
+    fn cline_nested_tool_payloads_are_closed_and_classified() {
+        let pre = json!({
+            "tool_call": {
+                "id": "call-1",
+                "name": "read_file",
+                "input": {"path": "src/lib.rs"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &pre),
+            Some(("read_file", Some("call-1")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-1"));
+
+        let success = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "output": "ok"}
+        });
+        let failure = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "error": "denied"}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &success),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &failure),
+            ToolOutcome::Error
+        );
+        assert_eq!(tool_payload_fields(AgentKind::Other, &pre), None);
+    }
+
+    /// ClineCore built-in names (Cline CLI 3.0.74, docs.cline.bot tools
+    /// reference) are not on the shared family lists, so they classified as
+    /// unknown and closed-tool observations stored `tool unknown` with no
+    /// output (#1950). The CLI nests the call at `tool_call`; the VS Code
+    /// extension uses `preToolUse.toolName` + `parameters` (ClineignoreGuard).
+    #[test]
+    fn cline_core_tool_names_are_classified_and_honor_capture_exclusions() {
+        for (tool, expected) in [
+            ("read_files", ToolFamily::File),
+            ("editor", ToolFamily::File),
+            ("replace_in_file", ToolFamily::File),
+            ("apply_patch", ToolFamily::File),
+            ("read_file", ToolFamily::File),
+            ("search_codebase", ToolFamily::SearchList),
+            ("run_commands", ToolFamily::NonFile),
+            ("execute_command", ToolFamily::NonFile),
+            ("fetch_web_content", ToolFamily::NonFile),
+            ("skills", ToolFamily::NonFile),
+            ("use_skill", ToolFamily::NonFile),
+            ("ask_question", ToolFamily::NonFile),
+            ("submit_and_exit", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Cline, tool), expected, "{tool}");
+        }
+        // Cline-only names keep their classification for other agents.
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "read_files"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "editor"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "run_commands"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "skills"),
+            ToolFamily::Unknown
+        );
+
+        // Live Cline CLI 3.0.74 PreToolUse: both envelopes, `run_commands`
+        // with `commands[0]` (#1950).
+        let live = json!({
+            "hookName": "PreToolUse",
+            "taskId": "cline-task-1",
+            "preToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["cat docs/adr/1.md"]}
+            },
+            "tool_call": {
+                "id": "toolu_01live",
+                "name": "run_commands",
+                "input": {"commands": ["cat docs/adr/1.md"]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &live),
+            Some(("run_commands", Some("toolu_01live")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &live, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("toolu_01live"));
+
+        // Documented VS Code envelope with no `tool_call`.
+        let documented = json!({
+            "preToolUse": {
+                "toolName": "read_files",
+                "parameters": {"files": [{"path": "src/lib.rs"}]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &documented),
+            Some(("read_files", None))
+        );
+        let documented_meta =
+            tool_observation_metadata(AgentKind::Cline, &documented, true).unwrap();
+        assert_eq!(documented_meta.tool_family, ToolFamily::File);
+        assert_eq!(documented_meta.tool_call_id, None);
+
+        let older_tool_key = json!({
+            "preToolUse": {
+                "tool": "write_to_file",
+                "parameters": {"path": "src/config.ts"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &older_tool_key),
+            Some(("write_to_file", None))
+        );
+
+        let documented_failure = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["ls"]},
+                "result": "denied",
+                "success": false
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_failure),
+            ToolOutcome::Error
+        );
+        let documented_success = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "result": "ok",
+                "success": true
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_success),
+            ToolOutcome::Success
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let disposition = |raw: &Value| {
+            policy
+                .inspect(AgentKind::Cline, raw, "/repo")
+                .protocol()
+                .clone()
+        };
+        let call = |name: &str, input: Value| {
+            json!({
+                "tool_call": {
+                    "id": "toolu_01policy",
+                    "name": name,
+                    "input": input,
+                }
+            })
+        };
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat docs/adr/1.md"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat src/lib.rs"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "docs/adr/1.md"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "src/lib.rs"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call("editor", json!({"path": "docs/adr/1.md"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call("search_codebase", json!({"query": "TODO"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        // Without the Cline mapping the same payloads stay unrecognized.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("run_commands", json!({"commands": ["cat docs/adr/1.md"]}),),
+                    "/repo",
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
         );
     }
 
@@ -5076,7 +6142,12 @@ mod tests {
         assert_eq!(excluded.tool_family(), ToolFamily::File);
         assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
         assert_eq!(
-            capture_lookup_locations(AgentKind::Muse, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Muse,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
 
@@ -5086,7 +6157,7 @@ mod tests {
         assert_eq!(decision.tool_family(), ToolFamily::SearchList);
         assert_eq!(decision.disposition(), CaptureDisposition::Drop);
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::Muse,
                 &call(
                     "search",
@@ -5094,7 +6165,7 @@ mod tests {
                 ),
                 "/repo",
                 None
-            ),
+            )),
             Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
         );
 
@@ -5279,6 +6350,56 @@ mod tests {
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
     }
 
+    /// Claude Code's documented `PostToolUseFailure` payload proves an error;
+    /// its success payload proves nothing.
+    #[test]
+    fn claude_code_post_tool_use_failure_error_maps_to_error_outcome() {
+        let failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test", "description": "Run test suite"},
+            "tool_use_id": "toolu_01ABC123",
+            "error": "Exit code 1
+        Error: Cannot find module 'express'",
+            "is_interrupt": false,
+            "duration_ms": 4187
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &failure),
+            ToolOutcome::Error
+        );
+        // An abort is still a call that did not succeed.
+        let interrupted = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 100"},
+            "error": "Command aborted",
+            "is_interrupt": true
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &interrupted),
+            ToolOutcome::Error
+        );
+        // Control: a success and an empty `error` stay unknown.
+        let success = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "tool_response": {"stdout": "ok", "stderr": "", "interrupted": false}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &success),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::ClaudeCode,
+                &json!({"tool_name": "Bash", "error": ""})
+            ),
+            ToolOutcome::Unknown
+        );
+    }
+
     #[test]
     fn zcode_post_tool_use_failure_error_maps_to_error_outcome() {
         // Live-captured PostToolUseFailure payload (run 10, real model, #512):
@@ -5329,6 +6450,72 @@ mod tests {
         assert_eq!(outcome(json!({"tool_name": "bash"})), ToolOutcome::Unknown);
     }
 
+    /// Cursor's documented `postToolUseFailure` payload
+    /// (<https://cursor.com/docs/agent/hooks>) proves an error when the call
+    /// failed or timed out; a denied call, an undocumented failure type and
+    /// the `postToolUse` payload prove nothing.
+    #[test]
+    fn cursor_post_tool_use_failure_maps_to_error_outcome() {
+        let outcome = |raw: Value| tool_observation_outcome(AgentKind::Cursor, &raw);
+        let failure = |failure_type: &str, error_message: &str| {
+            json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUseFailure",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "error_message": error_message,
+                "failure_type": failure_type,
+                "duration": 5000,
+                "is_interrupt": false
+            })
+        };
+        assert_eq!(
+            outcome(failure("error", "Exit code 1: Cannot find module")),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(failure("timeout", "Command timed out after 30s")),
+            ToolOutcome::Error
+        );
+        // A denied call is not a tool failure, and a future type proves
+        // nothing.
+        assert_eq!(
+            outcome(failure("permission_denied", "Denied by the user")),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            outcome(failure("cancelled", "Stopped")),
+            ToolOutcome::Unknown
+        );
+        // A message with no type still names a failure; an empty one does not.
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": "Exit code 1"})),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": ""})),
+            ToolOutcome::Unknown
+        );
+        // Control: the success payload stays unknown.
+        assert_eq!(
+            outcome(json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_output": "{\"exitCode\":0,\"stdout\":\"All tests passed\"}",
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "duration": 5432
+            })),
+            ToolOutcome::Unknown
+        );
+    }
+
     #[test]
     fn copilot_cli_tool_metadata_uses_the_claude_compatible_keys() {
         let pre = json!({
@@ -5339,6 +6526,29 @@ mod tests {
         // PreToolUse without a proven input shape stays metadata-less.
         let no_input = json!({"tool_name": "edit"});
         assert!(tool_observation_metadata(AgentKind::CopilotCli, &no_input, true).is_none());
+    }
+
+    #[test]
+    fn qwen_code_tool_metadata_uses_documented_claude_shaped_fields() {
+        let pre = json!({
+            "tool_name": "write_file",
+            "tool_input": {"file_path": "src/lib.rs", "content": "x"},
+            "tool_use_id": "toolu_qwen",
+        });
+        let metadata = tool_observation_metadata(AgentKind::QwenCode, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("toolu_qwen"));
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::QwenCode,
+                &json!({"tool_name": "write_file", "error": "disk full"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::QwenCode, &json!({"tool_name": "write_file"})),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]
@@ -5839,11 +7049,22 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&over), "/repo", None).is_none()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&over),
+                "/repo",
+                None
+            ))
+            .is_none()
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&at_limit), "/repo", None)
-                .is_some()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&at_limit),
+                "/repo",
+                None
+            ))
+            .is_some()
         );
     }
 
@@ -5963,6 +7184,15 @@ mod tests {
             (
                 AgentKind::Devin,
                 json!({"tool_name": "exec", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            // DSH's Windows shell tool beside its POSIX `bash`.
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "pwsh", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "bash", "tool_input": {"command": "cat docs/adr/x.md"}}),
             ),
         ] {
             let decision = policy.inspect(agent, &raw, "/repo");
@@ -6265,6 +7495,10 @@ mod tests {
                     json!({"tool_name": "read_many_files", "tool_input": {"include": include}}),
                 ),
                 (
+                    AgentKind::QwenCode,
+                    json!({"tool_name": "read_many_files", "tool_input": {"include": include}}),
+                ),
+                (
                     AgentKind::OpenCode,
                     json!({"tool": "read_many_files", "args": {"include": include}}),
                 ),
@@ -6409,8 +7643,14 @@ mod tests {
     #[test]
     fn windows_lookup_locations_keep_glob_segments_whole() {
         let cwd = r"C:\work\b";
-        let locations =
-            |raw: &Value| capture_lookup_locations(AgentKind::ClaudeCode, raw, cwd, None);
+        let locations = |raw: &Value| {
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                cwd,
+                None,
+            ))
+        };
         assert_eq!(
             locations(&bash("cat {.,}./a/secrets.env")),
             Some(vec![
@@ -6433,7 +7673,12 @@ mod tests {
     #[test]
     fn capture_lookup_locations_name_every_path_a_call_spells() {
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", Some("/home/me"))
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                Some("/home/me"),
+            ))
         };
         assert_eq!(
             locations(
@@ -6462,12 +7707,12 @@ mod tests {
             Some(vec!["/work/a".to_owned()])
         );
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::ClaudeCode,
                 &json!({"tool_name": "Read", "tool_input": {"file_path": "C:\\a\\x.md"}}),
                 "C:\\b",
                 None,
-            ),
+            )),
             Some(vec!["C:\\a\\x.md".to_owned()])
         );
         // A search/list tool names its root and the path-like globs below it;
@@ -6749,7 +7994,13 @@ mod tests {
             CaptureDisposition::Keep
         );
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", None).unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for raw in [
             bash("cat ./**/../a/secrets.env"),
@@ -6837,8 +8088,13 @@ mod tests {
             Err(())
         );
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for command in [
             "cat .*/a/secrets.env",
@@ -6876,8 +8132,13 @@ mod tests {
     #[test]
     fn glob_groups_and_ansi_c_escapes_reach_the_marker_lookup() {
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for (command, location) in [
             ("cat ../(a)/secrets.env", "/work/(a)/secrets.env"),
@@ -6969,7 +8230,12 @@ mod tests {
             "tool_input": {"command": "*** Begin Patch\n*** Add File: x.rs\n+x\n  \t*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Codex, &patch, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Codex,
+                &patch,
+                "/work/b",
+                None
+            )),
             Some(vec![
                 "/work/b/x.rs".to_owned(),
                 "/work/a/secrets.env".to_owned()
@@ -6980,7 +8246,12 @@ mod tests {
             "tool_input": {"pattern": "KEY", "path": "/work", "file_glob": "a/*.env"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Hermes, &search, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Hermes,
+                &search,
+                "/work/b",
+                None
+            )),
             Some(vec!["/work".to_owned(), "/work/a/*.env".to_owned()])
         );
     }
@@ -7825,6 +9096,102 @@ mod tests {
                 CaptureDisposition::Keep,
                 "{command}"
             );
+        }
+    }
+
+    /// The file path index takes only a call that names one literal file: a
+    /// direct path, or an `apply_patch` with one header. Two files, a move, a
+    /// glob or an unreadable target never yield a path, and any other tool is
+    /// not a file call at all.
+    #[test]
+    fn file_target_is_one_literal_file_or_nothing() {
+        let call = |agent, name, args: Value| tool_call_payload(agent, name, Some(&args), None);
+        let patch = |headers: &str| format!("*** Begin Patch\n{headers}*** End Patch");
+        let one = |path: &str| Some(FileTarget::One(path.into()));
+        for (agent, raw, expected) in [
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Read",
+                    json!({"file_path": "src/lib.rs"}),
+                ),
+                one("src/lib.rs"),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Edit",
+                    json!({"file_path": "/repo/a.rs"}),
+                ),
+                one("/repo/a.rs"),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: src/a.rs\n@@\n-a\n+b\n")}),
+                ),
+                one("src/a.rs"),
+            ),
+            (
+                AgentKind::Droid,
+                call(
+                    AgentKind::Droid,
+                    "ApplyPatch",
+                    json!({"input": patch("*** Add File: new.rs\n+x\n")}),
+                ),
+                one("new.rs"),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: a.rs\n*** Delete File: b.rs\n")}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: a.rs\n*** Move to: b.rs\n")}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::GeminiCli,
+                call(
+                    AgentKind::GeminiCli,
+                    "read_many_files",
+                    json!({"paths": ["src/*.rs"]}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": "not a patch"}),
+                ),
+                Some(FileTarget::NoFile),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Bash",
+                    json!({"command": "cat src/lib.rs"}),
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(file_target(agent, &raw), expected, "{raw}");
         }
     }
 }

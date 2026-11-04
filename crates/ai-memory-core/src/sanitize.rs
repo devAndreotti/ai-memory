@@ -27,16 +27,39 @@
 //! `[sanitize].allowlist` — the allowlist is checked *per match*, so a
 //! pattern still runs but an allowlisted span survives unchanged.
 //!
+//! Private keys come first: complete PEM and PGP armor blocks, and a block
+//! cut off before its end line (`head` of a key file, a truncated tool
+//! result) as long as at least one key-body line follows the header. A
+//! sentence that only names a header has no body line and survives. The
+//! allowlist never exempts a private key.
+//!
+//! Invisible formatting characters (Unicode `Default_Ignorable_Code_Point`:
+//! zero-width spaces and joiners, soft hyphens, variation selectors, …) do
+//! not hide a credential from the patterns. When the text carries any, each
+//! pattern also runs over a copy with them removed and the match is mapped
+//! back to the original span, invisible characters included. Text that
+//! matches nothing is stored byte for byte, so emoji sequences and scripts
+//! that need joiners (Persian, the Indic scripts) are never altered.
+//!
 //! Terminal escape sequences, NUL and bidi overrides are stripped rather
 //! than redacted: they are not secrets, but stored text is replayed to a
-//! terminal by the CLI, and a NUL makes the markdown file binary.
+//! terminal by the CLI, and a NUL makes the markdown file binary. Tag
+//! characters outside an emoji flag sequence, a byte-order mark after the
+//! start of the text, and the invisible math operators are stripped too:
+//! captured prose has no use for them, and they can carry text a reader
+//! never sees.
 //!
 //! ## What we deliberately do not catch
 //!
 //! Standalone high-entropy strings (e.g. a 32-char random hex) cannot
 //! be safely redacted without knowing their structure — too many false
 //! positives. Operators who care about that level of paranoia should
-//! add a custom pattern via `extra_patterns`.
+//! add a custom pattern via `extra_patterns`. ai-memory's own root bearer
+//! is such a string: it is caught under a `token` key (a hook spool entry)
+//! or behind `Bearer`, not printed alone (`cat` of its token file).
+//!
+//! Look-alike characters (full-width `ｓｋ－…`, other confusables) are not
+//! folded: matching does not apply NFKC normalization.
 
 use std::sync::Arc;
 
@@ -64,10 +87,355 @@ const fn is_stripped_control(c: char) -> bool {
         | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Characters whose only realistic use in captured text is hiding it: the
+/// tag block (also used by emoji flag sequences, which [`emoji_tag_run_len`]
+/// keeps), the invisible math operators, and a byte-order mark anywhere but
+/// the start of the text (`U+2060` replaced it as a zero-width no-break
+/// space).
+const fn is_hidden_text_char(offset: usize, c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}' | '\u{e0000}'..='\u{e007f}')
+        || (c == '\u{feff}' && offset > 0)
+}
+
+/// Unicode `Default_Ignorable_Code_Point` (UAX #44, `DerivedCoreProperties`):
+/// characters that render as nothing. Matching ignores them; storage keeps
+/// them unless [`is_stripped_control`] or [`is_hidden_text_char`] says
+/// otherwise.
+const fn is_default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
+        | '\u{ffa0}' | '\u{fff0}'..='\u{fff8}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
+}
+
+/// Byte length of the tag characters that close an emoji flag sequence
+/// (`U+1F3F4`, tag letters, `U+E007F` cancel tag) at the start of `rest`, or
+/// 0 when `rest` does not start with a well-formed run.
+fn emoji_tag_run_len(rest: &str) -> usize {
+    let mut len = 0;
+    for c in rest.chars() {
+        match c {
+            '\u{e0020}'..='\u{e007e}' => len += c.len_utf8(),
+            '\u{e007f}' if len > 0 => return len + c.len_utf8(),
+            _ => return 0,
+        }
+    }
+    0
+}
+
+/// `text` seen through its transport encoding: every [`is_default_ignorable`]
+/// character dropped and every JSON string escape decoded, plus where in
+/// `text` each byte of the view came from, so a match found in the view maps
+/// back to the bytes it covers. The escapes are the one layer ai-memory adds
+/// itself, when an object-shaped tool result is stored as compact JSON;
+/// encodings the tool produced (HTML entities, percent-encoding, base64) are
+/// content and stay as written.
+struct Shadow {
+    text: String,
+    /// The start in `text` of the character or escape each view byte was
+    /// decoded from; its end is re-derived, which halves the view's size.
+    origin: Vec<usize>,
+}
+
+impl Shadow {
+    /// The view of `text`, or `None` when `text` reads the same without one.
+    fn of(text: &str) -> Option<Self> {
+        if !text.contains(|c: char| c == '\\' || is_default_ignorable(c)) {
+            return None;
+        }
+        let mut shadow = String::with_capacity(text.len());
+        let mut origin = Vec::with_capacity(text.len());
+        let mut index = 0;
+        while let Some(c) = text[index..].chars().next() {
+            let (c, len) = json_escape_at(text.as_bytes(), index).unwrap_or((c, c.len_utf8()));
+            if !is_default_ignorable(c) {
+                shadow.push(c);
+                origin.extend(std::iter::repeat_n(index, c.len_utf8()));
+            }
+            index += len;
+        }
+        Some(Self {
+            text: shadow,
+            origin,
+        })
+    }
+
+    /// The span of `text` a view match `start..end` covers: from the first
+    /// byte of its first character through the last byte of its last,
+    /// invisible characters between them and the escapes they were decoded
+    /// from included.
+    fn original_span(&self, text: &str, start: usize, end: usize) -> (usize, usize) {
+        let from = self.origin.get(start).copied().unwrap_or(text.len());
+        let to = match end.checked_sub(1).and_then(|last| self.origin.get(last)) {
+            Some(&last) if end > start => last + source_len_at(text, last),
+            _ => from,
+        };
+        (from, to)
+    }
+}
+
+/// The byte length of the escape or character at `text[index..]`, as
+/// [`Shadow::of`] consumed it.
+fn source_len_at(text: &str, index: usize) -> usize {
+    json_escape_at(text.as_bytes(), index).map_or_else(
+        || text[index..].chars().next().map_or(0, char::len_utf8),
+        |(_, len)| len,
+    )
+}
+
+/// The character the JSON string escape at `bytes[index..]` stands for and
+/// the escape's byte length. Anything else, a lone surrogate included, is
+/// text.
+fn json_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    if bytes.get(index) != Some(&b'\\') {
+        return None;
+    }
+    let decoded = match bytes.get(index + 1)? {
+        b'"' => ('"', 2),
+        b'\\' => ('\\', 2),
+        b'/' => ('/', 2),
+        b'b' => ('\u{8}', 2),
+        b'f' => ('\u{c}', 2),
+        b'n' => ('\n', 2),
+        b'r' => ('\r', 2),
+        b't' => ('\t', 2),
+        b'u' => json_unicode_escape_at(bytes, index)?,
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// `\uXXXX`, or a `\uXXXX\uXXXX` surrogate pair, at `bytes[index..]`.
+fn json_unicode_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    let unit = json_hex_unit(bytes, index + 2)?;
+    if !(0xD800..=0xDBFF).contains(&unit) {
+        return Some((char::from_u32(unit)?, 6));
+    }
+    if bytes.get(index + 6..index + 8)? != b"\\u" {
+        return None;
+    }
+    let low = json_hex_unit(bytes, index + 8).filter(|low| (0xDC00..=0xDFFF).contains(low))?;
+    let code = 0x1_0000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+    Some((char::from_u32(code)?, 12))
+}
+
+/// The four hex digits at `bytes[at..]` as a UTF-16 code unit.
+fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes.get(at..at + 4)?.iter().try_fold(0, |unit, b| {
+        Some((unit << 4) | char::from(*b).to_digit(16)?)
+    })
+}
+
+/// Disjoint spans sorted by start, answering "which of them overlap this
+/// span" in logarithmic time.
+struct SortedSpans(Vec<(usize, usize)>);
+
+impl SortedSpans {
+    fn new(spans: &[(usize, usize)]) -> Self {
+        let mut sorted = spans.to_vec();
+        sorted.sort_unstable();
+        Self(sorted)
+    }
+
+    /// The spans that overlap `span`. One pattern's view matches never
+    /// overlap one another, so their ends rise with their starts.
+    fn overlapping(&self, (start, end): (usize, usize)) -> &[(usize, usize)] {
+        let from = self.0.partition_point(|&(_, e)| e <= start);
+        let to = self.0.partition_point(|&(s, _)| s < end);
+        self.0.get(from..to).unwrap_or_default()
+    }
+}
+
+/// Where a value the view cut short at `from` really ends inside a JSON line:
+/// at the end of its JSON string, at an escaped quote (the view's own
+/// closing quote), or at an escaped line break. An escaped tab stays part of
+/// the value, and so does a line break whose continuation is the string's
+/// last line and is not a `KEY=value`, `key: value` or `#` comment line
+/// (#1974). A longer continuation is ambiguous with the next lines of a
+/// printed `.env`, which must survive, so the value stops at its first line
+/// break.
+fn json_value_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'"' => break,
+            b'\\' => {
+                let next = bytes.get(at + 1).copied();
+                if next == Some(b'"') {
+                    break;
+                }
+                let len = source_len_at(text, at).max(1);
+                if matches!(next, Some(b'n' | b'r')) {
+                    return last_line_end(text, at + len).unwrap_or(at);
+                }
+                at += len;
+            }
+            _ => at += text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    at
+}
+
+/// The end of the continuation that starts at `from`, just after an escaped
+/// line break, when it is the last line of its JSON string and holds a value
+/// rather than a new `.env` line; otherwise `None`.
+fn last_line_end(text: &str, mut from: usize) -> Option<usize> {
+    if text[from..].starts_with("\\n") {
+        from += 2;
+    }
+    let rest = &text[from..];
+    if starts_assignment(rest) || rest.starts_with('#') {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'"' => break,
+            b'\\' => match bytes.get(at + 1) {
+                Some(b'"') => break,
+                Some(b'n' | b'r') => return None,
+                _ => at += source_len_at(text, at).max(1),
+            },
+            _ => at += text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    (at > from).then_some(at)
+}
+
+/// Whether `rest` opens with `KEY=value` or `key: value`, an optional
+/// `export ` first. The separator must be followed by a value, so base64
+/// padding (`...cmQ=`) at the end of a string is no assignment.
+fn starts_assignment(rest: &str) -> bool {
+    let rest = rest.strip_prefix("export ").unwrap_or(rest);
+    let key_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    if key_len == 0 || rest.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let mut after = rest[key_len..].trim_start_matches([' ', '\t']).bytes();
+    matches!(after.next(), Some(b'=' | b':'))
+        && after
+            .next()
+            .is_some_and(|b| !matches!(b, b'=' | b'"' | b'\\'))
+}
+
+/// Which lines of a text parse as JSON, each line checked once.
+struct JsonLines<'a> {
+    text: &'a str,
+    /// The offset of every `\n`, found on first use.
+    breaks: Option<Vec<usize>>,
+    checked: std::collections::HashMap<usize, bool>,
+}
+
+impl<'a> JsonLines<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            breaks: None,
+            checked: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether the line holding byte `at` is a JSON value with an escape in
+    /// it, the shape a stringified tool result takes.
+    fn contains(&mut self, at: usize) -> bool {
+        let text = self.text;
+        let breaks = self
+            .breaks
+            .get_or_insert_with(|| text.match_indices('\n').map(|(i, _)| i).collect());
+        let line = breaks.partition_point(|&i| i < at);
+        let start = line.checked_sub(1).map_or(0, |prev| breaks[prev] + 1);
+        let end = breaks.get(line).copied().unwrap_or(text.len());
+        *self.checked.entry(start).or_insert_with(|| {
+            let line = text[start..end].trim_end_matches('\r');
+            line.contains('\\') && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+        })
+    }
+}
+
+/// `span` widened so neither end falls between a backslash and the character
+/// it escapes, which would leave an invalid escape behind.
+fn whole_escapes(text: &str, (mut start, mut end): (usize, usize)) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let odd_run_before = |at: usize| {
+        bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            % 2
+            == 1
+    };
+    if start > 0 && odd_run_before(start) {
+        start -= 1;
+    }
+    if end > start && end < bytes.len() && odd_run_before(end) {
+        end = (end - 1 + source_len_at(text, end - 1)).max(end);
+    }
+    (start, end)
+}
+
+/// `text` with each span replaced by `[REDACTED:<label>]`, overlapping
+/// spans merged into one.
+fn redact_spans(text: &str, spans: Vec<(usize, usize)>, label: &str) -> String {
+    let mut spans: Vec<_> = spans
+        .into_iter()
+        .map(|span| whole_escapes(text, span))
+        .collect();
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut spans = spans.into_iter().peekable();
+    while let Some((start, mut end)) = spans.next() {
+        while let Some(&(next_start, next_end)) = spans.peek() {
+            if next_start >= end {
+                break;
+            }
+            end = end.max(next_end);
+            spans.next();
+        }
+        debug!(label, "sanitize: redacted match");
+        out.push_str(&text[copied..start]);
+        out.push_str("[REDACTED:");
+        out.push_str(label);
+        out.push(']');
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
 const BUILTIN_PATTERNS: &[(&str, &str)] = &[
+    // Private keys run first, while their base64 body lines are still intact
+    // for the token rules below to leave alone.
+    //
+    // A complete PEM or PGP armor block (`… PRIVATE KEY BLOCK-----` is the PGP
+    // form) — multi-line, lazy match.
+    (
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----",
+        "private_key",
+    ),
+    // A block with no end line: the head of a key file, or a tool result cut
+    // short before the hook saw it. It needs at least one key-body line (16+
+    // base64 characters filling the rest of the line) after the header,
+    // optionally behind armor headers (`Proc-Type:`, `Version:`, …) and blank
+    // lines, so prose that only names the header keeps it. Lines break on a
+    // real newline or a JSON-escaped one. The line end after the last body
+    // line sits outside the `secret` group: it has to be there, but it is not
+    // redacted.
+    (
+        r#"(?P<secret>-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:(?:\r?\n|(?:\\r)?\\n)[ \t]*(?:(?:Proc-Type|DEK-Info|Version|Comment|Hash):[^\r\n\\]*)?)*?(?:(?:\r?\n|(?:\\r)?\\n)[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*)+)(?:\r?(?m:$)|["'\\…]|\.\.\.)"#,
+        "private_key",
+    ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
     // Vendor-prefixed API keys.
@@ -81,6 +449,10 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
+    // ai-memory's own DB-user API keys (`aim_`) and web-session secrets
+    // (`ams_`): the prefix plus 43 base64url characters. The 40-character
+    // floor keeps snake_case identifiers that start with `aim_` intact.
+    (r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -148,11 +520,6 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // credential from a short encoded fragment; config that long is pasted as
     // JSON, not base64.
     (r"eyJ[A-Za-z0-9_\-+/]{40,}={0,2}", "base64_json_token"),
-    // PEM private key blocks — multi-line, lazy match.
-    (
-        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-        "private_key",
-    ),
     // URL-embedded credentials: scheme://user:pass@host.
     (
         r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
@@ -176,21 +543,44 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `Access-Control-Allow-Credentials: true` intact. It is not what
     // protects an already-redacted value: `[REDACTED]` starts with `[`,
     // which the value character class excludes outright.
+    //
+    // The view decodes one level of JSON escaping. JSON printed inside a JSON
+    // string (`\\\"`) still reaches the rule with backslashes before its
+    // quotes, so the quote around a key or value accepts them; a `.env`
+    // nested that deep is not covered (#1963).
     (
-        r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))"?\s*[=:]\s*(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
+        r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))(?:\\*")?\s*[=:]\s*(?:\\*")?(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
+        "auth_header",
+    ),
+    // A bare `token` key: the rule above needs an auth word before `token`,
+    // but a hook spool entry stores ai-memory's root bearer (64 hex
+    // characters from `generate-auth-token`) as `"token":"…"` (#1982), and
+    // Vault and many CLI config files use the same key. The key also names
+    // tokenizer output and short literals, so the value floor is 32: longer
+    // than a word, shorter than a generated credential. A `-` before the key
+    // makes it a header name such as `Continuation-Token`, which stays the
+    // rule above's call; the character before the key is context, not part
+    // of the redaction.
+    (
+        r#"(?i)(?:^|[^A-Za-z0-9_-])(?P<secret>token(?:\\*"|')?\s*[=:]\s*(?:\\*"|')?[A-Za-z0-9._~+/=-]{32,})"#,
         "auth_header",
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
-    // even without `sk-` shape).
+    // even without `sk-` shape). In this rule and the two below, a quoted
+    // value ends at its closing quote, escapes inside it included: compact
+    // JSON has no whitespace for `\S+` to stop at, so it would redact the
+    // rest of the stored result and leave it unparseable. Text glued to the
+    // closing quote (`"abc"tail`, shell concatenation) stays part of the
+    // value; a JSON delimiter after the quote ends it.
     (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)"?\s*[=:]\s*\S+"#,
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)"?\s*[=:]\s*\S+"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // The suffixes one step outside those: `*_KEY_ID` (the other half of an
@@ -200,7 +590,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // convention: as code identifiers (`api_key_id`, `password_salt`) they are
     // ordinary column and field names, and redaction is irreversible.
     (
-        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)"?\s*[=:]\s*\S+"#,
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -238,10 +628,22 @@ pub struct Sanitizer {
 }
 
 struct SanitizerInner {
-    patterns: Vec<(Regex, &'static str)>,
+    patterns: Vec<Pattern>,
     allowlist: Vec<String>,
     escapes: Regex,
 }
+
+struct Pattern {
+    re: Regex,
+    label: &'static str,
+    /// A built-in rule whose match must include context that is not itself
+    /// secret (a line end) redacts only its `secret` capture group.
+    secret_group: bool,
+}
+
+/// The one label the allowlist never exempts: no project codename belongs
+/// inside a private key, and a short entry would otherwise match key bodies.
+const PRIVATE_KEY_LABEL: &str = "private_key";
 
 impl std::fmt::Debug for Sanitizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,15 +679,32 @@ impl Sanitizer {
     pub fn new(cfg: &SanitizeConfig) -> Result<Self, regex::Error> {
         let mut patterns = Vec::with_capacity(BUILTIN_PATTERNS.len() + cfg.extra_patterns.len());
         for (p, label) in BUILTIN_PATTERNS {
-            patterns.push((Regex::new(p)?, *label));
+            let re = Regex::new(p)?;
+            let secret_group = re.capture_names().any(|name| name == Some("secret"));
+            patterns.push(Pattern {
+                re,
+                label,
+                secret_group,
+            });
         }
         for p in &cfg.extra_patterns {
-            patterns.push((Regex::new(p)?, "custom"));
+            patterns.push(Pattern {
+                re: Regex::new(p)?,
+                label: "custom",
+                secret_group: false,
+            });
         }
         Ok(Self {
             inner: Arc::new(SanitizerInner {
                 patterns,
-                allowlist: cfg.allowlist.clone(),
+                // A blank entry is a substring of every match and would turn
+                // redaction off entirely. `Config::load` warns about it.
+                allowlist: cfg
+                    .allowlist
+                    .iter()
+                    .filter(|entry| !entry.trim().is_empty())
+                    .cloned()
+                    .collect(),
                 escapes: Regex::new(ESCAPE_SEQUENCES)?,
             }),
         })
@@ -306,39 +725,147 @@ impl Sanitizer {
         // Before the redaction passes: an escape inside a secret would
         // otherwise split it out of reach of every pattern below.
         let mut out = self.strip_control(input);
-        for (re, label) in &self.inner.patterns {
-            out = re
-                .replace_all(&out, |caps: &regex::Captures<'_>| {
-                    let m = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-                    if self.inner.allowlist.iter().any(|a| m.contains(a)) {
-                        m.to_string()
-                    } else {
-                        debug!(pattern = re.as_str(), "sanitize: redacted match");
-                        format!("[REDACTED:{label}]")
-                    }
-                })
-                .into_owned();
+        // Each pattern runs twice: through the transport encoding (invisible
+        // characters, JSON string escapes), so a secret split by one or quoted
+        // by the other is redacted whole, and over the text as written, which
+        // finds a match that needs an invisible character as its word
+        // boundary. Outside JSON, overlapping spans merge to the widest, so
+        // the view only ever widens a redaction: plain text holding a literal
+        // `\n` or `\"` ends a value early in the view but not as written. In
+        // a line that parses as JSON the escapes are JSON's own, so a plain
+        // match the view already covers only lets each view value's tail
+        // grow as far as `json_value_end` allows: never past its JSON string
+        // or onto the next `.env` line.
+        let mut shadow = Shadow::of(&out);
+        for pattern in &self.inner.patterns {
+            let mut spans = self.spans(&out, shadow.as_ref(), pattern);
+            if shadow.is_some() {
+                let plain = self.spans(&out, None, pattern);
+                if !plain.is_empty() {
+                    let view = SortedSpans::new(&spans);
+                    let mut json_lines = JsonLines::new(&out);
+                    let kept: Vec<_> = plain
+                        .into_iter()
+                        .flat_map(|span| {
+                            let covered = view.overlapping(span);
+                            if covered.is_empty() || !json_lines.contains(span.0) {
+                                return vec![span];
+                            }
+                            // Only each view value's own tail grows; the
+                            // view spans already cover the rest.
+                            covered
+                                .iter()
+                                .map(|&(_, end)| (end, json_value_end(&out, end).min(span.1)))
+                                .filter(|&(start, end)| end > start)
+                                .collect()
+                        })
+                        .collect();
+                    spans.extend(kept);
+                }
+            }
+            if spans.is_empty() {
+                continue;
+            }
+            out = redact_spans(&out, spans, pattern.label);
+            // Dropped first, so two views of a large result never coexist.
+            drop(shadow.take());
+            shadow = Shadow::of(&out);
         }
         out
     }
 
-    /// Drop terminal escape sequences and the control characters that have
-    /// no place in a page.
+    /// Whether `path` may be stored as a file index key: a valid key
+    /// ([`crate::valid_file_path_key`]) that scrubbing leaves unchanged.
+    /// Checked with a leading `/` because the credential-directory patterns
+    /// need a separator before the directory, so `.ssh/config` at the
+    /// checkout root would otherwise pass.
+    #[must_use]
+    pub fn admits_file_path(&self, path: &str) -> bool {
+        let rooted = format!("/{path}");
+        crate::valid_file_path_key(path) && self.scrub(&rooted) == rooted
+    }
+
+    /// The spans of `text` one pattern matches, allowlisted matches left out:
+    /// over `shadow` when there is one, each match mapped back to the span of
+    /// `text` it covers, else over `text` itself.
+    fn spans(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> Vec<(usize, usize)> {
+        let view = shadow.map_or(text, |shadow| shadow.text.as_str());
+        let matches: Vec<regex::Match<'_>> = if pattern.secret_group {
+            pattern
+                .re
+                .captures_iter(view)
+                .filter_map(|caps| caps.name("secret").or_else(|| caps.get(0)))
+                .collect()
+        } else {
+            pattern.re.find_iter(view).collect()
+        };
+        matches
+            .into_iter()
+            .filter(|m| !self.allowlisted(pattern.label, m.as_str()))
+            .map(|m| match shadow {
+                Some(shadow) => shadow.original_span(text, m.start(), m.end()),
+                None => (m.start(), m.end()),
+            })
+            .collect()
+    }
+
+    /// Whether an allowlist entry exempts `matched`. Compared with invisible
+    /// characters removed, so they neither break nor fake an entry. The plain
+    /// pass matches the raw escapes, so an entry holding a quote or backslash
+    /// exempts plain text only.
+    fn allowlisted(&self, label: &str, matched: &str) -> bool {
+        if label == PRIVATE_KEY_LABEL || self.inner.allowlist.is_empty() {
+            return false;
+        }
+        let visible: String;
+        let matched = if matched.contains(is_default_ignorable) {
+            visible = matched
+                .chars()
+                .filter(|c| !is_default_ignorable(*c))
+                .collect();
+            visible.as_str()
+        } else {
+            matched
+        };
+        self.inner
+            .allowlist
+            .iter()
+            .any(|entry| matched.contains(entry.as_str()))
+    }
+
+    /// Drop terminal escape sequences, the control characters that have no
+    /// place in a page, and characters that hide text.
     ///
     /// Captured text is replayed to a terminal by `ai-memory read-page` and
     /// `search`, where an escape rewrites the screen or the window title, and
     /// a bidi override reverses what the reader sees. A NUL additionally
     /// makes the markdown file binary, which costs it `grep` and git diffs.
+    /// Tag characters spell out text no reader sees; the ones that finish an
+    /// emoji flag (England, Scotland, Wales) stay.
     fn strip_control(&self, input: &str) -> String {
         let stripped = self.inner.escapes.replace_all(input, "");
-        if stripped.contains(is_stripped_control) {
-            stripped
-                .chars()
-                .filter(|c| !is_stripped_control(*c))
-                .collect()
-        } else {
-            stripped.into_owned()
+        if !stripped
+            .char_indices()
+            .any(|(offset, c)| is_stripped_control(c) || is_hidden_text_char(offset, c))
+        {
+            return stripped.into_owned();
         }
+        let mut out = String::with_capacity(stripped.len());
+        let mut offset = 0;
+        while let Some(c) = stripped[offset..].chars().next() {
+            let next = offset + c.len_utf8();
+            if c == '\u{1f3f4}' {
+                let tags = emoji_tag_run_len(&stripped[next..]);
+                out.push_str(&stripped[offset..next + tags]);
+                offset = next + tags;
+                continue;
+            }
+            if !is_stripped_control(c) && !is_hidden_text_char(offset, c) {
+                out.push(c);
+            }
+            offset = next;
+        }
+        out
     }
 }
 
@@ -382,6 +909,9 @@ impl Sanitized<NewObservation> {
         obs.title = truncate_for_title(&sanitizer.scrub(&obs.title));
         obs.body =
             truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
+        obs.file_path = obs
+            .file_path
+            .filter(|path| sanitizer.admits_file_path(path));
         Self(obs)
     }
 }
@@ -967,10 +1497,52 @@ mod tests {
             title: "OPENAI_API_KEY=sk-leak-1234567890abcdef".into(),
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED:"));
         assert!(scrubbed.body.contains("[REDACTED:"));
+    }
+
+    /// The file index key reaches the store only through `Sanitized::new`,
+    /// which clears a rooted, `..`, over-long, credential-directory or
+    /// control-character path and keeps a plain checkout-relative one.
+    #[test]
+    fn observation_file_path_is_cleared_unless_admitted() {
+        let observation = |file_path: &str| NewObservation {
+            occurred_at: None,
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::PostToolUse,
+            extension: None,
+            source_event: None,
+            title: "tool file".into(),
+            body: String::new(),
+            importance: 5,
+            file_path: Some(file_path.into()),
+        };
+        let longest = "a".repeat(crate::FILE_PATH_MAX_CHARS);
+        for kept in ["src/lib.rs", "docs/a b.md", longest.as_str()] {
+            let stored = Sanitized::new(observation(kept), &s()).into_inner();
+            assert_eq!(stored.file_path.as_deref(), Some(kept));
+        }
+        let too_long = "a".repeat(crate::FILE_PATH_MAX_CHARS + 1);
+        for refused in [
+            "",
+            "/etc/passwd",
+            "\\\\share\\x",
+            "C:/repo/x",
+            "src/../secret",
+            "..",
+            ".ssh/config",
+            "home/.aws/credentials",
+            "src/\u{1b}[31mx",
+            too_long.as_str(),
+        ] {
+            let stored = Sanitized::new(observation(refused), &s()).into_inner();
+            assert_eq!(stored.file_path, None, "{refused:?}");
+        }
     }
 
     #[test]
@@ -990,6 +1562,7 @@ mod tests {
                 "é".repeat(OBSERVATION_BODY_MAX_BYTES)
             ),
             importance: 8,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
@@ -1026,6 +1599,7 @@ mod tests {
             title: format!("{} {secret}", "x".repeat(70)),
             body: String::new(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
         assert!(
@@ -1195,6 +1769,200 @@ mod tests {
         );
     }
 
+    /// One line of a fake key body. Short on purpose: a complete fake block
+    /// stays under the length the secret scanner's private-key rule needs.
+    const FAKE_KEY_LINE: &str = "b3BlbnNzaC1rZXktdjEAAAAA";
+
+    /// The vectors the client companion's scrub runs too
+    /// (`companions/ai-memory-client`), so the two copies cannot drift.
+    #[test]
+    fn shared_sanitizer_vectors_hold() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/sanitizer_vectors.json"
+        ))
+        .unwrap();
+        let strings = |key: &str| -> Vec<String> {
+            vectors[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect()
+        };
+        for secret in strings("credentials") {
+            let (head, tail) = secret.split_at(secret.len() / 2);
+            for invisible in strings("invisibles") {
+                let out = s().scrub(&format!("key {head}{invisible}{tail} end"));
+                assert!(
+                    out.contains("[REDACTED:") && !out.contains(head) && !out.contains(tail),
+                    "{invisible:?} inside {secret}: {out:?}"
+                );
+                assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
+            }
+        }
+        for field in vectors["credential_fields"].as_array().unwrap() {
+            let input = field["input"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(field["secret"].as_str().unwrap()),
+                "{input:?} -> {out:?}"
+            );
+            for kept in field["kept"].as_array().into_iter().flatten() {
+                assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+            }
+        }
+        let body_line = vectors["key_body_line"].as_str().unwrap();
+        for block in vectors["key_blocks"].as_array().unwrap() {
+            let input = block["input"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert!(
+                out.contains("[REDACTED:private_key]") && !out.contains(body_line),
+                "{input:?} -> {out:?}"
+            );
+            for kept in block["kept"].as_array().unwrap() {
+                assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+            }
+        }
+        for text in strings("unchanged") {
+            assert_eq!(s().scrub(&text), text);
+        }
+    }
+
+    #[test]
+    fn invisible_character_inside_an_operator_pattern_match_is_redacted() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"CANARY-[0-9]{6}".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            sn.scrub("found CANARY-12\u{200b}3456 here"),
+            "found [REDACTED:custom] here"
+        );
+    }
+
+    /// An invisible character neither breaks an allowlist entry (the span is
+    /// still exempt) nor lets a secret that is not allowlisted through.
+    #[test]
+    fn invisible_characters_neither_break_nor_bypass_the_allowlist() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["KEEP_ME".to_string()],
+        })
+        .unwrap();
+        for kept in [
+            "SERVICE_TOKEN=KEEP_ME_visible_value",
+            "SERVICE_TOKEN=KEEP\u{200b}_ME_visible_value",
+        ] {
+            assert_eq!(sn.scrub(kept), kept, "allowlisted span must survive");
+        }
+        let out = sn.scrub("SERVICE_TOKEN=s3cretva\u{200b}lue0123");
+        assert!(
+            out.contains("[REDACTED:env_secret]") && !out.contains("lue0123"),
+            "a secret without the allowlist entry must still be redacted: {out:?}"
+        );
+    }
+
+    #[test]
+    fn characters_that_hide_text_are_stripped() {
+        let hidden: String = "hidden note"
+            .chars()
+            .map(|c| char::from_u32(0xe0000 + u32::from(c)).unwrap())
+            .collect();
+        let out = s().scrub(&format!("visible{hidden} text"));
+        assert_eq!(out, "visible text");
+
+        assert_eq!(s().scrub("a\u{2062}b\u{feff}c"), "abc");
+        // A flag start with no cancel tag is not a flag: its tags go.
+        assert_eq!(s().scrub("\u{1f3f4}\u{e0067}\u{e0062} x"), "\u{1f3f4} x");
+    }
+
+    #[test]
+    fn pgp_private_key_block_is_redacted() {
+        let block = format!(
+            "before\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: 1\n\n\
+             {FAKE_KEY_LINE}\n-----END PGP PRIVATE KEY BLOCK-----\nafter"
+        );
+        assert_eq!(s().scrub(&block), "before\n[REDACTED:private_key]\nafter");
+    }
+
+    #[test]
+    fn private_key_block_without_an_end_line_is_redacted() {
+        let line = FAKE_KEY_LINE;
+        for (input, expected) in [
+            (
+                format!("$ head -3 key.pem\n-----BEGIN PRIVATE KEY-----\n{line}\n{line}\n$ ls"),
+                "$ head -3 key.pem\n[REDACTED:private_key]\n$ ls".to_string(),
+            ),
+            (
+                format!("-----BEGIN RSA PRIVATE KEY-----\r\n{line}\r\n{line}\r\n"),
+                "[REDACTED:private_key]\r\n".to_string(),
+            ),
+            (
+                format!(r#"{{"stdout":"-----BEGIN OPENSSH PRIVATE KEY-----\n{line}\n{line}"}}"#),
+                r#"{"stdout":"[REDACTED:private_key]"}"#.to_string(),
+            ),
+            (
+                format!(
+                    "  -----BEGIN EC PRIVATE KEY-----\n  {line}\n  {}",
+                    &line[..20]
+                ),
+                "  [REDACTED:private_key]".to_string(),
+            ),
+            (
+                format!(
+                    "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+                     DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{line}\n"
+                ),
+                "[REDACTED:private_key]\n".to_string(),
+            ),
+        ] {
+            assert_eq!(s().scrub(&input), expected, "input: {input:?}");
+        }
+    }
+
+    /// A key body line can contain `eyJ…`, which a token rule would redact
+    /// in part, leaving the rest of the key unrecognizable to the key rules.
+    #[test]
+    fn key_rules_run_before_token_rules_can_split_a_key_body() {
+        let first = format!("MIIEeyJ{}", "A".repeat(50));
+        let input = format!("-----BEGIN PRIVATE KEY-----\n{first}\n{FAKE_KEY_LINE}\n");
+        assert_eq!(s().scrub(&input), "[REDACTED:private_key]\n");
+    }
+
+    #[test]
+    fn allowlist_never_exempts_a_private_key() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["b3Bl".to_string()],
+        })
+        .unwrap();
+        let complete =
+            format!("-----BEGIN PRIVATE KEY-----\n{FAKE_KEY_LINE}\n-----END PRIVATE KEY-----");
+        assert_eq!(sn.scrub(&complete), "[REDACTED:private_key]");
+        let unterminated = format!("-----BEGIN PRIVATE KEY-----\n{FAKE_KEY_LINE}\n");
+        assert_eq!(sn.scrub(&unterminated), "[REDACTED:private_key]\n");
+    }
+
+    #[test]
+    fn blank_allowlist_entries_are_ignored() {
+        let input = "token=ghp_FAKEfakeFAKEfakeFAKEfake012345678";
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec![String::new(), "   ".to_string()],
+        })
+        .unwrap();
+        assert_eq!(sn.scrub(input), "token=[REDACTED:github_token]");
+
+        // Control: a real entry still exempts its span.
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["ghp_FAKE".to_string()],
+        })
+        .unwrap();
+        assert_eq!(sn.scrub(input), input);
+    }
+
     /// JSON is the shape most captured tool payloads arrive in, and the
     /// quote before the value used to put it outside the value class, so the
     /// same secret was redacted in YAML and stored verbatim in JSON.
@@ -1211,6 +1979,335 @@ mod tests {
                 out.contains("[REDACTED:"),
                 "JSON-quoted secret must be redacted: {raw} -> {out}"
             );
+        }
+    }
+
+    /// A tool result stored as compact JSON carries the printed file with its
+    /// quotes, newlines and tabs escaped. The same secrets unescaped are
+    /// covered above; here each sits inside a Claude Code Bash `tool_response`
+    /// string (#1963).
+    #[test]
+    fn scrubs_secret_values_inside_an_escaped_json_tool_result() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret) in [
+            (
+                r#"{"stdout":"{\"db_password\": \"correct-horse-battery\"}\n","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"OPENAI_API_KEY\": \"FAKEfake0123456789abcd\"}\n"}"#,
+                "FAKEfake0123456789abcd",
+            ),
+            (
+                r#"{"stdout":"password = \"correct-horse-battery\"\n"}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"Authorization\": \"Basic YWRtaW46c2VjcmV0cGFzc3dvcmQ=\"}\n"}"#,
+                "YWRtaW46c2VjcmV0cGFzc3dvcmQ=",
+            ),
+            (
+                r#"{"stdout":"{\u0022api_key\u0022: \u0022FAKEfake0123456789abcdef\u0022}"}"#,
+                "FAKEfake0123456789abcdef",
+            ),
+            // JSON inside a JSON string inside the printed file.
+            (
+                r#"{"stdout":"{\"env\": \"{\\\"db_password\\\":\\\"correct-horse-battery\\\"}\"}\n"}"#,
+                "correct-horse-battery",
+            ),
+            // Line two of a `.env`: the escaped newline is the word boundary
+            // the case-sensitive rules need.
+            (
+                r#"{"stdout":"DB_HOST=localhost\nLITESTREAM_ACCESS_KEY_ID=fake0000fake0000fake0000fake0000\n"}"#,
+                "fake0000fake0000fake0000fake0000",
+            ),
+            (
+                r#"{"stdout":"region=us-east-1\nAKIAFAKEFAKEFAKEFAKE\n"}"#,
+                "AKIAFAKEFAKEFAKEFAKE",
+            ),
+            // A tab between header name and value, as `curl -v` prints it.
+            (
+                r#"{"stdout":"> X-Api-Key:\tFAKEfake0123456789abcdef\n"}"#,
+                "FAKEfake0123456789abcdef",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "escaped JSON secret must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// The view hands the rules the real line break, so a value stops at the
+    /// end of its line instead of swallowing the rest of the result, and a
+    /// match that ends on an escape covers the whole escape.
+    #[test]
+    fn a_redaction_inside_an_escaped_json_tool_result_keeps_the_rest() {
+        let s = s();
+        assert_eq!(
+            s.scrub(
+                r#"{"stdout":"DB_PASSWORD=hunter2hunter2\nPORT=5432\n","stderr":"","interrupted":false}"#
+            ),
+            r#"{"stdout":"[REDACTED:auth_header]\nPORT=5432\n","stderr":"","interrupted":false}"#
+        );
+        assert_eq!(
+            s.scrub(r#"{"stdout":"{\"db_password\": \"correct-horse-battery\/\"}"}"#),
+            r#"{"stdout":"{\"[REDACTED:auth_header]\"}"}"#
+        );
+    }
+
+    /// Compact JSON has no whitespace for a `KEY=value` rule's value to stop
+    /// at, so a quoted value ends at its closing quote; otherwise the
+    /// redaction runs to the end of the stored result and leaves invalid JSON.
+    #[test]
+    fn a_quoted_secret_in_compact_json_stops_at_its_closing_quote() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret) in [
+            (
+                r#"{"stdout":"{\"db_password\":\"correct-horse-battery\"}","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"DB_PASSWORD\":\"AKIAFAKEFAKEFAKEFAKE\"}","stderr":"","interrupted":false}"#,
+                "AKIAFAKEFAKEFAKEFAKE",
+            ),
+            (
+                r#"{"stdout":"{\"db_password\":\"sk-FAKEfake0123456789abcdef\"}","stderr":"","interrupted":false}"#,
+                "sk-FAKEfake0123456789abcdef",
+            ),
+            (
+                r#"{"stdout":"{\"SESSION_SECRET\":\"short\"}","stderr":"","interrupted":false}"#,
+                "short",
+            ),
+            (
+                r#"{"stdout":"{\"env\":\"{\\\"DB_PASSWORD\\\":\\\"correct-horse-battery\\\"}\"}","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"DB_PASSWORD\":\"a\\\"b\\\\c-correct-horse\"}","stderr":"","interrupted":false}"#,
+                "correct-horse",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "secret must be redacted: {raw} -> {out}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {raw} -> {out}"));
+            assert_eq!(parsed["interrupted"], false, "{raw} -> {out}");
+        }
+        // The same rule over plain text: a quoted value with spaces is
+        // redacted whole instead of up to its first space.
+        let out = s.scrub("DB_PASSWORD=\"correct horse battery\"\nPORT=5432");
+        assert_eq!(out, "[REDACTED:env_secret]\"\nPORT=5432");
+    }
+
+    /// Plain text with a literal escape (a dotenv multi-line value, a shell
+    /// string with `\"`) reads differently through the decoded view, where
+    /// the escape ends the value early. The view only ever widens a
+    /// redaction: each one still covers at least what the plain text match
+    /// covers.
+    #[test]
+    fn a_literal_escape_in_plain_text_never_shortens_a_redaction() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, tail) in [
+            (
+                r#"JWT_SECRET="firstHALF\nSECONDHALFsecret""#,
+                "SECONDHALFsecret",
+            ),
+            (
+                r#"export WEBHOOK_SECRET="abc\"SECONDHALFsecret""#,
+                "SECONDHALFsecret",
+            ),
+            (
+                r"STRIPE_SECRET_KEY=sk_live_FAKE\tSECONDHALFsecret",
+                "SECONDHALFsecret",
+            ),
+            (r#"DB_PASSWORD="abc"SECRETTAIL"#, "SECRETTAIL"),
+            (r#"DB_PASSWORD="abc"SECRETTAIL"more"#, "SECRETTAIL"),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(tail),
+                "tail of the secret stored in clear: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// In a compact JSON line the escapes are JSON's own, so the view is
+    /// exact there: the text as written must neither start a redaction
+    /// inside an escape (`x\[REDACTED…]`) nor run an unquoted value past the
+    /// escaped line break to the end of the result.
+    #[test]
+    fn a_secret_in_a_compact_json_line_keeps_the_rest_valid() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret, survivor) in [
+            (
+                r#"{"stdout":"DB_HOST=x\nDB_PASSWORD=hunter2hunter2\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "hunter2hunter2",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"DB_HOST=x\nSTRIPE_SECRET=abcFAKEfake0123456789\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123456789\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"x\napi_key: FAKEfake0123456789abcdef\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "FAKEfake0123456789abcdef",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"{\"STRIPE_SECRET\":\"abcFAKEfake0123456789\",\"next\":\"keep\"}","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r#",\"next\":\"keep\"}"#,
+            ),
+            // Scrubbed a second time: the marker is no secret to run past.
+            (
+                r#"{"stdout":"STRIPE_SECRET=[REDACTED:env_secret]\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "STRIPE_SECRET",
+                r"\nPORT=5432\n",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret) && out.contains(survivor),
+                "{raw} -> {out}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {raw} -> {out}"));
+            assert_eq!(parsed["interrupted"], false, "{raw} -> {out}");
+        }
+    }
+
+    /// A body that is itself one line of JSON (a minified file, a JSON
+    /// literal in a prompt) can hold a value whose escaped tab or line break
+    /// is part of the secret. The view stops the value there; the rest of
+    /// that JSON string is still redacted, and no further (#1974).
+    #[test]
+    fn a_secret_continued_past_an_escape_in_a_json_body_is_redacted_whole() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        let deep = format!(
+            "{}\"JWT_SECRET=firstHALF\\nSECONDHALFsecret\"{}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        for raw in [
+            r#"{"JWT_SECRET":"firstHALF\nSECONDHALFsecret"}"#.to_string(),
+            r#""JWT_SECRET=firstHALF\nSECONDHALFsecret""#.to_string(),
+            r#"["STRIPE_SECRET_KEY=sk_live_FAKE\tSECONDHALFsecret"]"#.to_string(),
+            r#"["JWT_SECRET=firstHALF\r\nSECONDHALFsecret","keep"]"#.to_string(),
+            // Base64 padding is no `KEY=` line.
+            r#""JWT_SECRET=firstHALF\nSECONDHALFsecretcmQ=""#.to_string(),
+            deep,
+        ] {
+            let out = s.scrub(&raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains("SECONDHALF"),
+                "tail of the secret stored in clear: {raw} -> {out}"
+            );
+            // The key and its value are one match, so redacting a quoted
+            // key's pair removes the `":"` between them, as it always has.
+            if !raw.starts_with('{') {
+                assert!(
+                    serde_json::from_str::<serde::de::IgnoredAny>(&out).is_ok(),
+                    "redaction broke the JSON: {raw} -> {out}"
+                );
+            }
+            if raw.contains("keep") {
+                assert!(out.contains(r#","keep"]"#), "{raw} -> {out}");
+            }
+        }
+    }
+
+    /// Compact JSON has no whitespace, so one plain match can span several
+    /// `.env` lines and their secrets. Only each secret's own tail is
+    /// extended; the lines between and after them survive (#1974).
+    #[test]
+    fn lines_between_secrets_in_a_compact_json_line_survive() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secrets, survivors) in [
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123\nPORT=5432\nOTHER_SECRET=defFAKEfake0123\n","x":"keep"}"#,
+                &["abcFAKEfake0123", "defFAKEfake0123"][..],
+                &[r"\nPORT=5432\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123\r\nPORT=5432\r\nOTHER_SECRET=defFAKEfake0123\r\n","x":"keep"}"#,
+                &["abcFAKEfake0123", "defFAKEfake0123"][..],
+                &[r"\r\nPORT=5432\r\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"A_SECRET=xFAKEfake0123\nyyyy\nzz\n","x":"keep"}"#,
+                &["xFAKEfake0123"][..],
+                &[r"\nyyyy\nzz\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"DB_HOST=x\nSTRIPE_SECRET=abcFAKEfake0123\n# comment keep\n","x":"keep"}"#,
+                &["abcFAKEfake0123"][..],
+                &[r"DB_HOST=x\n", r"\n# comment keep\n", r#""x":"keep""#][..],
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(out.contains("[REDACTED:"), "{raw} -> {out}");
+            for secret in secrets {
+                assert!(!out.contains(secret), "{secret} kept: {raw} -> {out}");
+            }
+            for survivor in survivors {
+                assert!(out.contains(survivor), "{survivor} lost: {raw} -> {out}");
+            }
+            assert!(
+                serde_json::from_str::<serde::de::IgnoredAny>(&out).is_ok(),
+                "redaction broke the JSON: {raw} -> {out}"
+            );
+        }
+        // At scale: the lines after the secret keep their size.
+        let raw = serde_json::json!({"stdout": format!("A_SECRET=xFAKEfake0123\n{}", "yyyy\nzz\n".repeat(100_000))})
+            .to_string();
+        let out = s.scrub(&raw);
+        assert!(
+            !out.contains("xFAKEfake0123") && out.len() > raw.len() - 64,
+            "{}",
+            out.len()
+        );
+    }
+
+    /// Outside JSON, a redaction never starts between a backslash and the
+    /// character it escapes.
+    #[test]
+    fn a_redaction_never_starts_inside_an_escape() {
+        let s = s();
+        let out = s.scrub(r"note: DB_HOST=x\nDB_PASSWORD=hunter2hunter2 done");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains(r"x\["), "{out}");
+    }
+
+    /// Decoding widens only what the rules see through, never what counts as
+    /// a key or a value; a malformed escape is text.
+    #[test]
+    fn an_escaped_json_tool_result_without_a_secret_is_left_alone() {
+        let s = s();
+        for raw in [
+            r#"{"stdout":"{\"Idempotency-Key\": \"00000000-0000-0000-0000-000000000000\"}\n"}"#,
+            r#"{"stdout":"{\"Access-Control-Allow-Credentials\": true}\n"}"#,
+            r#"{"stdout":"{\"password_hint\": \"see 1Password\"}\n"}"#,
+            r#"{"stdout":"C:\\Users\\me\\token.txt\n"}"#,
+            r#"{"stdout":"\ud83d\ude00 \udead \u12 \x41 \"}"#,
+        ] {
+            assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
         }
     }
 
@@ -1285,6 +2382,77 @@ mod tests {
         ] {
             let out = s().scrub(raw);
             assert_eq!(out, raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// ai-memory's own credentials: the root bearer `generate-auth-token`
+    /// mints (64 hex characters) under the bare `token` key a hook spool
+    /// entry stores it in, and the `aim_`/`ams_` keys and session secrets.
+    /// An agent printing a spool entry while debugging delivery is how the
+    /// first reaches a tool result (#1982). The rest of the result is kept
+    /// and still parses.
+    #[test]
+    fn ai_memorys_own_credentials_are_redacted() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        let hex = "0123456789abcdef".repeat(4);
+        let key = format!("aim_{}", "FAKEfake0123-_xy".repeat(3));
+        let session = format!("ams_{}", "FAKEfake0123-_xy".repeat(3));
+        let spool = format!(
+            r#"{{"stdout":"{{\"url\":\"http://127.0.0.1:0/hook?event=post-tool-use\",\"body\":\"...\",\"created_ms\":0,\"auth_mode\":\"static\",\"token\":\"{hex}\",\"attempts\":0}}\n","stderr":"","interrupted":false}}"#
+        );
+        let out = s.scrub(&spool);
+        assert!(!out.contains(&hex), "{spool} -> {out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {out}"));
+        let inner = parsed["stdout"].as_str().unwrap();
+        assert!(
+            inner.contains(r#""auth_mode":"static""#) && inner.contains(r#""attempts":0}"#),
+            "the fields around the token must survive: {out}"
+        );
+        assert_eq!(parsed["interrupted"], false, "{out}");
+
+        for (raw, secret) in [
+            (format!(r#"{{"token":"{hex}"}}"#), hex.as_str()),
+            (
+                format!(r#"{{"stdout":"{{\\\"token\\\":\\\"{hex}\\\"}}"}}"#),
+                hex.as_str(),
+            ),
+            (format!("token = \"{hex}\"\n"), hex.as_str()),
+            (format!("token: '{hex}'\n"), hex.as_str()),
+            (format!("TOKEN={hex}"), hex.as_str()),
+            (format!(r#"{{"token":"{key}","id":"k1"}}"#), key.as_str()),
+            (format!("$ cat hook-key\n{key}\n"), key.as_str()),
+            (
+                format!("Cookie: ai_memory_session={session}"),
+                session.as_str(),
+            ),
+        ] {
+            let out = s.scrub(&raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "credential must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// The bare `token` key also names tokenizer output, counts and short
+    /// literals, and `aim_` starts ordinary identifiers; none of those carry
+    /// a credential, so the value floor and the key-prefix shape leave them
+    /// byte-identical.
+    #[test]
+    fn a_bare_token_key_without_a_credential_is_left_alone() {
+        let s = s();
+        for raw in [
+            r#"{"token":"Hello","logprob":-0.12}"#,
+            r#"{"tokens":1234,"token_count":1234567890}"#,
+            r#"{"stdout":"{\"token\":\"short-lived\"}\n"}"#,
+            "token: the next word the model emits",
+            "Continuation-Token: 0123456789abcdef0123456789abcdef0123456789",
+            "let aim_target_position = aim_offset + 1;",
+            "ams_ and aim_ are the key prefixes",
+        ] {
+            assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
         }
     }
 }

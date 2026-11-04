@@ -107,10 +107,7 @@ impl AuthPosture {
     /// `server_open` is whether the server is known to answer without a
     /// credential.
     pub(crate) fn classify(server_open: bool, server_url: &str) -> Self {
-        match (
-            server_open,
-            crate::commands::hook_spool::is_loopback_url(server_url),
-        ) {
+        match (server_open, crate::http_client::is_loopback_url(server_url)) {
             (false, _) => Self::Token,
             (true, true) => Self::NoneLoopback,
             (true, false) => Self::None,
@@ -123,6 +120,17 @@ impl AuthPosture {
             Self::Token => "bearer token".to_owned(),
             Self::NoneLoopback => format!("none (loopback) — fix: `{AUTH_ENABLE_FIX}`"),
             Self::None => "none — set AI_MEMORY_AUTH_TOKEN on the server".to_owned(),
+        }
+    }
+
+    pub(crate) fn localized_line(self, i18n: &ai_memory_core::i18n::Localizer) -> String {
+        if i18n.language() == ai_memory_core::i18n::Language::English {
+            return self.line();
+        }
+        match self {
+            Self::Token => i18n.text("cli-auth-posture-token"),
+            Self::NoneLoopback => i18n.one("cli-auth-posture-loopback", AUTH_ENABLE_FIX),
+            Self::None => i18n.text("cli-auth-posture-none"),
         }
     }
 

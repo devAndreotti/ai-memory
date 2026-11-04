@@ -53,6 +53,23 @@ fn render(body: &str, workspace: &str, project: &str) -> String {
     render_document(body, workspace, project).html
 }
 
+/// Render bundled product docs with repository-aware links, without wiki routing.
+pub(crate) fn render_reference_document(
+    body: &str,
+    mut rewrite: impl FnMut(&str) -> String,
+) -> Rendered {
+    let mut headings = HeadingIdAssigner::new(Parser::new_ext(body, options()));
+    let events = headings
+        .by_ref()
+        .map(|event| sanitize_event_with_links(event, |url| CowStr::Boxed(rewrite(&url).into())));
+    let mut html = String::new();
+    html::push_html(&mut html, events);
+    Rendered {
+        html,
+        outline: headings.outline,
+    }
+}
+
 /// A rendered page body and the headings it contains.
 pub struct Rendered {
     /// The sanitized HTML.
@@ -114,10 +131,22 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
         Some(i) => (&trimmed[..i], &trimmed[i..]),
         None => (trimmed, ""),
     };
-    if path_part.is_empty() || path_part.contains("..") {
-        return dest; // don't rewrite traversal; safe_url/router will reject
+    let Some(decoded) = ai_memory_wiki::decode_markdown_destination_path(path_part) else {
+        return CowStr::Borrowed("#");
+    };
+    let decoded_path = decoded.as_ref();
+    if decoded_path.is_empty()
+        || decoded_path.contains("..")
+        || decoded_path.starts_with('/')
+        || decoded_path.contains(['\\', ':'])
+    {
+        return if decoded_path == path_part {
+            dest
+        } else {
+            CowStr::Borrowed("#")
+        };
     }
-    let mut path_part = path_part.trim_end_matches('/');
+    let mut path_part = decoded_path.trim_end_matches('/');
     while let Some(rest) = path_part.strip_prefix("./") {
         path_part = rest;
     }
@@ -269,11 +298,18 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Reject non-page extensions, normalise the `.md` suffix, then rely on
     // the canonical page-path validator for traversal, absolute paths,
     // Windows prefixes, backslashes, and empty segments.
+    //
+    // A directory target (trailing slash, empty last segment) and a
+    // stem-less `.md` cannot name a page; leaving them as literal text
+    // aligns web rendering with the wiki link extractor.
     let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
     let last_segment = path.rsplit('/').next().unwrap_or("");
+    if last_segment.is_empty() || last_segment == ".md" {
+        return None;
+    }
     let path = if last_segment.contains('.') {
         if !path.ends_with(".md") {
             return None;
@@ -535,6 +571,13 @@ fn slugify(text: &str) -> String {
 }
 
 fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event<'a> {
+    sanitize_event_with_links(event, |url| scope_relative_link(url, workspace, project))
+}
+
+fn sanitize_event_with_links<'a>(
+    event: Event<'a>,
+    mut rewrite: impl FnMut(CowStr<'a>) -> CowStr<'a>,
+) -> Event<'a> {
     match event {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
         Event::Start(Tag::Link {
@@ -546,7 +589,7 @@ fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event
             link_type,
             // Scope relative in-wiki targets first (#603), then run the
             // scheme allowlist over whatever remains.
-            dest_url: safe_url(scope_relative_link(dest_url, workspace, project)),
+            dest_url: safe_url(rewrite(dest_url)),
             title,
             id,
         }),
@@ -690,28 +733,14 @@ fn has_external_or_unsafe_scheme(target: &str) -> bool {
         || lower.starts_with("file:")
 }
 
-/// Escape text for insertion into an HTML template while preserving the
-/// fixed `<mark>` tags emitted by SQLite FTS snippets.
+/// Escape an internal FTS snippet for insertion into an HTML template.
+///
+/// SQLite wraps matches in control delimiters that the durable sanitizer
+/// forbids in page content. Only those unforgeable delimiters become
+/// `<mark>` tags; literal markup from a page is always escaped.
 #[must_use]
 pub fn escape_snippet(snippet: &str) -> String {
-    escape_html(snippet)
-        .replace("&lt;mark&gt;", "<mark>")
-        .replace("&lt;/mark&gt;", "</mark>")
-}
-
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
+    ai_memory_store::highlighted_snippet_html(snippet)
 }
 
 /// Drop the leading H1 from a markdown body when it repeats `title`.
@@ -892,9 +921,43 @@ mod tests {
 
     #[test]
     fn escapes_search_snippet_but_keeps_marks() {
-        let out = escape_snippet("<script>x</script> <mark>hit</mark>");
+        let out = escape_snippet(&format!(
+            "<script>x</script> {}hit{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        ));
         assert!(out.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(out.contains("<mark>hit</mark>"));
+    }
+
+    #[test]
+    fn a_literal_mark_tag_in_page_text_stays_text() {
+        assert_eq!(
+            escape_snippet("use <mark> here <mark>hit</mark>"),
+            "use &lt;mark&gt; here &lt;mark&gt;hit&lt;/mark&gt;"
+        );
+        assert_eq!(escape_snippet("see <mark> here"), "see &lt;mark&gt; here");
+        assert_eq!(escape_snippet("a </mark> b"), "a &lt;/mark&gt; b");
+        let highlighted = format!(
+            "{}a{} x {}b{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END,
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&highlighted),
+            "<mark>a</mark> x <mark>b</mark>"
+        );
+        let escaped_inside = format!(
+            "{}a&b{} <script>",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&escaped_inside),
+            "<mark>a&amp;b</mark> &lt;script&gt;"
+        );
     }
 
     #[test]
@@ -971,6 +1034,53 @@ mod tests {
         assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
         assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
         assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
+    }
+
+    #[test]
+    fn markdown_url_destinations_are_decoded_once_before_route_encoding() {
+        let html = render(
+            "[space](notes/my%20note.md#part) [literal percent](notes/my%2520note.md) \
+             [separator](notes%2Fmy%20note.md) [unicode](notes/%E6%97%A5%E6%9C%AC.md)",
+            "default",
+            "scratch",
+        );
+        for href in [
+            "w/default/scratch/p/notes/my%20note.md#part",
+            "w/default/scratch/p/notes/my%2520note.md",
+            "w/default/scratch/p/notes/%E6%97%A5%E6%9C%AC.md",
+        ] {
+            assert!(html.contains(href), "{html}");
+        }
+        let wiki = render("[[notes/my%20note.md]]", "default", "scratch");
+        assert!(
+            wiki.contains("w/default/scratch/p/notes/my%2520note.md"),
+            "{wiki}"
+        );
+    }
+
+    #[test]
+    fn decoded_markdown_destinations_cannot_change_the_web_scope() {
+        for destination in [
+            "%2e%2e/secret.md",
+            "%2Fadmin/backup",
+            "notes%5Csecret.md",
+            "other%3Anotes/secret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            let html = render(&format!("[note](<{destination}>)"), "default", "scratch");
+            assert!(html.contains("href=\"#\""), "{destination}: {html}");
+        }
+        let html = render(
+            "[note](%77/foreign/project/p/secret.md)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains("w/default/scratch/p/w/foreign/project/p/secret.md"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1147,6 +1257,23 @@ mod tests {
             "scratch",
         );
         assert!(!d.contains("<a href"), "invalid page path: {d}");
+    }
+
+    #[test]
+    fn wikilink_directory_and_stemless_targets_stay_literal() {
+        // A trailing slash (directory target) or a stem-less `.md` cannot
+        // name a page; rewrite must not emit broken 404 links.
+        let html = render(
+            "[[notes/]] [[notes/.md]] [[.md]] [[other:notes/]] [[notes/|Folder]]",
+            "default",
+            "scratch",
+        );
+        assert!(!html.contains("<a href"), "no linkified targets: {html}");
+        assert!(html.contains("[[notes/]]"));
+        assert!(html.contains("[[notes/.md]]"));
+        assert!(html.contains("[[.md]]"));
+        assert!(html.contains("[[other:notes/]]"));
+        assert!(html.contains("[[notes/|Folder]]"));
     }
 
     /// A `~~~` fence must NOT be closed by a `` ``` `` line and vice
@@ -1452,5 +1579,24 @@ mod tests {
             html.contains(r#"<h2 id="my-section">My Section</h2>"#),
             "heading id: {html}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reference_document_tests {
+    #[test]
+    fn bundled_guides_keep_unsafe_markup_inert_and_use_document_anchors() {
+        let doc = crate::documentation::find("features").unwrap();
+        let rendered = super::render_reference_document(
+            "# Example\n\n<script>alert(1)</script>\n\n[x](javascript:alert) [guide](install.md) [local](#example)\n\n```text\n[[private-page]]\n```",
+            |url| crate::documentation::link(doc, "docs/features", url),
+        );
+        assert!(!rendered.html.contains("<script>"));
+        assert!(rendered.html.contains("&lt;script&gt;"));
+        assert!(!rendered.html.contains("href=\"javascript:"));
+        assert!(rendered.html.contains("href=\"docs/install\""));
+        assert!(rendered.html.contains("href=\"docs/features#example\""));
+        assert!(rendered.html.contains("[[private-page]]"));
+        assert_eq!(rendered.outline[0].id, "example");
     }
 }

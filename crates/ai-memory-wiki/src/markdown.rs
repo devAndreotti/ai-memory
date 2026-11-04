@@ -6,7 +6,7 @@
 //! basic-memory hit (#528). Reading through [`crate::frontmatter_yaml`] and
 //! writing through `serde-saphyr` directly keeps the round-trip predictable.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, LinkTarget, PagePath};
@@ -44,7 +44,8 @@ pub struct Markdown {
 ///
 /// Recognises only the canonical `---\n<yaml>\n---\n` block at the very
 /// start of the document, with either LF or CRLF line endings on the fence
-/// lines. Anything else is treated as body.
+/// lines. The closing fence may also end the file without a line ending.
+/// Anything else is treated as body.
 ///
 /// A leading UTF-8 BOM is dropped either way. It only means "this file is
 /// UTF-8" while it sits at offset zero; carried into `body` it is a
@@ -69,11 +70,25 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
         (trimmed.strip_prefix("---\n"), "\n")
     };
     let close = format!("\n---{newline}");
-    if let Some(rest) = rest
-        && let Some(end) = rest.find(&close)
-    {
-        let fm_str = rest[..end].trim_end_matches('\r');
-        let body = rest[end + close.len()..].to_string();
+    // The closing fence may also be the file's last line with no line
+    // ending after it: a frontmatter-only file (a `_meta.md` scope manifest,
+    // a stub page) saved by an editor that does not add a final newline.
+    let split = rest.and_then(|rest| {
+        // An empty block puts the closing fence first, with no line before
+        // it to supply the newline `close` starts with.
+        if let Some(body) = rest.strip_prefix(&close[1..]) {
+            return Some(("", body));
+        }
+        if rest == "---" {
+            return Some(("", ""));
+        }
+        rest.find(&close)
+            .map(|end| (&rest[..end], &rest[end + close.len()..]))
+            .or_else(|| rest.strip_suffix("\n---").map(|fm| (fm, "")))
+    });
+    if let Some((fm_str, body)) = split {
+        let fm_str = fm_str.trim_end_matches('\r');
+        let body = body.to_string();
         let fm_json = crate::frontmatter_yaml::parse(fm_str).map_err(WikiError::Yaml)?;
         return Ok(Markdown {
             frontmatter: fm_json,
@@ -116,8 +131,8 @@ pub fn emit(md: &Markdown) -> WikiResult<String> {
 
 /// Derive a page title.
 ///
-/// Priority: frontmatter.title (string) → first `# ` heading in body →
-/// path stem with the `.md` suffix stripped.
+/// Priority: frontmatter.title (string) → first `# ` heading in body
+/// outside fenced code blocks → path stem with the `.md` suffix stripped.
 #[must_use]
 pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath) -> String {
     if let Some(t) = frontmatter.get("title").and_then(serde_json::Value::as_str) {
@@ -126,7 +141,15 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
             return trimmed.to_string();
         }
     }
+    let mut fence = None;
     for line in body.lines() {
+        // A `# ` line inside a fenced block is a shell or Python comment,
+        // not a heading.
+        let (next, in_code) = CodeFence::step(fence, line);
+        fence = next;
+        if in_code {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# ") {
             let trimmed = rest.trim();
             if !trimmed.is_empty() {
@@ -157,7 +180,11 @@ impl CodeFence {
     /// Returns `(updated_fence_state, line_is_code_or_fence)`.
     fn step(current: Option<Self>, line: &str) -> (Option<Self>, bool) {
         let in_fence = current.is_some();
-        let trimmed = line.trim_start();
+        let leading_spaces = line.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        if leading_spaces > 3 {
+            return (current, in_fence);
+        }
+        let trimmed = &line[leading_spaces..];
         let glyph = match trimmed.chars().next() {
             Some(c @ ('`' | '~')) => c,
             _ => return (current, in_fence),
@@ -626,6 +653,120 @@ fn delink_wikilinks_in_segment(
     }
 }
 
+/// Normalise a bare same-project path exactly as [`extract_links`]
+/// normalises a wikilink target: trimmed, an extension-less final
+/// segment gains `.md`, a non-`.md` extension and a target that cannot
+/// name a page are rejected, and `.`/`..` resolve from the wiki root (a
+/// wikilink target is root-relative whatever page it sits on, so no
+/// source page is needed). The consolidation batch path keys its
+/// proposed-to-final redirects with this so a sibling wikilink and the
+/// proposal it points at normalise to one key (#1943).
+pub fn normalize_wikilink_path(raw: &str) -> Option<PagePath> {
+    // `page_path` is unused for wikilink targets (root-relative), so a
+    // placeholder stands in for the missing source page.
+    let placeholder = PagePath::new("placeholder.md").ok()?;
+    let normalized = normalize_link_target(raw, &placeholder, true)?;
+    PagePath::new(normalized).ok()
+}
+
+/// Rewrite `body`'s same-project wikilinks whose normalised path is a key
+/// in `redirects`, replacing the target with the mapped path and keeping
+/// any `|label`. Scope-qualified links, fenced code blocks and inline
+/// code spans are copied byte-identically, exactly as [`delink_wikilinks`]
+/// treats them, and so is every link whose target is not in the map.
+///
+/// The consolidation batch path uses this to repoint sibling links at a
+/// Rule page's final path after the `_rules/<slug>` routing or the
+/// same-batch collision resolver moved it away from the path the model
+/// proposed (#1943): left alone, those links target a page that never
+/// exists, and same-project links are by design allowed to dangle, so no
+/// later pass repairs them.
+#[must_use]
+pub fn rewrite_wikilink_targets(
+    body: &str,
+    page_path: &PagePath,
+    redirects: &BTreeMap<String, String>,
+) -> String {
+    if redirects.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<CodeFence> = None;
+    for raw_line in body.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw_line);
+        let (next_fence, is_fence_or_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_fence_or_code {
+            out.push_str(line);
+            out.push_str(terminator);
+            continue;
+        }
+        let code_spans = inline_code_spans(line);
+        let mut pos = 0;
+        for span in &code_spans {
+            rewrite_wikilink_targets_in_segment(
+                &line[pos..span.start],
+                page_path,
+                redirects,
+                &mut out,
+            );
+            out.push_str(&line[span.clone()]);
+            pos = span.end;
+        }
+        rewrite_wikilink_targets_in_segment(&line[pos..], page_path, redirects, &mut out);
+        out.push_str(terminator);
+    }
+    out
+}
+
+fn rewrite_wikilink_targets_in_segment(
+    seg: &str,
+    page_path: &PagePath,
+    redirects: &BTreeMap<String, String>,
+    out: &mut String,
+) {
+    let mut rest = seg;
+    loop {
+        let Some(start) = rest.find("[[") else {
+            out.push_str(rest);
+            return;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            out.push_str(&rest[start..]);
+            return;
+        };
+        let raw = &after_start[..end];
+        // Parse exactly as `extract_wikilinks` does, mirroring
+        // `delink_wikilinks_in_segment`, so the occurrence matched here is
+        // the occurrence the extractor indexed.
+        let (target_part, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(t, l)| (t, Some(l)));
+        let unlabelled = target_part.trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        let redirected = (workspace.is_none() && project.is_none())
+            .then(|| normalize_link_target(&path_part, page_path, true))
+            .flatten()
+            .and_then(|path| redirects.get(&path).cloned());
+        if let Some(target) = redirected {
+            out.push_str("[[");
+            out.push_str(&target);
+            if let Some(label) = label {
+                out.push('|');
+                out.push_str(label);
+            }
+            out.push_str("]]");
+        } else {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
 /// Resolve a local `[[...]]` wikilink target into `(bundle-relative href,
 /// display label)`. Returns `None` when the target is cross-project,
 /// cross-workspace, empty, or otherwise not a page — the caller then keeps
@@ -671,9 +812,15 @@ fn resolve_local_wikilink(
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let mut href = relative_href(&page_dir, &target);
+    // The wikilink names a literal path; a Markdown destination is a URL
+    // that `extract_links` decodes once, so a literal `%` leaves as `%25`.
+    let mut href = relative_href(&page_dir, &target).replace('%', "%25");
     href.push_str(suffix);
-    let display = label.map_or(target_part, str::trim).to_string();
+    let display = label
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or(target_part)
+        .to_string();
     Some((href, display))
 }
 
@@ -760,31 +907,45 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
 }
 
 fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
-    let mut start_at = 0;
-    while let Some(rel_start) = line[start_at..].find('[') {
-        let start = start_at + rel_start;
-        if start > 0 && line.as_bytes()[start - 1] == b'!' {
-            start_at = start + 1;
-            continue;
+    // Track labels in one pass: rescanning an unmatched outer label would
+    // make repeated `[` quadratic and hide valid inner links.
+    let mut labels = Vec::new();
+    let mut last_escaped = None;
+    let mut pos = 0;
+    while pos < line.len() {
+        match line.as_bytes()[pos] {
+            b'\\' => {
+                pos += 1;
+                if let Some(next) = line[pos..].chars().next() {
+                    last_escaped = Some(pos);
+                    pos += next.len_utf8();
+                }
+            }
+            b'[' => {
+                labels.push(
+                    pos > 0 && line.as_bytes()[pos - 1] == b'!' && last_escaped != Some(pos - 1),
+                );
+                pos += 1;
+            }
+            b']' => {
+                let image = labels.pop();
+                pos += 1;
+                if let Some(image) = image
+                    && line.as_bytes().get(pos) == Some(&b'(')
+                    && let Some((raw, target_end)) = parse_link_destination(&line[pos + 1..])
+                {
+                    if !image && let Some(path) = normalize_link_target(raw, page_path, false) {
+                        out.insert((None, None, path));
+                    }
+                    pos += target_end + 2;
+                    // Images may appear in a link's label; links may not.
+                    if !image {
+                        labels.clear();
+                    }
+                }
+            }
+            _ => pos += 1,
         }
-        let after_start = start + 1;
-        let Some(rel_close) = line[after_start..].find(']') else {
-            break;
-        };
-        let close = after_start + rel_close;
-        if !line[close + 1..].starts_with('(') {
-            start_at = close + 1;
-            continue;
-        }
-        let target_start = close + 2;
-        let Some((raw, target_end)) = parse_link_destination(&line[target_start..]) else {
-            start_at = close + 1;
-            continue;
-        };
-        if let Some(path) = normalize_link_target(raw, page_path, false) {
-            out.insert((None, None, path));
-        }
-        start_at = target_start + target_end + 1;
     }
 }
 
@@ -879,6 +1040,48 @@ fn closing_paren_after_destination(tail: &str) -> Option<usize> {
     None
 }
 
+/// Decode the path portion of an ordinary Markdown URL destination once.
+///
+/// Split literal query and fragment delimiters before calling this helper:
+/// an encoded `%23` or `%3F` names a character in the filename. Wikilinks
+/// name literal page paths and must not go through URL decoding. Invalid
+/// escape spellings stay literal; invalid UTF-8 and encoded control bytes
+/// have no portable page-path representation and are refused.
+#[must_use]
+pub fn decode_markdown_destination_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !path.contains('%') {
+        return Some(std::borrow::Cow::Borrowed(path));
+    }
+    let mut decoded = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes
+                    .get(pos + 1)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+                bytes
+                    .get(pos + 2)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+            )
+        {
+            let byte = (hi * 16 + lo) as u8;
+            if byte.is_ascii_control() {
+                return None;
+            }
+            decoded.push(byte);
+            pos += 3;
+        } else {
+            decoded.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(std::borrow::Cow::Owned)
+}
+
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
     let target = raw
         .split_once('|')
@@ -886,26 +1089,27 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
         .trim()
         .trim_matches('<')
         .trim_matches('>');
-    if target.is_empty() || target.starts_with('#') || target.contains("://") {
+    if target.is_empty() || target.starts_with('#') {
         return None;
     }
+    let path = target.split(['#', '?']).next()?.trim();
+    let decoded = if wikilink {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        decode_markdown_destination_path(path)?
+    };
+    let target = decoded.as_ref();
     let lower = target.to_ascii_lowercase();
-    if lower.starts_with("mailto:")
+    if target.is_empty()
+        || target.contains("://")
+        || target.contains('\\')
+        || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
         || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
         || lower.starts_with("file:")
     {
-        return None;
-    }
-
-    let target = target.split_once('#').map_or(target, |(path, _)| path);
-    let target = target
-        .split_once('?')
-        .map_or(target, |(path, _)| path)
-        .trim();
-    if target.is_empty() || target.contains('\\') {
         return None;
     }
 
@@ -1238,6 +1442,61 @@ mod tests {
         assert_eq!(md.frontmatter["pinned"], true);
         assert_eq!(md.frontmatter["tags"][0], "a");
         assert_eq!(md.body, "Body\r\n");
+    }
+
+    /// A frontmatter-only file whose closing fence is the last line, saved
+    /// without a final newline (the editor default in several editors). The
+    /// block is still the frontmatter: reading it as body loses the `_meta.md`
+    /// workspace name and a page's tier, pin and TTL, and the OKF file pass
+    /// would write a second frontmatter block above it.
+    #[test]
+    fn parses_frontmatter_closed_at_end_of_file() {
+        let md = parse("---\ntitle: Hello\npinned: true\n---").unwrap();
+        assert_eq!(md.frontmatter["title"], "Hello");
+        assert_eq!(md.frontmatter["pinned"], true);
+        assert_eq!(md.body, "");
+        assert_eq!(
+            emit(&md).unwrap(),
+            "---\ntitle: Hello\npinned: true\n---\n",
+            "re-emitting must keep a single frontmatter block"
+        );
+
+        let crlf = parse("\u{FEFF}---\r\ntitle: Hello\r\n---").unwrap();
+        assert_eq!(crlf.frontmatter["title"], "Hello");
+        assert_eq!(crlf.body, "");
+    }
+
+    /// An empty block (`---` straight after `---`, the Jekyll idiom) is
+    /// frontmatter. Its closing fence has no newline in front of it, so it
+    /// was missed: the page body was read as YAML up to the next `---` rule,
+    /// or the whole file was kept as body.
+    #[test]
+    fn parses_empty_frontmatter_block() {
+        let md = parse("---\n---\n# Title\n\nIntro.\n\n---\n\nMore.\n").unwrap();
+        assert!(md.frontmatter.is_null(), "{:?}", md.frontmatter);
+        assert_eq!(md.body, "# Title\n\nIntro.\n\n---\n\nMore.\n");
+
+        let md = parse("---\n---\nbody").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body");
+
+        let crlf = parse("\u{FEFF}---\r\n---\r\nbody\r\n").unwrap();
+        assert!(crlf.frontmatter.is_null());
+        assert_eq!(crlf.body, "body\r\n");
+
+        let only = parse("---\n---").unwrap();
+        assert!(only.frontmatter.is_null());
+        assert_eq!(only.body, "");
+    }
+
+    /// A body line that merely starts with `---` at the end of the file is
+    /// not a closing fence.
+    #[test]
+    fn trailing_dashes_line_is_not_a_closing_fence() {
+        let src = "---\ntitle: Hello\n----";
+        let md = parse(src).unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, src);
     }
 
     /// A page a Windows editor saved with a UTF-8 BOM and no frontmatter:
@@ -1575,6 +1834,35 @@ mod tests {
         );
     }
 
+    /// Agent-written pages often open with a fenced command block. A
+    /// `# comment` inside it is code, not the page's H1, so it must not
+    /// become the indexed title.
+    #[test]
+    fn title_skips_comment_lines_inside_code_fences() {
+        let path = PagePath::new("notes/setup.md").unwrap();
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            derive_title(
+                &null,
+                "```bash\n# install deps\nnpm i\n```\n# Real Title\n",
+                &path
+            ),
+            "Real Title"
+        );
+        assert_eq!(
+            derive_title(&null, "~~~python\n# compute\nx = 1\n~~~\nbody\n", &path),
+            "setup",
+            "a fenced comment must not replace the stem fallback"
+        );
+        // An unclosed fence runs to the end of the body.
+        assert_eq!(derive_title(&null, "```sh\n# only code\n", &path), "setup");
+        // A heading after an inline triple-backtick span is still a heading.
+        assert_eq!(
+            derive_title(&null, "```inline``` text\n# Heading\n", &path),
+            "Heading"
+        );
+    }
+
     #[test]
     fn extracts_internal_wiki_and_markdown_links() {
         let path = PagePath::new("concepts/current.md").unwrap();
@@ -1655,6 +1943,57 @@ mod tests {
         assert_eq!(delink_wikilinks(body, &page, &BTreeSet::new()), body);
     }
 
+    /// #1943: the redirect keys normalise exactly as a wikilink the
+    /// extractor reads, whatever the model's proposed path looked like.
+    #[test]
+    fn normalize_wikilink_path_matches_the_extractor_fold() {
+        for raw in ["_rules/acme", "_rules/acme.md"] {
+            assert_eq!(
+                normalize_wikilink_path(raw).map(|p| p.as_str().to_owned()),
+                Some("_rules/acme.md".to_owned()),
+                "{raw:?}"
+            );
+        }
+        // A non-md extension, a directory and an escaping target are not
+        // pages, and neither is anything above the root.
+        assert_eq!(normalize_wikilink_path("notes/a.txt"), None);
+        assert_eq!(normalize_wikilink_path("notes/"), None);
+        assert_eq!(normalize_wikilink_path("../escape.md"), None);
+        // Whatever page a link sits on, a wikilink target is root-relative.
+        for source in ["notes/a.md", "deep/dir/b.md"] {
+            let body = "See [[_rules/acme]].";
+            let from = extract_links(body, &PagePath::new(source).unwrap());
+            assert_eq!(from[0].path.as_str(), "_rules/acme.md");
+        }
+    }
+
+    /// #1943: only same-project links whose normalised target is a key in
+    /// the map move; labels, code, scope-qualified links and unmatched
+    /// targets are copied byte-identically.
+    #[test]
+    fn rewrite_wikilink_targets_repoints_only_listed_same_project_links() {
+        let page = PagePath::new("sessions/a.md").unwrap();
+        let redirects = BTreeMap::from([(
+            "_rules/acme.md".to_owned(),
+            "_rules/acme-c230fc38.md".to_owned(),
+        )]);
+        let body = "See [[_rules/acme]], [[_rules/acme|the rule]] and \
+                    [[infra:_rules/acme]]; keep [[notes/pending]] too.\n\
+                    `[_rules/acme]` stays code.\n";
+        let out = rewrite_wikilink_targets(body, &page, &redirects);
+        assert_eq!(
+            out,
+            "See [[_rules/acme-c230fc38.md]], [[_rules/acme-c230fc38.md|the rule]] and \
+             [[infra:_rules/acme]]; keep [[notes/pending]] too.\n\
+             `[_rules/acme]` stays code.\n"
+        );
+        // An empty map is a byte-identical no-op.
+        assert_eq!(
+            rewrite_wikilink_targets(body, &page, &BTreeMap::new()),
+            body
+        );
+    }
+
     #[test]
     fn extract_links_ignores_inline_code_spans() {
         // The web page renders all of these code spans as code, so a link
@@ -1716,6 +2055,41 @@ mod tests {
             rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
             "[the decision](../decisions/b.md)"
         );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_falls_back_to_target_for_an_empty_label() {
+        // An empty or blank `|label` must not export as `[](…)`, a link with
+        // no text to click. The web view and `delink_wikilinks` already show
+        // the target in that case.
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md|]]", &path, "proj"),
+            "[decisions/b.md](../decisions/b.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
+            "[decisions/b](../decisions/b.md)"
+        );
+    }
+
+    /// A wikilink names a literal page path, but the exported Markdown link
+    /// is a URL that `extract_links` decodes once. A `%` in the filename has
+    /// to leave as `%25`, or the export points at another page (`a%20b.md`
+    /// read as `a b.md`) or at none (`95%cap.md` does not decode).
+    #[test]
+    fn rewrite_local_wikilinks_keeps_a_literal_percent_in_the_target() {
+        let page = PagePath::new("notes/here.md").unwrap();
+        for (body, href) in [
+            ("See [[notes/a%20b]].\n", "a%2520b.md"),
+            ("See [[notes/cpu-95%cap]].\n", "cpu-95%25cap.md"),
+        ] {
+            let before = extract_links(body, &page);
+            assert_eq!(before.len(), 1, "{body}");
+            let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
+            assert_eq!(extract_links(&exported, &page), before, "{exported}");
+        }
     }
 
     #[test]
@@ -1842,6 +2216,58 @@ mod tests {
     }
 
     #[test]
+    fn indented_pseudo_closers_do_not_expose_or_rewrite_fenced_links() {
+        let page = PagePath::new("concepts/a.md").unwrap();
+        let delink = BTreeSet::from([
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/hidden.md".to_string(),
+            ),
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/visible.md".to_string(),
+            ),
+        ]);
+
+        for prefix in ["    ", "\t", "\u{2003}"] {
+            let body = format!(
+                "````md\n{prefix}````\n[[decisions/hidden.md]]\n\
+                 [[infra:runbooks/hidden.md]]\n````\n[[decisions/visible.md]]\n\
+                 [[infra:runbooks/visible.md]]\n"
+            );
+            let links = extract_links(&body, &page);
+            let paths: Vec<&str> = links.iter().map(|link| link.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                ["decisions/visible.md", "runbooks/visible.md"],
+                "prefix {prefix:?}"
+            );
+
+            let rewritten = rewrite_local_wikilinks(&body, &page, "proj");
+            assert!(
+                rewritten.contains("[[decisions/hidden.md]]"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+            assert!(
+                rewritten.contains("[decisions/visible.md](../decisions/visible.md)"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+
+            let delinked = delink_wikilinks(&body, &page, &delink);
+            assert!(
+                delinked.contains("[[infra:runbooks/hidden.md]]"),
+                "prefix {prefix:?}: {delinked}"
+            );
+            assert!(
+                delinked.contains("\ninfra:runbooks/visible.md\n"),
+                "prefix {prefix:?}: {delinked}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_links_parses_balanced_parentheses_and_pointy_destinations() {
         let root = PagePath::new("here.md").unwrap();
         let md = "See [doc](notes/foo_(1).md), [space](<notes/bar (2).md>), and [title](notes/baz.md \"a title\").\n";
@@ -1904,6 +2330,59 @@ mod tests {
             linked("[a](g.md 'single') [b](h.md (paren title))"),
             ["g.md", "h.md"]
         );
+    }
+
+    #[test]
+    fn extract_links_handles_nested_and_escaped_labels() {
+        for label in [
+            "array[0] access",
+            r"array\[0\] access",
+            r"closing \] bracket",
+            r"literal \\ [index]",
+            "日本語 [索引]",
+            "outer [middle [inner]] label",
+        ] {
+            assert_eq!(linked(&format!("[{label}](b.md)")), ["b.md"], "{label}");
+        }
+        assert_eq!(linked("[unclosed [inner](b.md)"), ["b.md"]);
+        assert_eq!(linked("[outer [inner](b.md)](c.md)"), ["b.md"]);
+        assert!(linked(r"\[literal](b.md)").is_empty());
+        assert!(linked("![array[0] access](b.md)").is_empty());
+        assert_eq!(linked("[outer ![icon](image.png)](b.md)"), ["b.md"]);
+        assert_eq!(linked(r"\![label](b.md)"), ["b.md"]);
+        assert!(linked("`[array[0] access](b.md)`").is_empty());
+        assert!(linked("[unclosed [label]").is_empty());
+    }
+
+    #[test]
+    fn export_labels_keep_their_link_when_reindexed() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        for label in ["array[0] access", r"C:\work\notes", "日本語 [索引]"] {
+            let source = format!("[[notes/array.md|{label}]]");
+            let rewritten = rewrite_local_wikilinks(&source, &path, "proj");
+            assert_eq!(
+                extract_links(&rewritten, &path)
+                    .iter()
+                    .map(|link| link.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["notes/array.md"],
+                "{rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_links_stays_linear_on_nested_and_unclosed_labels() {
+        let root = PagePath::new("here.md").unwrap();
+        let started = std::time::Instant::now();
+        for body in [
+            "[".repeat(256 * 1024),
+            format!("{}[kept](b.md)", "[".repeat(256 * 1024)),
+            format!("{}{}(b.md)", "[".repeat(128 * 1024), "]".repeat(128 * 1024)),
+        ] {
+            let _ = extract_links(&body, &root);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
@@ -1998,5 +2477,54 @@ mod tests {
         // Without whitespace or parens a bare destination holds them fine.
         let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, "proj");
         assert!(bare.ends_with("](../notes/a>b.md)"), "{bare}");
+    }
+
+    #[test]
+    fn markdown_url_paths_decode_once_before_link_resolution() {
+        for (destination, expected) in [
+            ("notes/my%20note.md", "notes/my note.md"),
+            ("notes/%E6%97%A5%E6%9C%AC.md", "notes/日本.md"),
+            ("notes/my%23note.md#section", "notes/my#note.md"),
+            ("notes/my%3Fnote.md?view=1", "notes/my?note.md"),
+            ("notes/my%2520note.md", "notes/my%20note.md"),
+            ("notes%2Fmy%20note.md", "notes/my note.md"),
+            ("notes/%zz.md", "notes/%zz.md"),
+            ("notes/%2.md", "notes/%2.md"),
+        ] {
+            let root = PagePath::new("source.md").unwrap();
+            let links = extract_links(&format!("[note](<{destination}>)"), &root);
+            assert_eq!(links.len(), 1, "{destination}");
+            assert_eq!(links[0].path.as_str(), expected, "{destination}");
+            assert_eq!(links[0].workspace, None);
+            assert_eq!(links[0].project, None);
+        }
+        assert_eq!(linked("[[notes/my%20note.md]]"), ["notes/my%20note.md"]);
+    }
+
+    #[test]
+    fn decoded_markdown_paths_cannot_escape_or_change_scope() {
+        let root = PagePath::new("source.md").unwrap();
+        for destination in [
+            "%2e%2e/secret.md",
+            "notes/%2e%2e/%2e%2e/secret.md",
+            "notes%5Csecret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "%66ile%3Asecret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            assert!(
+                extract_links(&format!("[note](<{destination}>)"), &root).is_empty(),
+                "{destination} must not become a page target"
+            );
+        }
+        let links = extract_links("[note](other%3Anotes/secret.md)", &root);
+        assert!(
+            links
+                .iter()
+                .all(|link| link.workspace.is_none() && link.project.is_none())
+        );
+        let links = extract_links("[note](notes/%2e%2e/inside.md)", &root);
+        assert_eq!(links[0].path.as_str(), "inside.md");
     }
 }

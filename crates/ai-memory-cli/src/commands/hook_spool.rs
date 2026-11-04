@@ -51,8 +51,9 @@ impl MaxAttempts {
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
 const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-/// Hard cap on queued events per data dir. Enqueue prunes oldest files beyond
-/// this so a down server cannot grow the hook spool without bound.
+/// Hard cap on queued events per data dir. Once full, enqueue preserves the
+/// existing backlog and drops the new event so a down server cannot grow the
+/// hook spool without bound.
 #[cfg(not(test))]
 const MAX_SPOOL_FILES: usize = 10_000;
 #[cfg(test)]
@@ -75,6 +76,9 @@ const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
 /// (the cap is a soft bound), never discarded.
 const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+/// A live enqueuer may still own its `*.json.tmp`; only recover one after a
+/// much longer interval than the hook's normal write and fsync latency.
+const STRANDED_TEMP_GRACE_MS: u64 = 5 * 60 * 1000;
 const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_TOMBSTONES: usize = 512;
 const MAX_RECOVERY_SWEEP_DIRS: usize = 1_024;
@@ -160,8 +164,7 @@ pub struct SpoolHealth {
     pub oldest_age_ms: Option<u64>,
     /// Sum of failed-delivery attempts across all queued events.
     pub retries_total: u64,
-    /// Most events the spool holds; past it the oldest undelivered ones are
-    /// evicted to make room.
+    /// Most events the spool holds; new events are dropped while it is full.
     pub capacity: usize,
 }
 
@@ -177,9 +180,9 @@ impl Default for SpoolHealth {
 }
 
 impl SpoolHealth {
-    /// The spool is full, so each new event evicts the oldest undelivered one.
+    /// The spool is full, so each new event is dropped.
     #[must_use]
-    pub fn evicting(&self) -> bool {
+    pub fn at_capacity(&self) -> bool {
         self.pending >= self.capacity
     }
 }
@@ -316,7 +319,10 @@ pub fn enqueue_with_config(
     if total_spool_entries(spool)? >= MAX_SPOOL_FILES {
         let _ = std::fs::remove_file(&tmp);
         eprintln!(
-            "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            ))
         );
         return Ok(());
     }
@@ -397,6 +403,99 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = opts.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TempRecovery {
+    adopted: usize,
+    dropped: usize,
+    unreadable: usize,
+}
+
+/// Recover complete enqueue files left between `sync_all` and the atomic
+/// rename. The age gate keeps an in-flight writer out; the filename and body
+/// checks keep unrelated temp files out. Malformed old files cannot become
+/// deliverable and are deleted so private partial capture does not accumulate.
+fn recover_stranded_temp_entries(spool: &Path, now: u64) -> std::io::Result<TempRecovery> {
+    let entries = match std::fs::read_dir(spool) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TempRecovery::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut result = TempRecovery::default();
+    let mut examined = 0usize;
+    for item in entries {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => {
+                result.unreadable += 1;
+                continue;
+            }
+        };
+        let path = item.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(final_name) = name.strip_suffix(".tmp") else {
+            continue;
+        };
+        let Some(created_ms) = created_ms_from_name(final_name) else {
+            continue;
+        };
+        examined += 1;
+        if examined > MAX_SPOOL_FILES || now.saturating_sub(created_ms) < STRANDED_TEMP_GRACE_MS {
+            continue;
+        }
+        let bytes = match read_spool_entry_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                if std::fs::remove_file(&path).is_ok() {
+                    result.dropped += 1;
+                } else {
+                    result.unreadable += 1;
+                }
+                continue;
+            }
+            Err(_) => {
+                result.unreadable += 1;
+                continue;
+            }
+        };
+        let valid = serde_json::from_slice::<SpoolEntry>(&bytes)
+            .is_ok_and(|entry| entry.created_ms == created_ms);
+        if !valid {
+            if std::fs::remove_file(&path).is_ok() {
+                result.dropped += 1;
+            } else {
+                result.unreadable += 1;
+            }
+            continue;
+        }
+        let final_path = spool.join(final_name);
+        if final_path.exists() {
+            // The atomic rename may have completed before a copied/stale temp
+            // appeared. Remove only a byte-identical duplicate; never replace
+            // a different queued event.
+            match read_spool_entry_bytes(&final_path) {
+                Ok(final_bytes) if final_bytes == bytes => {
+                    if std::fs::remove_file(&path).is_ok() {
+                        result.adopted += 1;
+                    } else {
+                        result.unreadable += 1;
+                    }
+                }
+                _ => result.unreadable += 1,
+            }
+            continue;
+        }
+        match std::fs::rename(&path, &final_path) {
+            Ok(()) => result.adopted += 1,
+            Err(_) => result.unreadable += 1,
+        }
+    }
+    Ok(result)
 }
 
 /// Build a [`SpoolEntry`] for the current event, choosing the auth mode from
@@ -1290,8 +1389,9 @@ pub async fn drain_until_quiescent_locked_with_live_token(
 /// A delivered event is deleted; a failed one is charged a retry attempt
 /// (dropped at the configured limit, unless it is zero); a `429` (saturation)
 /// deletes any accepted prefix the server reports, then retries the rest
-/// untouched so it never burns the retry budget. OIDC bearer is resolved and
-/// refreshed at most once per drain and cached.
+/// untouched so it never burns the retry budget. That endpoint is skipped for
+/// the rest of the pass; entries for other endpoints still deliver. OIDC bearer
+/// is resolved and refreshed at most once per drain and cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
@@ -1343,24 +1443,58 @@ pub async fn drain_with_live_token(
     live_token: Option<&str>,
     max_attempts: MaxAttempts,
 ) -> DrainResult {
+    let recovery = match recover_stranded_temp_entries(spool, now_ms()) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
+                    spool.display()
+                ))
+            );
+            TempRecovery {
+                unreadable: 1,
+                ..TempRecovery::default()
+            }
+        }
+    };
+    if recovery.adopted > 0 || recovery.dropped > 0 || recovery.unreadable > 0 {
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
+                recovery.adopted,
+                recovery.dropped,
+                recovery.unreadable,
+                if recovery.unreadable == 1 { "y" } else { "ies" }
+            ))
+        );
+    }
     let (mut files, unreadable) = match list_entries(spool) {
         Ok(listed) => listed,
         Err(e) => {
             // Never silent: a spool we cannot read is an outage, not an idle
             // pass, and the difference is invisible from the exit code.
             eprintln!(
-                "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
                  no events were attempted",
-                spool.display()
+                    spool.display()
+                ))
             );
             return DrainResult::default();
         }
     };
     if unreadable > 0 {
         eprintln!(
-            "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
-            if unreadable == 1 { "y" } else { "ies" },
-            spool.display()
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
+                if unreadable == 1 { "y" } else { "ies" },
+                spool.display()
+            ))
         );
     }
     files.sort();
@@ -1369,7 +1503,11 @@ pub async fn drain_with_live_token(
     let started = Instant::now();
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
-    let mut result = DrainResult::default();
+    let mut result = DrainResult {
+        remaining: unreadable.saturating_add(recovery.unreadable),
+        dropped: recovery.dropped,
+        ..DrainResult::default()
+    };
     let max_attempts = max_attempts.0;
 
     let mut idx = 0;
@@ -1391,6 +1529,20 @@ pub async fn drain_with_live_token(
     // the 7-day TTL) instead of deleting the oldest events.
     let mut unreachable_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Backpressure belongs to one endpoint, too. Do not retry that server
+    // during this pass, but keep delivering entries addressed elsewhere.
+    let mut saturated_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Credentials refused during THIS pass, keyed by what decides a retry:
+    // endpoint, profile and bearer. A `401` belongs to the chunk's credential,
+    // not to the entries behind it that carry another one, so the pass
+    // carries on past it; a later entry with the same credential would only
+    // be refused again, so it waits for the next pass uncharged.
+    let mut rejected_credentials: std::collections::HashSet<(
+        String,
+        Option<String>,
+        Option<String>,
+    )> = std::collections::HashSet::new();
     // Resolved on first need only — a healthy drain never reads the config.
     let mut configured_server: Option<Option<String>> = None;
     'drain: while idx < files.len() {
@@ -1404,9 +1556,11 @@ pub async fn drain_with_live_token(
         let Some(entry) = load_live_entry(&path, &mut result) else {
             continue;
         };
-        if unreachable_endpoints.contains(&batch_endpoint(&entry.url)) {
-            // Already proven undeliverable this pass. Leave it queued and do
-            // not bump attempts: it was never actually attempted.
+        if unreachable_endpoints.contains(&batch_endpoint(&entry.url))
+            || saturated_endpoints.contains(&batch_endpoint(&entry.url))
+        {
+            // Already unavailable this pass. Leave it queued and do not bump
+            // attempts: it was never actually attempted.
             result.remaining += 1;
             continue;
         }
@@ -1416,6 +1570,15 @@ pub async fn drain_with_live_token(
         }
 
         let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
+        let credential = (
+            batch_endpoint(&entry.url),
+            entry.profile.clone(),
+            bearer.clone(),
+        );
+        if rejected_credentials.contains(&credential) {
+            result.remaining += 1;
+            continue;
+        }
 
         if batch_supported {
             // Extend the chunk over consecutive entries sharing the same batch
@@ -1548,16 +1711,14 @@ pub async fn drain_with_live_token(
                         let _ = std::fs::remove_file(path);
                     }
                     result.sent += k;
-                    result.remaining +=
-                        chunk.len().saturating_sub(k) + files.len().saturating_sub(idx);
-                    break;
+                    result.remaining += chunk.len().saturating_sub(k);
+                    saturated_endpoints.insert(base);
                 }
                 BatchOutcome::SaturatedIndices(indices) => {
                     let sent = delete_accepted_indices(&chunk, &indices);
                     result.sent += sent;
-                    result.remaining +=
-                        chunk.len().saturating_sub(sent) + files.len().saturating_sub(idx);
-                    break;
+                    result.remaining += chunk.len().saturating_sub(sent);
+                    saturated_endpoints.insert(base);
                 }
                 BatchOutcome::Unsupported => {
                     // Pre-upgrade server with no /hook/batch: fall back to the
@@ -1587,7 +1748,9 @@ pub async fn drain_with_live_token(
                                 result.sent += 1;
                             }
                             PostOutcome::Saturated => {
-                                result.remaining += 1;
+                                result.remaining += chunk.len() - pos;
+                                saturated_endpoints.insert(base.clone());
+                                break;
                             }
                             PostOutcome::Failed => {
                                 bump_or_drop(path, entry, max_attempts, &mut result);
@@ -1617,8 +1780,8 @@ pub async fn drain_with_live_token(
                                     live_token,
                                     &mut profile_tokens,
                                 );
-                                let recovered = match retry {
-                                    Some(token) => matches!(
+                                let retried = match retry {
+                                    Some(token) => Some(
                                         post_hook(
                                             &client,
                                             &entry.url,
@@ -1627,11 +1790,14 @@ pub async fn drain_with_live_token(
                                             per_event_timeout,
                                         )
                                         .await,
-                                        PostOutcome::Delivered
                                     ),
-                                    None => false,
+                                    None => None,
                                 };
-                                if recovered {
+                                if retried == Some(PostOutcome::Saturated) {
+                                    result.remaining += chunk.len() - pos;
+                                    saturated_endpoints.insert(base.clone());
+                                    break;
+                                } else if retried == Some(PostOutcome::Delivered) {
                                     let _ = std::fs::remove_file(path);
                                     result.sent += 1;
                                 } else {
@@ -1665,11 +1831,14 @@ pub async fn drain_with_live_token(
                     // profile's capture there is the cross-server delivery
                     // profiles exist to prevent (#992).
                     let retry = configured.as_deref().and_then(|server| {
-                        if chunk[0].1.profile.is_some() || !is_loopback_url(&chunk[0].1.url) {
+                        if chunk[0].1.profile.is_some()
+                            || !crate::http_client::is_loopback_url(&chunk[0].1.url)
+                        {
                             return None;
                         }
                         let rerooted = batch_endpoint(&reroot_url(&chunk[0].1.url, server)?);
-                        (rerooted != base).then_some(rerooted)
+                        (rerooted != base && !saturated_endpoints.contains(&rerooted))
+                            .then_some(rerooted)
                     });
 
                     // Whether the configured-address retry reached a server
@@ -1703,6 +1872,25 @@ pub async fn drain_with_live_token(
                                 let sent = delete_accepted_indices(&chunk, &indices);
                                 result.sent += sent;
                                 result.remaining += chunk.len().saturating_sub(sent);
+                                continue;
+                            }
+                            BatchOutcome::Saturated(k) => {
+                                let k = k.min(chunk.len());
+                                for (path, _) in &chunk[..k] {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                result.sent += k;
+                                result.remaining += chunk.len().saturating_sub(k);
+                                saturated_endpoints.insert(rerooted);
+                                unreachable_endpoints.insert(base);
+                                continue;
+                            }
+                            BatchOutcome::SaturatedIndices(indices) => {
+                                let sent = delete_accepted_indices(&chunk, &indices);
+                                result.sent += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                saturated_endpoints.insert(rerooted);
+                                unreachable_endpoints.insert(base);
                                 continue;
                             }
                             // The configured address is itself unreachable:
@@ -1755,6 +1943,7 @@ pub async fn drain_with_live_token(
                         live_token,
                         &mut profile_tokens,
                     );
+                    let mut credential_refused = true;
                     if let Some(token) = retry {
                         match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
                             .await
@@ -1778,19 +1967,45 @@ pub async fn drain_with_live_token(
                                 result.remaining += chunk.len().saturating_sub(sent);
                                 continue;
                             }
+                            BatchOutcome::Saturated(k) => {
+                                let k = k.min(chunk.len());
+                                for (path, _) in &chunk[..k] {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                result.sent += k;
+                                result.remaining += chunk.len().saturating_sub(k);
+                                saturated_endpoints.insert(base);
+                                continue;
+                            }
+                            BatchOutcome::SaturatedIndices(indices) => {
+                                let sent = delete_accepted_indices(&chunk, &indices);
+                                result.sent += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                saturated_endpoints.insert(base);
+                                continue;
+                            }
                             // The current token is no better — the server is
                             // rejecting more than a stale credential. Fall
                             // through and charge conservatively.
-                            _ => {}
+                            BatchOutcome::Unauthorized => {}
+                            // The retry hit a failure or the endpoint went
+                            // away, rather than refusing the credential, so
+                            // the pass stops as for `Failed`.
+                            _ => credential_refused = false,
                         }
                     }
 
                     // Same conservative accounting as `Failed`: the server
                     // refused the whole batch, so nothing in it was processed.
                     bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
-                    result.remaining +=
-                        chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
-                    break;
+                    if !credential_refused {
+                        result.remaining +=
+                            chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                        break;
+                    }
+                    result.remaining += chunk.len().saturating_sub(1);
+                    rejected_credentials.insert(credential);
+                    continue;
                 }
                 BatchOutcome::Failed => {
                     // The batch didn't land (server answered with an unexpected
@@ -1824,6 +2039,7 @@ pub async fn drain_with_live_token(
                 }
                 PostOutcome::Saturated => {
                     result.remaining += 1;
+                    saturated_endpoints.insert(batch_endpoint(&entry.url));
                 }
                 PostOutcome::Refused => {
                     // Terminal; see `PostOutcome::Refused`.
@@ -1850,8 +2066,8 @@ pub async fn drain_with_live_token(
                         live_token,
                         &mut profile_tokens,
                     );
-                    let recovered = match retry {
-                        Some(token) => matches!(
+                    let retried = match retry {
+                        Some(token) => Some(
                             post_hook(
                                 &client,
                                 &entry.url,
@@ -1860,11 +2076,13 @@ pub async fn drain_with_live_token(
                                 per_event_timeout,
                             )
                             .await,
-                            PostOutcome::Delivered
                         ),
-                        None => false,
+                        None => None,
                     };
-                    if recovered {
+                    if retried == Some(PostOutcome::Saturated) {
+                        result.remaining += 1;
+                        saturated_endpoints.insert(batch_endpoint(&entry.url));
+                    } else if retried == Some(PostOutcome::Delivered) {
                         let _ = std::fs::remove_file(&path);
                         result.sent += 1;
                     } else {
@@ -2201,22 +2419,6 @@ impl<'a> ProfileTokens<'a> {
     }
 }
 
-/// Is this URL's host a loopback address?
-///
-/// A loopback authority is only meaningful on the machine that recorded it, so
-/// a stale port in one is unambiguous — nothing else could have been meant. A
-/// remote host is left alone: re-pointing it would misdeliver a spool that was
-/// deliberately captured against another server.
-pub(crate) fn is_loopback_url(url: &str) -> bool {
-    let rest = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => url,
-    };
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
-}
-
 /// Rewrite `url`'s scheme and authority onto `server_url`, keeping path and
 /// query. Used only to retry an endpoint that has already proven unreachable.
 fn reroot_url(url: &str, server_url: &str) -> Option<String> {
@@ -2316,8 +2518,11 @@ fn rewrite_entry(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 fn note_retry_persist(outcome: std::io::Result<()>) -> bool {
     if outcome.is_err() {
         eprintln!(
-            "ai-memory hook warning: failed to persist spool retry count; \
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook warning: failed to persist spool retry count; \
              event may retry until it ages out"
+            )
         );
         return false;
     }
@@ -2373,6 +2578,79 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stranded_complete_temp_entry_is_adopted_only_after_the_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        create_spool_dir(&spool).unwrap();
+        let created_ms = 1_000_000;
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=session-end&agent=claude-code".into(),
+            body: r#"{"session_id":"native-1"}"#.into(),
+            created_ms,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let final_name = format!("{created_ms:013}-42-0000000000000001-key.json");
+        let tmp_path = spool.join(format!("{final_name}.tmp"));
+        write_private(&tmp_path, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            recover_stranded_temp_entries(
+                &spool,
+                created_ms + STRANDED_TEMP_GRACE_MS.saturating_sub(1)
+            )
+            .unwrap(),
+            TempRecovery::default(),
+            "a possibly live writer is left alone"
+        );
+        assert!(tmp_path.is_file());
+
+        assert_eq!(
+            recover_stranded_temp_entries(&spool, created_ms + STRANDED_TEMP_GRACE_MS).unwrap(),
+            TempRecovery {
+                adopted: 1,
+                ..TempRecovery::default()
+            }
+        );
+        assert!(!tmp_path.exists());
+        assert!(spool.join(final_name).is_file());
+        assert_eq!(spool_len(&spool), 1);
+    }
+
+    #[test]
+    fn stranded_malformed_or_mismatched_temp_entries_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        create_spool_dir(&spool).unwrap();
+        let created_ms = 1_000_000;
+        let malformed = spool.join(format!("{created_ms:013}-42-0000000000000001-key.json.tmp"));
+        write_private(&malformed, b"{not complete").unwrap();
+        let mismatched = spool.join(format!("{created_ms:013}-42-0000000000000002-key.json.tmp"));
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=session-end&agent=claude-code".into(),
+            body: r#"{"session_id":"native-1"}"#.into(),
+            created_ms: created_ms + 1,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        write_private(&mismatched, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            recover_stranded_temp_entries(&spool, created_ms + STRANDED_TEMP_GRACE_MS).unwrap(),
+            TempRecovery {
+                dropped: 2,
+                ..TempRecovery::default()
+            }
+        );
+        assert!(!malformed.exists());
+        assert!(!mismatched.exists());
+    }
 
     #[test]
     fn correlated_session_entries_quarantine_and_restore_without_touching_others() {
@@ -3212,7 +3490,7 @@ mod tests {
     /// rode out the outage.
     #[tokio::test]
     async fn outage_then_recovery_delivers_the_entire_backlog() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
 
         // Phase 1 — outage: nothing listens where the events were captured.
         let dead_addr = {
@@ -3255,9 +3533,8 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    let mut buf = vec![0_u8; 65536];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let buf = read_test_http_request(&mut s).await;
+                    let req = String::from_utf8_lossy(&buf);
                     let (status, body) = if req
                         .lines()
                         .next()
@@ -3844,6 +4121,173 @@ mod tests {
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(loaded.attempts, 0, "429 must not consume the retry budget");
+    }
+
+    #[tokio::test]
+    async fn a_saturated_endpoint_does_not_hold_back_another_endpoint() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        for (reply, token, accepted, requests) in [
+            (Some(r#"{"accepted":0}"#), None, None, 1),
+            (Some(r#"{"accepted":1}"#), None, Some(0), 1),
+            (Some(r#"{"accepted_indices":[1]}"#), None, Some(1), 1),
+            (None, None, None, 2),
+            (Some(r#"{"accepted":1}"#), Some("live"), Some(0), 2),
+            (
+                Some(r#"{"accepted_indices":[1]}"#),
+                Some("live"),
+                Some(1),
+                2,
+            ),
+            (None, Some("live"), None, 3),
+        ] {
+            let saturated_hits = Arc::new(AtomicUsize::new(0));
+            let saturated = serve_saturated_hook(saturated_hits.clone(), reply, token).await;
+            let healthy_hits = Arc::new(AtomicUsize::new(0));
+            let healthy = serve_token_gated_hook("healthy-token", healthy_hits.clone())
+                .await
+                .to_string();
+            let tmp = tempfile::tempdir().unwrap();
+            let spool = spool_dir(tmp.path());
+            for (name, server) in [
+                ("00.json", &saturated),
+                ("01.json", &saturated),
+                ("02.json", &healthy),
+                ("03.json", &saturated),
+            ] {
+                write_spool_entry_with_token(
+                    &spool,
+                    name,
+                    format!("http://{server}/hook?event={name}"),
+                    if name == "02.json" {
+                        "healthy-token"
+                    } else {
+                        "old"
+                    },
+                );
+            }
+
+            let result = drain_with_live_token(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(5),
+                Duration::from_millis(500),
+                token,
+                MaxAttempts::new(MAX_ATTEMPTS),
+            )
+            .await;
+
+            assert_eq!(
+                healthy_hits.load(Ordering::SeqCst),
+                1,
+                "a different endpoint must still deliver: {reply:?}, {token:?}"
+            );
+            assert_eq!(saturated_hits.load(Ordering::SeqCst), requests);
+            assert_eq!(result.sent, 1 + usize::from(accepted.is_some()));
+            assert_eq!(result.dropped, 0);
+            assert_eq!(result.remaining, 3 - usize::from(accepted.is_some()));
+            assert_eq!(sorted_attempts(&spool), vec![0; result.remaining]);
+            assert!(!spool.join("02.json").exists());
+            for index in [0, 1, 3] {
+                assert_eq!(
+                    spool.join(format!("{index:02}.json")).exists(),
+                    accepted != Some(index),
+                    "only the acknowledged saturated-server items may be removed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saturated_reroot_is_not_retried_or_allowed_to_block_another_endpoint() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stale = closed.local_addr().unwrap();
+        let saturated_hits = Arc::new(AtomicUsize::new(0));
+        let saturated =
+            serve_saturated_hook(saturated_hits.clone(), Some(r#"{"accepted":0}"#), None).await;
+        let healthy_hits = Arc::new(AtomicUsize::new(0));
+        let healthy = serve_counting_hook(healthy_hits.clone(), "200 OK").await;
+        drop(closed);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            format!("server_url = \"http://{saturated}\"\n"),
+        )
+        .unwrap();
+        let spool = spool_dir(tmp.path());
+        for (name, server) in [
+            ("00.json", stale.to_string()),
+            ("01.json", saturated),
+            ("02.json", healthy),
+        ] {
+            write_spool_entry(&spool, name, format!("http://{server}/hook?event={name}"));
+        }
+
+        let result = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(healthy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(saturated_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 2);
+        assert_eq!(result.dropped, 0);
+        assert_eq!(sorted_attempts(&spool), vec![0, 0]);
+    }
+
+    /// A saturated server, optionally lacking batch support or requiring the
+    /// live credential before it reports saturation. All tokens are fixtures.
+    async fn serve_saturated_hook(
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        batch_reply: Option<&'static str>,
+        token: Option<&'static str>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut bytes = vec![0; 65536];
+                    let len = stream.read(&mut bytes).await.unwrap_or(0);
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let request = String::from_utf8_lossy(&bytes[..len]);
+                    let batch = request
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("/hook/batch"));
+                    let authorized = token.is_none_or(|token| {
+                        request.lines().any(|line| {
+                            line.trim()
+                                .eq_ignore_ascii_case(&format!("authorization: Bearer {token}"))
+                        })
+                    });
+                    let (status, body) = if batch && batch_reply.is_none() {
+                        ("404 Not Found", "")
+                    } else if !authorized {
+                        ("401 Unauthorized", "")
+                    } else {
+                        ("429 Too Many Requests", batch_reply.unwrap_or(""))
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr.to_string()
     }
 
     /// #493: a spooled entry carries the URL it was captured against, so a
@@ -4476,6 +4920,192 @@ mod tests {
         assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "entry survives");
     }
 
+    /// #1283: entries captured before `auth enable` carry no credential and
+    /// sort ahead of everything captured after it. Their `401` rejects that
+    /// credential only, so the entry behind them, carrying the token the
+    /// server now accepts, is still delivered in the same pass. A later entry
+    /// with the refused credential would be refused identically, so it waits
+    /// for the next pass without a request and without a charged attempt.
+    #[tokio::test]
+    async fn a_refused_credential_does_not_hold_back_entries_with_a_valid_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_token_gated_hook("root-token", count.clone()).await;
+
+        for (event, token) in [("a0", None), ("t0", Some("root-token")), ("a1", None)] {
+            let entry = entry_for(
+                format!("http://{addr}/hook?event={event}"),
+                "{}".into(),
+                token,
+                false,
+            );
+            enqueue(&spool, &entry).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("root-token"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1, "the tokened entry is delivered");
+        assert_eq!(r.remaining, 2);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            sorted_attempts(&spool),
+            vec![1, 0],
+            "only the refused request is charged"
+        );
+    }
+
+    /// A profile entry retries with its own stored token, so a refusal of a
+    /// default entry at the same address with the same captured bearer must
+    /// not hold it back.
+    #[tokio::test]
+    async fn a_refused_default_credential_does_not_hold_back_a_profile_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = serve_token_gated_hook("b-new", count.clone()).await;
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(
+            tmp.path(),
+            &name,
+            &format!("http://{server}"),
+            &[],
+            Some("b-new"),
+        )
+        .unwrap();
+
+        let default_entry = entry_for(
+            format!("http://{server}/hook?event=d0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        );
+        enqueue(&spool, &default_entry).unwrap();
+        let profile_entry = entry_for(
+            format!("http://{server}/hook?event=p0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        enqueue(&spool, &profile_entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(
+            r.sent, 1,
+            "the profile entry is delivered with its own token"
+        );
+        assert_eq!(r.remaining, 1);
+    }
+
+    /// The refused credential belongs to one endpoint: an anonymous entry
+    /// refused by a server that requires a token does not hold back an
+    /// anonymous entry for a server that accepts it.
+    #[tokio::test]
+    async fn a_refusal_at_one_endpoint_does_not_hold_back_another_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let gated_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gated = serve_token_gated_hook("root-token", gated_count.clone()).await;
+        let open_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = serve_counting_hook(open_count.clone(), "200 OK").await;
+
+        for url in [
+            format!("http://{gated}/hook?event=a0"),
+            format!("http://{open}/hook?event=a1"),
+        ] {
+            enqueue(&spool, &entry_for(url, "{}".into(), None, false)).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("root-token"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1, "the entry for the open server is delivered");
+        assert_eq!(open_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A retry that reaches a saturated server leaves other entries addressed
+    /// to that same endpoint alone for this pass.
+    #[tokio::test]
+    async fn a_saturated_retry_does_not_retry_the_same_endpoint() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rc = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let rc = rc.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let live = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .any(|l| l.trim().eq_ignore_ascii_case("authorization: Bearer live"));
+                    let status = if live {
+                        "429 Too Many Requests"
+                    } else {
+                        "401 Unauthorized"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for (event, token) in [("t0", Some("old")), ("a0", None)] {
+            let url = format!("http://{addr}/hook?event={event}");
+            enqueue(&spool, &entry_for(url, "{}".into(), token, false)).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("live"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.remaining, 2);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the refused request and its retry, nothing after them"
+        );
+    }
+
     /// #992, adversarial: server B accepts exactly the install default's live
     /// token. Had the drain presented it to B, the entry would deliver; it
     /// must stay queued instead, because that token belongs to another server.
@@ -4763,12 +5393,71 @@ mod tests {
         serve_counting_hook_with_accept(req_count, batch_status, None).await
     }
 
+    async fn read_test_http_request<R>(stream: &mut R) -> Vec<u8>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+
+        const MAX_REQUEST_BYTES: usize = 65_536;
+        let mut request = Vec::with_capacity(4096);
+        let mut chunk = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.len() >= MAX_REQUEST_BYTES {
+                request.truncate(MAX_REQUEST_BYTES);
+                break;
+            }
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let content_length = std::str::from_utf8(&request[..header_end])
+                .ok()
+                .and_then(|headers| {
+                    headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if request.len() >= body_start.saturating_add(content_length) {
+                break;
+            }
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn test_http_reader_waits_for_a_split_body() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"POST /hook/batch HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            writer.write_all(b"[1,2]").await.unwrap();
+        });
+
+        let request = read_test_http_request(&mut reader).await;
+        assert!(request.ends_with(b"[1,2]"));
+    }
+
     async fn serve_counting_hook_with_accept(
         req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         batch_status: &'static str,
         accepted_override: Option<usize>,
     ) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4776,10 +5465,9 @@ mod tests {
                 let rc = req_count.clone();
                 let accepted_override = accepted_override;
                 tokio::spawn(async move {
-                    let mut buf = vec![0_u8; 65536];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let buf = read_test_http_request(&mut s).await;
                     rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = String::from_utf8_lossy(&buf);
                     let is_batch = req
                         .lines()
                         .next()
@@ -4961,6 +5649,40 @@ mod tests {
             1,
             "three events ride ONE /hook/batch request (RTT amortized)"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_adopts_and_delivers_a_complete_stranded_temp_entry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let created_ms = now_ms().saturating_sub(STRANDED_TEMP_GRACE_MS + 1);
+        let mut entry = entry_for(
+            format!("http://{addr}/hook?event=session-end"),
+            r#"{"session_id":"native-1"}"#.into(),
+            None,
+            false,
+        );
+        entry.created_ms = created_ms;
+        let temp_path = spool.join(format!("{created_ms:013}-42-0000000000000001-key.json.tmp"));
+        write_private(&temp_path, &serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        let result = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(result.dropped, 0);
+        assert!(!temp_path.exists());
+        assert_eq!(spool_len(&spool), 0);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

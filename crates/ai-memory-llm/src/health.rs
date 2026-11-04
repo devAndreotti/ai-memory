@@ -3,7 +3,9 @@
 //! These wrappers never probe providers on their own. They only record
 //! the result of calls the server was already going to make.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
@@ -12,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::embedding::Embedder;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
+use crate::routes::LlmProviders;
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId, LlmWorkload, Usage};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
@@ -20,6 +23,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 #[derive(Clone, Default)]
 pub struct ProviderHealth {
     llm: ProviderRoleHealth,
+    llm_workloads: LlmWorkloadHealth,
     embedding: ProviderRoleHealth,
     /// The configured LLM provider, held only so `snapshot()` can read its
     /// [`LlmProvider::candidate_health`] — a plain provider always returns
@@ -27,6 +31,12 @@ pub struct ProviderHealth {
     /// ordered candidate list. Never dereferenced for anything but that
     /// read, so this adds no behavior beyond passive reporting.
     llm_provider: Arc<Mutex<Option<Arc<dyn LlmProvider>>>>,
+    llm_overrides: Arc<Mutex<HashMap<LlmWorkload, LlmOverrideHealth>>>,
+}
+
+struct LlmOverrideHealth {
+    provider: Arc<dyn LlmProvider>,
+    health: ProviderRoleHealth,
 }
 
 impl ProviderHealth {
@@ -40,9 +50,34 @@ impl ProviderHealth {
             .as_ref()
             .map(|provider| provider.candidate_health())
             .unwrap_or_default();
+        let overrides = self.llm_overrides.lock().unwrap_or_else(|e| e.into_inner());
+        let llm_task_chains = LlmWorkload::ALL
+            .iter()
+            .filter_map(|task| {
+                let LlmOverrideHealth { provider, health } = overrides.get(task)?;
+                Some(LlmTaskChainHealthSnapshot {
+                    task: *task,
+                    provider: provider.name().to_owned(),
+                    model: provider.model().to_owned(),
+                    status: health.snapshot().status,
+                    candidates: provider.candidate_health(),
+                })
+            })
+            .collect();
+        let llm = self.llm.snapshot();
+        let (llm_workloads, llm_workloads_started_ms) =
+            if llm.status == ProviderHealthStatus::Disabled && overrides.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let (rows, started_ms) = self.llm_workloads.snapshot();
+                (rows, Some(started_ms))
+            };
         ProviderHealthSnapshot {
-            llm: self.llm.snapshot(),
+            llm,
             llm_candidates,
+            llm_task_chains,
+            llm_workloads,
+            llm_workloads_started_ms,
             embedding: self.embedding.snapshot(),
         }
     }
@@ -58,8 +93,62 @@ impl ProviderHealth {
     ) -> Arc<dyn LlmProvider> {
         let health = self.llm.clone();
         health.configure(provider.into(), model.into(), None, retry_hint);
+        self.llm_workloads.reset();
         *self.llm_provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(inner.clone());
-        Arc::new(HealthRecordingLlmProvider { inner, health })
+        Arc::new(HealthRecordingLlmProvider {
+            inner,
+            health,
+            workloads: self.llm_workloads.clone(),
+        })
+    }
+
+    /// Wrap every configured route, keeping task chains and global health separate.
+    #[must_use]
+    pub fn wrap_llm_providers(
+        &self,
+        providers: LlmProviders,
+        retry_hint: Option<String>,
+    ) -> LlmProviders {
+        let default = providers.default.map(|provider| {
+            let name = provider.name().to_owned();
+            let model = provider.model().to_owned();
+            self.wrap_llm_provider(provider, name, model, retry_hint)
+        });
+        if default.is_none() {
+            self.llm_workloads.reset();
+            *self.llm_provider.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.llm.state.lock().unwrap_or_else(|e| e.into_inner()) =
+                ProviderRoleState::disabled();
+        }
+        let mut registered = self.llm_overrides.lock().unwrap_or_else(|e| e.into_inner());
+        registered.clear();
+        let overrides = providers
+            .overrides
+            .into_iter()
+            .map(|(task, inner)| {
+                let health = ProviderRoleHealth::default();
+                health.configure(
+                    inner.name().to_owned(),
+                    inner.model().to_owned(),
+                    None,
+                    None,
+                );
+                registered.insert(
+                    task,
+                    LlmOverrideHealth {
+                        provider: inner.clone(),
+                        health: health.clone(),
+                    },
+                );
+                let wrapped: Arc<dyn LlmProvider> = Arc::new(HealthRecordingLlmProvider {
+                    inner,
+                    health,
+                    workloads: self.llm_workloads.clone(),
+                });
+                (task, wrapped)
+            })
+            .collect();
+        LlmProviders { default, overrides }
     }
 
     /// Mark the embedding role as configured and wrap it with passive recording.
@@ -117,8 +206,85 @@ pub struct ProviderHealthSnapshot {
     /// field existed still deserializes for a newer CLI.
     #[serde(default)]
     pub llm_candidates: Vec<CandidateHealth>,
+    /// Passive per-workload LLM counts, latency, token estimates, reported
+    /// usage and last outcome. Empty when no LLM provider is configured.
+    #[serde(default)]
+    pub llm_workloads: Vec<LlmWorkloadHealthSnapshot>,
+    /// Unix milliseconds when the `llm_workloads` counters started. They
+    /// reset on restart, so two snapshots measure one window only when this
+    /// value matches. `None` when `llm_workloads` is empty, and from a server
+    /// built before the field existed.
+    #[serde(default)]
+    pub llm_workloads_started_ms: Option<u64>,
+    /// Health of independently configured task chains, in stable task order.
+    #[serde(default)]
+    pub llm_task_chains: Vec<LlmTaskChainHealthSnapshot>,
     /// Embedding provider role.
     pub embedding: ProviderRoleHealthSnapshot,
+}
+
+/// Passive health for an explicitly configured task provider chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmTaskChainHealthSnapshot {
+    /// Task selecting this chain.
+    pub task: LlmWorkload,
+    /// Primary provider.
+    pub provider: String,
+    /// Primary model.
+    pub model: String,
+    /// Most recent chain call status.
+    pub status: ProviderHealthStatus,
+    /// Per-candidate circuit and outcome state.
+    pub candidates: Vec<CandidateHealth>,
+}
+
+/// Passive process-lifetime telemetry for one closed LLM workload label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmWorkloadHealthSnapshot {
+    /// Why ai-memory made these calls.
+    pub workload: LlmWorkload,
+    /// Provider-interface invocations, including errors. Candidate attempts
+    /// inside one fallback-chain invocation remain one call; an outer caller
+    /// that deliberately retries makes another invocation.
+    pub calls: u64,
+    /// Successful provider-interface invocations.
+    pub successes: u64,
+    /// Failed provider-interface invocations.
+    pub errors: u64,
+    /// Total wall time across calls, in microseconds.
+    pub latency_total_us: u64,
+    /// Slowest observed call, in microseconds.
+    pub latency_max_us: u64,
+    /// Upper bound of the bucket containing p50. `None` means no calls or a
+    /// value above the largest fixed bucket (10 seconds).
+    pub latency_p50_upper_us: Option<u64>,
+    /// Upper bound of the bucket containing p95, with the same `None`
+    /// semantics as p50.
+    pub latency_p95_upper_us: Option<u64>,
+    /// Coarse four-characters-per-token input estimate for every call.
+    pub estimated_input_tokens: u64,
+    /// Coarse four-characters-per-token output estimate for successful calls.
+    pub estimated_output_tokens: u64,
+    /// Provider-reported input tokens when the provider returned usage.
+    pub reported_input_tokens: u64,
+    /// Provider-reported output tokens when the provider returned usage.
+    pub reported_output_tokens: u64,
+    /// Calls for which the provider returned token usage. Structured-output
+    /// providers currently return JSON without usage, so estimates remain the
+    /// comparable measurement for those workloads.
+    pub usage_reported_calls: u64,
+    /// Outcome of the most recent call, or `unknown` before the first call.
+    pub status: ProviderHealthStatus,
+    /// Time of the most recent call.
+    pub last_call_at: Option<Timestamp>,
+    /// Time of the most recent success.
+    pub last_success_at: Option<Timestamp>,
+    /// Time of the most recent error.
+    pub last_error_at: Option<Timestamp>,
+    /// Redacted error class for the most recent error.
+    pub last_error_class: Option<String>,
+    /// HTTP status for the most recent error, when one existed.
+    pub last_error_status: Option<u16>,
 }
 
 /// One candidate's passive health state in an ordered LLM fallback chain.
@@ -324,9 +490,240 @@ impl ProviderRoleState {
     }
 }
 
+const LLM_WORKLOAD_BUCKETS: usize = ai_memory_core::LATENCY_BUCKET_BOUNDS_US.len() + 1;
+
+#[derive(Clone, Default)]
+struct LlmWorkloadHealth {
+    state: Arc<Mutex<LlmWorkloadCounters>>,
+}
+
+/// Every workload's counters and when they started, under one lock so a
+/// snapshot never pairs counters with the start time of another reset.
+struct LlmWorkloadCounters {
+    started_ms: u64,
+    rows: [LlmWorkloadState; LlmWorkload::ALL.len()],
+}
+
+impl Default for LlmWorkloadCounters {
+    fn default() -> Self {
+        Self {
+            started_ms: u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0),
+            rows: std::array::from_fn(|_| LlmWorkloadState::default()),
+        }
+    }
+}
+
+impl LlmWorkloadHealth {
+    fn reset(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = LlmWorkloadCounters::default();
+    }
+
+    fn record<T>(
+        &self,
+        workload: LlmWorkload,
+        elapsed: Duration,
+        estimated_input_tokens: u64,
+        result: &LlmResult<T>,
+        estimated_output_tokens: impl FnOnce(&T) -> u64,
+        reported_usage: impl FnOnce(&T) -> Option<Usage>,
+    ) {
+        let now = Timestamp::now();
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let mut counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut counters.rows[workload.index()];
+        state.calls = state.calls.saturating_add(1);
+        state.latency_total_us = state.latency_total_us.saturating_add(elapsed_us);
+        state.latency_max_us = state.latency_max_us.max(elapsed_us);
+        let bucket = ai_memory_core::LATENCY_BUCKET_BOUNDS_US
+            .iter()
+            .position(|bound| elapsed_us <= *bound)
+            .unwrap_or(LLM_WORKLOAD_BUCKETS - 1);
+        state.latency_buckets[bucket] = state.latency_buckets[bucket].saturating_add(1);
+        state.estimated_input_tokens = state
+            .estimated_input_tokens
+            .saturating_add(estimated_input_tokens);
+        state.last_call_at = Some(now);
+        match result {
+            Ok(output) => {
+                state.successes = state.successes.saturating_add(1);
+                state.estimated_output_tokens = state
+                    .estimated_output_tokens
+                    .saturating_add(estimated_output_tokens(output));
+                if let Some(usage) = reported_usage(output) {
+                    state.usage_reported_calls = state.usage_reported_calls.saturating_add(1);
+                    state.reported_input_tokens = state
+                        .reported_input_tokens
+                        .saturating_add(u64::from(usage.input_tokens));
+                    state.reported_output_tokens = state
+                        .reported_output_tokens
+                        .saturating_add(u64::from(usage.output_tokens));
+                }
+                state.status = ProviderHealthStatus::Ok;
+                state.last_success_at = Some(now);
+            }
+            Err(error) => {
+                state.errors = state.errors.saturating_add(1);
+                state.status = ProviderHealthStatus::Error;
+                state.last_error_at = Some(now);
+                state.last_error_class = Some(error.class().to_owned());
+                state.last_error_status = error.http_status();
+            }
+        }
+    }
+
+    /// The rows in [`LlmWorkload::ALL`] order and when their counters started.
+    fn snapshot(&self) -> (Vec<LlmWorkloadHealthSnapshot>, u64) {
+        let counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = LlmWorkload::ALL
+            .iter()
+            .copied()
+            .map(|workload| counters.rows[workload.index()].snapshot(workload))
+            .collect();
+        (rows, counters.started_ms)
+    }
+}
+
+#[derive(Clone)]
+struct LlmWorkloadState {
+    calls: u64,
+    successes: u64,
+    errors: u64,
+    latency_buckets: [u64; LLM_WORKLOAD_BUCKETS],
+    latency_total_us: u64,
+    latency_max_us: u64,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    reported_input_tokens: u64,
+    reported_output_tokens: u64,
+    usage_reported_calls: u64,
+    status: ProviderHealthStatus,
+    last_call_at: Option<Timestamp>,
+    last_success_at: Option<Timestamp>,
+    last_error_at: Option<Timestamp>,
+    last_error_class: Option<String>,
+    last_error_status: Option<u16>,
+}
+
+impl Default for LlmWorkloadState {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            successes: 0,
+            errors: 0,
+            latency_buckets: [0; LLM_WORKLOAD_BUCKETS],
+            latency_total_us: 0,
+            latency_max_us: 0,
+            estimated_input_tokens: 0,
+            estimated_output_tokens: 0,
+            reported_input_tokens: 0,
+            reported_output_tokens: 0,
+            usage_reported_calls: 0,
+            status: ProviderHealthStatus::Unknown,
+            last_call_at: None,
+            last_success_at: None,
+            last_error_at: None,
+            last_error_class: None,
+            last_error_status: None,
+        }
+    }
+}
+
+impl LlmWorkloadState {
+    fn snapshot(&self, workload: LlmWorkload) -> LlmWorkloadHealthSnapshot {
+        LlmWorkloadHealthSnapshot {
+            workload,
+            calls: self.calls,
+            successes: self.successes,
+            errors: self.errors,
+            latency_total_us: self.latency_total_us,
+            latency_max_us: self.latency_max_us,
+            latency_p50_upper_us: percentile_upper_bound(&self.latency_buckets, self.calls, 50),
+            latency_p95_upper_us: percentile_upper_bound(&self.latency_buckets, self.calls, 95),
+            estimated_input_tokens: self.estimated_input_tokens,
+            estimated_output_tokens: self.estimated_output_tokens,
+            reported_input_tokens: self.reported_input_tokens,
+            reported_output_tokens: self.reported_output_tokens,
+            usage_reported_calls: self.usage_reported_calls,
+            status: self.status,
+            last_call_at: self.last_call_at,
+            last_success_at: self.last_success_at,
+            last_error_at: self.last_error_at,
+            last_error_class: self.last_error_class.clone(),
+            last_error_status: self.last_error_status,
+        }
+    }
+}
+
+fn percentile_upper_bound(
+    buckets: &[u64; LLM_WORKLOAD_BUCKETS],
+    count: u64,
+    percentile: u64,
+) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let target = count.saturating_mul(percentile).div_ceil(100).max(1);
+    let mut cumulative = 0_u64;
+    for (bound, bucket) in ai_memory_core::LATENCY_BUCKET_BOUNDS_US.iter().zip(buckets) {
+        cumulative = cumulative.saturating_add(*bucket);
+        if cumulative >= target {
+            return Some(*bound);
+        }
+    }
+    None
+}
+
+fn estimate_request_tokens(request: &ChatRequest) -> u64 {
+    let chars = request
+        .system
+        .as_deref()
+        .map_or(0, |value| value.chars().count())
+        + request
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>();
+    u64::try_from(chars.div_ceil(4)).unwrap_or(u64::MAX)
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    u64::try_from(text.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
+}
+
+fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
+    estimate_text_tokens(&value.to_string())
+}
+
+fn estimate_structured_input_tokens(request: &ChatRequest, schema: &serde_json::Value) -> u64 {
+    estimate_request_tokens(request).saturating_add(estimate_json_tokens(schema))
+}
+
 struct HealthRecordingLlmProvider {
     inner: Arc<dyn LlmProvider>,
     health: ProviderRoleHealth,
+    workloads: LlmWorkloadHealth,
+}
+
+impl HealthRecordingLlmProvider {
+    fn record<T>(
+        &self,
+        workload: LlmWorkload,
+        started: Instant,
+        estimated_input: u64,
+        result: &LlmResult<T>,
+        output_tokens: impl FnOnce(&T) -> u64,
+        usage: impl FnOnce(&T) -> Option<Usage>,
+    ) {
+        self.health.record_result(result);
+        self.workloads.record(
+            workload,
+            started.elapsed(),
+            estimated_input,
+            result,
+            output_tokens,
+            usage,
+        );
+    }
 }
 
 #[async_trait]
@@ -340,8 +737,17 @@ impl LlmProvider for HealthRecordingLlmProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
+        let estimated_input = estimate_request_tokens(&request);
+        let started = Instant::now();
         let result = self.inner.complete(request).await;
-        self.health.record_result(&result);
+        self.record(
+            LlmWorkload::Unspecified,
+            started,
+            estimated_input,
+            &result,
+            |response| estimate_text_tokens(&response.text),
+            |response| response.usage,
+        );
         result
     }
 
@@ -354,11 +760,20 @@ impl LlmProvider for HealthRecordingLlmProvider {
         request: ChatRequest,
         operation_id: LlmOperationId,
     ) -> LlmResult<ChatResponse> {
+        let estimated_input = estimate_request_tokens(&request);
+        let started = Instant::now();
         let result = self
             .inner
             .complete_with_operation_id(request, operation_id)
             .await;
-        self.health.record_result(&result);
+        self.record(
+            operation_id.workload(),
+            started,
+            estimated_input,
+            &result,
+            |response| estimate_text_tokens(&response.text),
+            |response| response.usage,
+        );
         result
     }
 
@@ -367,8 +782,17 @@ impl LlmProvider for HealthRecordingLlmProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        let estimated_input = estimate_structured_input_tokens(&request, &schema);
+        let started = Instant::now();
         let result = self.inner.complete_structured_raw(request, schema).await;
-        self.health.record_result(&result);
+        self.record(
+            LlmWorkload::Unspecified,
+            started,
+            estimated_input,
+            &result,
+            estimate_json_tokens,
+            |_| None,
+        );
         result
     }
 
@@ -378,11 +802,20 @@ impl LlmProvider for HealthRecordingLlmProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        let estimated_input = estimate_structured_input_tokens(&request, &schema);
+        let started = Instant::now();
         let result = self
             .inner
             .complete_structured_raw_with_operation_id(request, schema, operation_id)
             .await;
-        self.health.record_result(&result);
+        self.record(
+            operation_id.workload(),
+            started,
+            estimated_input,
+            &result,
+            estimate_json_tokens,
+            |_| None,
+        );
         result
     }
 
@@ -440,13 +873,19 @@ impl Embedder for HealthRecordingEmbedder {
     }
 }
 
-fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
+/// The HTTP status and a bounded, redacted message for `err`.
+///
+/// The admin `llm-test` route answers with this so a server-side probe reports
+/// the same error class the health snapshot records, never the provider's full
+/// body (#1639).
+#[must_use]
+pub fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
     match err {
         LlmError::Http(e) => (
             e.status().map(|status| status.as_u16()),
             truncate_error_message(&e.to_string()),
         ),
-        LlmError::Provider { status, body } => (Some(*status), truncate_error_message(body)),
+        LlmError::Provider { status, body, .. } => (Some(*status), truncate_error_message(body)),
         _ => (None, truncate_error_message(&err.to_string())),
     }
 }
@@ -484,11 +923,15 @@ mod tests {
                 return Err(LlmError::Provider {
                     status: 401,
                     body: "bad token".to_string(),
+                    retry_after: None,
                 });
             }
             Ok(ChatResponse {
                 text: "pong".to_string(),
-                usage: None,
+                usage: Some(Usage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                }),
                 model: "fake-model".to_string(),
             })
         }
@@ -502,6 +945,174 @@ mod tests {
                 .await
                 .map(|_| serde_json::json!({ "ok": true }))
         }
+    }
+
+    struct TransientLlm;
+
+    #[async_trait]
+    impl LlmProvider for TransientLlm {
+        fn name(&self) -> &'static str {
+            "transient"
+        }
+        fn model(&self) -> &str {
+            "transient-model"
+        }
+        async fn complete(&self, _: ChatRequest) -> LlmResult<ChatResponse> {
+            Err(LlmError::Provider {
+                status: 503,
+                body: "secret provider response".to_owned(),
+                retry_after: None,
+            })
+        }
+        async fn complete_structured_raw(
+            &self,
+            _: ChatRequest,
+            _: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(LlmError::Provider {
+                status: 503,
+                body: "secret provider response".to_owned(),
+                retry_after: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn task_routes_keep_independent_chains_and_shared_workload_metrics() {
+        use crate::fallback::{Candidate, FallbackLlmProvider};
+
+        let health = ProviderHealth::default();
+        let default: Arc<dyn LlmProvider> = Arc::new(FakeLlm { fail: false });
+        let chain: Arc<dyn LlmProvider> = Arc::new(FallbackLlmProvider::new(vec![
+            Candidate::new("transient", "transient-model", Arc::new(TransientLlm)),
+            Candidate::new("backup", "backup-model", Arc::new(FakeLlm { fail: false })),
+        ]));
+        let other: Arc<dyn LlmProvider> = Arc::new(FallbackLlmProvider::new(vec![Candidate::new(
+            "other",
+            "other-model",
+            Arc::new(FakeLlm { fail: false }),
+        )]));
+        let routes = health.wrap_llm_providers(
+            LlmProviders {
+                default: Some(default),
+                overrides: [(LlmWorkload::Dream, chain), (LlmWorkload::Lint, other)].into(),
+            },
+            None,
+        );
+        assert!(routes.is_configured());
+        assert!(Arc::ptr_eq(
+            routes.get(LlmWorkload::Profile).unwrap(),
+            routes.default.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            routes.get(LlmWorkload::Dream).unwrap(),
+            routes.default.as_ref().unwrap()
+        ));
+        for task in [LlmWorkload::Dream, LlmWorkload::Lint] {
+            routes
+                .get(task)
+                .unwrap()
+                .complete_with_operation_id(
+                    ChatRequest::user_prompt("ping"),
+                    LlmOperationId::for_workload(task),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(health.snapshot().llm.status, ProviderHealthStatus::Unknown);
+        routes
+            .get(LlmWorkload::Profile)
+            .unwrap()
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                LlmOperationId::for_workload(LlmWorkload::Profile),
+            )
+            .await
+            .unwrap();
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.llm.provider.as_deref(), Some("fake"));
+        assert_eq!(snapshot.llm.status, ProviderHealthStatus::Ok);
+        let dream = snapshot
+            .llm_task_chains
+            .iter()
+            .find(|row| row.task == LlmWorkload::Dream)
+            .unwrap();
+        assert_eq!(dream.provider, "transient");
+        assert_eq!(dream.model, "transient-model");
+        assert_eq!(dream.status, ProviderHealthStatus::Ok);
+        assert!(dream.candidates[0].circuit_open_until.is_some());
+        assert!(dream.candidates[1].last_selected);
+        let lint = snapshot
+            .llm_task_chains
+            .iter()
+            .find(|row| row.task == LlmWorkload::Lint)
+            .unwrap();
+        assert_eq!(lint.candidates.len(), 1);
+        assert_eq!(lint.candidates[0].provider, "other");
+        for task in [LlmWorkload::Dream, LlmWorkload::Lint, LlmWorkload::Profile] {
+            assert_eq!(
+                snapshot
+                    .llm_workloads
+                    .iter()
+                    .find(|row| row.workload == task)
+                    .unwrap()
+                    .calls,
+                1
+            );
+        }
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("secret provider response")
+        );
+    }
+
+    #[tokio::test]
+    async fn override_only_routes_report_workloads_and_preserve_disabled_default() {
+        let health = ProviderHealth::default();
+        let routes = health.wrap_llm_providers(
+            LlmProviders {
+                default: None,
+                overrides: [(
+                    LlmWorkload::Dream,
+                    Arc::new(FakeLlm { fail: false }) as Arc<dyn LlmProvider>,
+                )]
+                .into(),
+            },
+            None,
+        );
+        assert!(routes.is_configured());
+        assert!(routes.get(LlmWorkload::Profile).is_none());
+        routes
+            .get(LlmWorkload::Dream)
+            .unwrap()
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                LlmOperationId::for_workload(LlmWorkload::Dream),
+            )
+            .await
+            .unwrap();
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.llm.status, ProviderHealthStatus::Disabled);
+        assert_eq!(snapshot.llm_task_chains[0].status, ProviderHealthStatus::Ok);
+        assert_eq!(
+            snapshot
+                .llm_workloads
+                .iter()
+                .find(|row| row.workload == LlmWorkload::Dream)
+                .unwrap()
+                .calls,
+            1
+        );
+        let mut old = serde_json::to_value(snapshot).unwrap();
+        old.as_object_mut().unwrap().remove("llm_task_chains");
+        assert!(
+            serde_json::from_value::<ProviderHealthSnapshot>(old)
+                .unwrap()
+                .llm_task_chains
+                .is_empty()
+        );
+        assert!(!LlmProviders::default().is_configured());
     }
 
     struct TaskAwareEmbedder;
@@ -552,7 +1163,10 @@ mod tests {
         async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
             Ok(ChatResponse {
                 text: "pong".to_string(),
-                usage: None,
+                usage: Some(Usage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                }),
                 model: "fake-model".to_string(),
             })
         }
@@ -590,7 +1204,7 @@ mod tests {
         let health = ProviderHealth::default();
         let inner = Arc::new(OperationIdLlm::default());
         let llm = health.wrap_llm_provider(inner.clone(), "openai", "gpt-test", None);
-        let id = LlmOperationId::new();
+        let id = LlmOperationId::for_workload(LlmWorkload::Consolidation);
 
         llm.complete_with_operation_id(ChatRequest::user_prompt("ping"), id)
             .await
@@ -604,7 +1218,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(*inner.seen.lock().unwrap(), vec![id, id]);
-        assert_eq!(health.snapshot().llm.status, ProviderHealthStatus::Ok);
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.llm.status, ProviderHealthStatus::Ok);
+        let consolidation = snapshot
+            .llm_workloads
+            .iter()
+            .find(|row| row.workload == LlmWorkload::Consolidation)
+            .unwrap();
+        assert_eq!(
+            (
+                consolidation.calls,
+                consolidation.successes,
+                consolidation.errors,
+                consolidation.usage_reported_calls,
+                consolidation.reported_input_tokens,
+                consolidation.reported_output_tokens,
+            ),
+            (2, 2, 0, 1, 2, 1)
+        );
+        assert!(consolidation.estimated_input_tokens > 0);
+        assert!(consolidation.estimated_output_tokens > 0);
+        assert!(consolidation.latency_p50_upper_us.is_some());
+        assert!(
+            !id.to_string().contains(LlmWorkload::Consolidation.as_str()),
+            "the workload label must not change the provider wire id"
+        );
     }
 
     #[tokio::test]
@@ -629,11 +1267,21 @@ mod tests {
         llm.complete(ChatRequest::user_prompt("ping"))
             .await
             .unwrap();
-        let after_success = health.snapshot().llm;
+        let snapshot = health.snapshot();
+        let after_success = snapshot.llm;
         assert_eq!(after_success.status, ProviderHealthStatus::Ok);
         assert!(after_success.last_call_at.is_some());
         assert!(after_success.last_success_at.is_some());
         assert!(after_success.last_error_message.is_none());
+        let unspecified = snapshot
+            .llm_workloads
+            .iter()
+            .find(|row| row.workload == LlmWorkload::Unspecified)
+            .unwrap();
+        assert_eq!(unspecified.calls, 1);
+        assert_eq!(unspecified.usage_reported_calls, 1);
+        assert_eq!(unspecified.reported_input_tokens, 2);
+        assert_eq!(unspecified.reported_output_tokens, 1);
 
         let llm = health.wrap_llm_provider(
             Arc::new(FakeLlm { fail: true }),
@@ -648,6 +1296,141 @@ mod tests {
         assert_eq!(after_error.last_error_status, Some(401));
         assert_eq!(after_error.last_error_message.as_deref(), Some("bad token"));
         assert_eq!(after_error.retry_hint.as_deref(), Some(retry_hint.as_str()));
+    }
+
+    /// #1981: the counters say when they started, the value holds while they
+    /// count, and a reset restarts both, so two snapshots with the same
+    /// `llm_workloads_started_ms` measure one window.
+    #[tokio::test]
+    async fn workload_counters_report_when_they_started() {
+        let health = ProviderHealth::default();
+        let disabled = health.snapshot();
+        assert!(disabled.llm_workloads.is_empty());
+        assert_eq!(disabled.llm_workloads_started_ms, None);
+
+        let before = u64::try_from(Timestamp::now().as_millisecond()).unwrap();
+        let llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let started = health.snapshot().llm_workloads_started_ms.unwrap();
+        assert!(started >= before, "{started} < {before}");
+        llm.complete(ChatRequest::user_prompt("ping"))
+            .await
+            .unwrap();
+        let counted = health.snapshot();
+        assert_eq!(counted.llm_workloads_started_ms, Some(started));
+        assert_eq!(
+            counted
+                .llm_workloads
+                .iter()
+                .map(|row| row.calls)
+                .sum::<u64>(),
+            1
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let _llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let reset = health.snapshot();
+        assert!(reset.llm_workloads_started_ms.unwrap() > started);
+        assert!(reset.llm_workloads.iter().all(|row| row.calls == 0));
+
+        let json = serde_json::to_value(&reset).unwrap();
+        assert_eq!(
+            json["llm_workloads_started_ms"],
+            reset.llm_workloads_started_ms.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_server_has_no_workload_start() {
+        let mut json = serde_json::to_value(ProviderHealthSnapshot::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("llm_workloads_started_ms")
+            .unwrap();
+        let parsed: ProviderHealthSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.llm_workloads_started_ms, None);
+    }
+
+    #[test]
+    fn workload_snapshot_is_bounded_redacted_and_percentiled() {
+        let workloads = LlmWorkloadHealth::default();
+        let request = ChatRequest::user_prompt("do not expose this private prompt");
+        let response = Ok(ChatResponse {
+            text: "private provider output".into(),
+            usage: Some(Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+            }),
+            model: "fake".into(),
+        });
+        workloads.record(
+            LlmWorkload::Rerank,
+            Duration::from_millis(40),
+            estimate_request_tokens(&request),
+            &response,
+            |output| estimate_text_tokens(&output.text),
+            |output| output.usage,
+        );
+        let failure: LlmResult<ChatResponse> = Err(LlmError::Provider {
+            status: 429,
+            body: "secret upstream body".into(),
+            retry_after: None,
+        });
+        workloads.record(
+            LlmWorkload::Rerank,
+            Duration::from_secs(12),
+            estimate_request_tokens(&request),
+            &failure,
+            |output| estimate_text_tokens(&output.text),
+            |output| output.usage,
+        );
+        workloads.record(
+            LlmWorkload::Rerank,
+            Duration::from_millis(20),
+            estimate_request_tokens(&request),
+            &response,
+            |output| estimate_text_tokens(&output.text),
+            |output| output.usage,
+        );
+
+        let row = workloads
+            .snapshot()
+            .0
+            .into_iter()
+            .find(|row| row.workload == LlmWorkload::Rerank)
+            .unwrap();
+        assert_eq!((row.calls, row.successes, row.errors), (3, 2, 1));
+        assert_eq!(
+            (row.reported_input_tokens, row.reported_output_tokens),
+            (22, 6)
+        );
+        assert_eq!(row.usage_reported_calls, 2);
+        assert_eq!(row.status, ProviderHealthStatus::Ok);
+        assert!(row.last_success_at.is_some());
+        assert_eq!(row.latency_p50_upper_us, Some(50_000));
+        assert_eq!(row.latency_p95_upper_us, None, "p95 is above 10 seconds");
+        assert!(
+            row.last_error_at.is_some(),
+            "a later success must not erase the last error evidence"
+        );
+        assert_eq!(row.last_error_class.as_deref(), Some("provider"));
+        assert_eq!(row.last_error_status, Some(429));
+        let json = serde_json::to_string(&row).unwrap();
+        for secret in ["private prompt", "provider output", "upstream body"] {
+            assert!(!json.contains(secret), "telemetry leaked {secret}: {json}");
+        }
+    }
+
+    #[test]
+    fn structured_input_estimate_includes_the_schema() {
+        let request = ChatRequest::user_prompt("x");
+        let schema = serde_json::json!({
+            "type": "object",
+            "description": "s".repeat(400),
+        });
+        assert!(
+            estimate_structured_input_tokens(&request, &schema)
+                > estimate_request_tokens(&request) + 90
+        );
     }
 
     #[tokio::test]

@@ -138,10 +138,24 @@ Initial source support is intentionally narrow:
   scope, every write conditional (`create_only`, then `expected_page_id` per
   later version), refuse servers older than 3.0, and land under
   `imported/agentmemory/`, outside every reserved family. Each page version
-  carries a stable UUIDv5 ingest key, so a rerun skips what is already there.
+  carries a stable UUIDv5 ingest key; a rerun skips an existing version only
+  when its complete body matches the sanitized plan. A destination body edit
+  retaining the key stops resumption before another version replaces it.
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
+- claude-mem's local SQLite database (`claude-mem`, with a required project or
+  checkout mapping). The importer snapshots a regular source file through
+  SQLite's backup API, recognizes only documented schema families by their
+  actual columns, skips sensitive/security-alert rows without copying their
+  bodies, and writes sanitized per-record pages through bounded atomic MCP
+  batches. Stable `project_id` targets select an existing destination without
+  creating a same-name project. Details and limits are in the importer README.
+- one explicitly selected local text/Markdown, text-layer PDF, DOCX, PPTX,
+  XLSX, VTT, or SRT document (`document`, Unix-only). Extraction is bounded and
+  sanitized, pages carry source digest and extractor provenance, and writes
+  use MCP `create_only` so reruns are idempotent and conflicts never overwrite
+  another page. OCR, images, and raw audio/video stay outside the companion.
 
 Future sources can include:
 
@@ -200,8 +214,9 @@ Write:
   duplicate detection and context checks;
 - optionally call `memory_consolidate` or `memory_auto_improve` after import for
   post-import refinement, rather than building that refinement into core;
-- for bulk operations, loop over the public single-page operation unless ai-memory
-  later adds a generic bulk-mutation seam for its own reasons.
+- for bounded bulk imports, use `memory_write_pages_batch`: every page must be
+  conditional and one rejected or stale page rolls back the whole batch. Keep
+  ordinary writes on `memory_write_page`.
 
 Re-home by kind:
 
@@ -245,8 +260,9 @@ Re-home by kind:
 3. Add live writes through existing ai-memory public write/delete surfaces.
 4. Add optional LLM normalization as a companion-side pass.
 5. Add re-home/link-rewrite as a separate subcommand after import is stable.
-6. Only after repeated usage, consider whether ai-memory core lacks a small,
-   generic API seam; do not start by patching core endpoints.
+6. Reuse the bounded conditional `memory_write_pages_batch` seam for corpus
+   imports. Add another public mutation surface only when repeated use proves
+   that this generic batch cannot preserve the required safety contract.
 
 ## `ai-memory-wikisync`: team-wiki export and sync
 
@@ -300,6 +316,13 @@ directions are family-scoped and dry-run by default.
   state, server body): files edited locally since the last export are
   reported with a diff summary and the whole batch is refused without
   `--force`.
+- The state file records the server origin, workspace and project it was
+  exported from. Reusing a destination for another scope refuses before
+  anything is written — otherwise that project's pages read as "deleted on
+  the server" and `--propagate-deletes --apply` removes them — and
+  `--adopt-scope` is the explicit way to discard the baseline and start
+  fresh (#1708). A baseline written before the field existed is adopted on
+  its first run, with a warning.
 - `plan` and `export` never delete; `sync` deletes only with
   `--propagate-deletes`. It never runs git, commits, or pushes; it prints
   the commands (`git add`, `git rm`) the operator may run.
@@ -333,9 +356,11 @@ directions are family-scoped and dry-run by default.
   and is refused for a server page carrying any metadata the write cannot
   carry (`summary`, `sources`, `kind`, …), naming the keys.
 - Every import and delete is conditional on the page version the plan
-  classified, so the server refuses one that changed in between. That page
-  is reported as changed during the run and keeps its state; the other pages
-  still sync and the run exits non-zero.
+  classified. An edited repository file uses one full page read to obtain
+  both its comparison and its write precondition; unchanged files still use
+  ETag revalidation. The server refuses a version that changed in between.
+  That page is reported as changed during the run and keeps its state; the
+  other pages still sync and the run exits non-zero.
 
 ### Validation
 
@@ -424,6 +449,54 @@ override is written only into the rendered LaunchAgent plist
 - Do not sandbox the app in a way that blocks `launchctl` or LaunchAgents.
 
 See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
+
+## `ai-memory-desktop`: desktop installer
+
+A [Tauri v2](https://v2.tauri.app) app at
+[`companions/ai-memory-desktop`](../companions/ai-memory-desktop) for people
+who would rather not open a terminal (#1273, RFC #878 Phase 4). Its window
+starts on a plain HTML page and then shows the page `ai-memory setup --web`
+serves, so the whole setup UI and its safety rules stay in the CLI. There is
+no npm or JavaScript toolchain.
+
+It is not a root workspace member. Check it separately:
+
+```bash
+cargo clippy --locked --manifest-path companions/ai-memory-desktop/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path companions/ai-memory-desktop/Cargo.toml
+```
+
+### How it talks to ai-memory
+
+- Finds an existing `ai-memory` (the `install.sh`/`install.ps1` location,
+  `PATH`, the package-manager directories) and uses it as it is.
+- With none, copies the binary it carries (a Tauri sidecar) and the `hooks/`
+  bundle into the same per-user layout the scripts use, links
+  `~/.local/bin/ai-memory` when that name is free, and on Windows adds the
+  directory to the user `PATH`.
+- Runs `ai-memory setup --web --no-open --stop-on-stdin-eof` and navigates its
+  window to the address that command prints, accepting only the exact
+  `http://127.0.0.1:<port>/s/<secret>/` shape.
+
+It does not open SQLite or the wiki, call `/admin` routes, or add MCP tools.
+
+### Safety requirements
+
+- Never replace an existing install or someone else's `~/.local/bin/ai-memory`.
+- Never run `setup` from inside the bundle: the service it registers names the
+  binary it ran from, and a `.app` path, a replaced install directory or an
+  AppImage mount would stop the server from starting later.
+- The setup page is a remote origin to the webview and gets no Tauri
+  capability.
+- The setup page must not outlive the app: the app holds the child's stdin,
+  and `--stop-on-stdin-eof` stops it when the pipe closes.
+
+### Not done: signing
+
+CI builds unsigned installers on dispatch. They are previews and are not
+attached to releases until the project has an Apple Developer ID with
+notarization and a Windows Authenticode certificate. That decision, and its
+cost, belong to the maintainers (RFC #878).
 
 ## `ai-memory-ts`: TypeScript client SDK
 
@@ -630,10 +703,11 @@ unclaimed tree. Building the guard on ai-memory's captured
   (agentmemory #221), so by design there is no synchronous veto channel back to
   the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
-  stored observation is reduced to a `tool_family` label plus outcome; raw
-  arguments, paths, and tool names are extracted only transiently for
-  denylist matching, then dropped (`CaptureDecision` "never retains raw
-  arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
+  stored observation is reduced to a `tool_family` label plus outcome (and an
+  MCP tool's validated server and tool names); raw arguments, paths, and other
+  tool names are extracted only transiently for denylist matching, then dropped
+  (`CaptureDecision` "never retains raw arguments, paths, or arbitrary tool
+  names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
 Reversing either (persisting paths, or adding a blocking hook) would trade away a

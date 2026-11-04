@@ -136,6 +136,11 @@ pub struct ProviderConfig {
     /// by default, ignored by every other provider. Sourced once from
     /// `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` by `Config::load`.
     pub compat_disable_thinking: bool,
+    /// Optional `stream` field for `openai-compat` Chat Completions requests.
+    /// `None` preserves omission; `Some(false)` requests non-streaming JSON.
+    /// `Some(true)` is rejected; other providers ignore this setting.
+    /// Sourced once from `AI_MEMORY_LLM_COMPAT_STREAM` by `Config::load`.
+    pub compat_stream: Option<bool>,
     /// Per-request timeout for every chat provider, in seconds.
     /// Sourced once from `AI_MEMORY_LLM_TIMEOUT_SECS` by `Config::load`;
     /// defaults to [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`].
@@ -384,8 +389,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
+            let mut provider = AnthropicProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                AnthropicProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
@@ -393,8 +402,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
+            let mut provider = OpenAiProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                OpenAiProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
@@ -433,6 +446,7 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
                     .with_disable_thinking(config.compat_disable_thinking)
+                    .with_stream(config.compat_stream)?
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers)
@@ -496,6 +510,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             }
             Ok(Arc::new(
                 provider
+                    // Go's Chat Completions catalogue supports JSON Schema;
+                    // the wrapper falls back only when a model explicitly
+                    // rejects the parameter or returns an unparsable shape.
+                    .with_strict(true)
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
@@ -667,6 +685,7 @@ mod tests {
             base_url: None,
             compat_strict: false,
             compat_disable_thinking: false,
+            compat_stream: None,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: crate::ExtraHeaders::default(),
@@ -687,9 +706,33 @@ mod tests {
             base_url: Some("http://127.0.0.1:11434/v1".into()),
             compat_strict: true,
             compat_disable_thinking: false,
+            compat_stream: None,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers,
+        }
+    }
+
+    #[test]
+    fn openai_compat_rejects_streaming_configuration() {
+        let mut config = compat_config(crate::ExtraHeaders::default());
+        config.compat_stream = Some(true);
+        let error = build_provider(config)
+            .err()
+            .expect("streaming must be rejected before any request");
+        assert!(matches!(error, LlmError::NotConfigured(_)));
+        let message = error.to_string();
+        assert!(message.contains("AI_MEMORY_LLM_COMPAT_STREAM"), "{message}");
+        assert!(message.contains("false or unset"), "{message}");
+        assert!(message.contains("SSE"), "{message}");
+    }
+
+    #[test]
+    fn openai_compat_accepts_non_streaming_and_omission() {
+        for stream in [None, Some(false)] {
+            let mut config = compat_config(crate::ExtraHeaders::default());
+            config.compat_stream = stream;
+            assert!(build_provider(config).is_ok());
         }
     }
 
@@ -736,6 +779,7 @@ mod tests {
             base_url: None,
             compat_strict: false,
             compat_disable_thinking: false,
+            compat_stream: None,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: headers,
@@ -767,6 +811,7 @@ mod tests {
 
         let mut cfg = compat_config(crate::ExtraHeaders::default());
         cfg.base_url = Some(server.uri());
+        cfg.compat_stream = Some(false);
         let provider = build_provider(cfg).expect("provider builds");
         let operation_id = crate::LlmOperationId::new();
         provider
@@ -776,6 +821,9 @@ mod tests {
 
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        assert_eq!(body["stream"], false);
         assert_eq!(
             requests[0]
                 .headers

@@ -15,7 +15,10 @@
 //! zero-LLM default path never runs it.
 
 use ai_memory_core::{ProjectId, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{ReaderPool, StoredPageBody};
 
 use crate::auto_improve::{
@@ -221,9 +224,13 @@ pub async fn run_experience_review(
         max_tokens: REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request)
-        .await
-        .map_err(AutoImproveError::from)?;
+    let raw: AutoImproveLlmResponse = complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Experience),
+    )
+    .await
+    .map_err(AutoImproveError::from)?;
     let (mut proposals, mut rejected_candidates, mut response_warnings) =
         crate::auto_improve::validate_response(raw, &cfg, &existing_index);
     warnings.append(&mut response_warnings);
@@ -278,7 +285,11 @@ Your task is ABSTRACTION ACROSS SESSIONS, not summarizing any single one. Propos
 - gotchas: a pitfall more than one session hit
 - decisions: only when several sessions show a de-facto decision that no page records, or new sessions contradict a recorded one (say so plainly)
 
-Reject anything supported by a single session — the per-session reviewer owns that. Reject narratives, timelines, and status reports; propose durable knowledge only. Every proposal must include bounded evidence quotes NAMING the sessions they came from, confidence, rationale, and a valid path. Rule paths must start with `_rules/`. Do not target sessions/ or _pending/."#;
+Reject anything supported by a single session — the per-session reviewer owns that. Reject narratives, timelines, and status reports; propose durable knowledge only. Every proposal must include bounded evidence quotes NAMING the sessions they came from, confidence, rationale, and a valid path. Rule paths must start with `_rules/`. Do not target sessions/ or _pending/.
+
+## OUTPUT LANGUAGE
+
+Write page titles, markdown prose, patch content, and rationale in the dominant natural language of the session summaries (if the user works in Portuguese, write Portuguese — do not translate their vocabulary into English). English instructions and an English schema do not make English the output language. Keep code, identifiers, file paths, shell commands, error strings, patch anchors, and evidence quotes verbatim in their original form. JSON keys, enum values, and paths stay as the schema requires."#;
 
 #[cfg(test)]
 mod tests {
@@ -293,6 +304,16 @@ mod tests {
             "the cross-session evidence bar is the point of this pass"
         );
         assert!(EXPERIENCE_SYSTEM_PROMPT.contains("Reject anything supported by a single session"));
+    }
+
+    #[test]
+    fn experience_prompt_mirrors_input_language() {
+        assert!(EXPERIENCE_SYSTEM_PROMPT.contains("## OUTPUT LANGUAGE"));
+        assert!(
+            EXPERIENCE_SYSTEM_PROMPT.contains("dominant natural language of the session summaries")
+        );
+        assert!(EXPERIENCE_SYSTEM_PROMPT.contains("do not make English the output language"));
+        assert!(EXPERIENCE_SYSTEM_PROMPT.contains("evidence quotes verbatim"));
     }
 
     #[test]

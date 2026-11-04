@@ -90,6 +90,34 @@ check_sdk_not_distributed() {
   rm -f "${probe}"
 }
 
+# packaging/scoop/ai-memory.json is a template: the release workflow pins its
+# version, url and hash to the tag before pushing it to the Scoop bucket. Check
+# the parts the workflow keeps as they are, and that they name the zip the
+# release actually builds.
+check_scoop_manifest() {
+  local manifest=packaging/scoop/ai-memory.json
+  local zip=ai-memory-windows-x86_64.zip
+  log "Checking Scoop manifest template"
+  require_tool jq
+  jq -e . "${manifest}" >/dev/null || fail "${manifest} is not valid JSON"
+  jq -e --arg zip "${zip}" '
+    . as $m
+    | (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    and .homepage == "https://aimemory.sh"
+    and .license == "MIT"
+    and .bin == "ai-memory.exe"
+    and .checkver.github == "https://github.com/akitaonrails/ai-memory"
+    and (.architecture."64bit".url | endswith("/v" + $m.version + "/" + $zip))
+    and (.architecture."64bit".hash | test("^[0-9a-f]{64}$"))
+    and .autoupdate.architecture."64bit".url
+      == "https://github.com/akitaonrails/ai-memory/releases/download/v$version/" + $zip
+    and .autoupdate.hash.url == "$url.sha256"
+  ' "${manifest}" >/dev/null \
+    || fail "${manifest} does not match the release's Windows zip or Scoop's manifest fields"
+  grep -Fq "RELEASE_ARTIFACT: ${zip%.zip}" .github/workflows/release.yml \
+    || fail "release.yml no longer builds ${zip}, which ${manifest} installs"
+}
+
 main() {
   local repo
   repo="$(repo_root)"
@@ -124,7 +152,12 @@ main() {
     log "Skipping RPM spec check (rpmspec unavailable)"
   fi
 
-  TMP_ROOT="$(mktemp -d /tmp/ai-memory-native-root.XXXXXX)"
+  check_scoop_manifest
+
+  # Honor TMPDIR: mktemp ignores it once the template carries an explicit
+  # directory, and a host whose /tmp is small or quota-limited would reject
+  # the writes below.
+  TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-native-root.XXXXXX")"
   cleanup() {
     if [ -n "${TMP_ROOT}" ]; then
       rm -rf "${TMP_ROOT}"
@@ -161,6 +194,14 @@ main() {
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory install-hooks --agent claude-code --capture-mode allowlist --apply
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory --config '/tmp/ai memory.toml' run codex --yolo
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory --data-dir=/tmp/ai-memory show --json
+  assert_contains "${wrapper_log}" "--config /tmp/ai memory.toml run codex --yolo"
+  assert_contains "${wrapper_log}" "--data-dir=/tmp/ai-memory show --json"
   assert_contains "${wrapper_log}" "run codex --yolo"
   assert_contains "${wrapper_log}" "show --json --no-scan"
   assert_contains "${wrapper_log}" "continue --workspace work --yolo"
@@ -181,6 +222,22 @@ main() {
     bin/ai-memory run codex 2>/dev/null; then
     fail "AI_MEMORY_NATIVE_BIN pointing to the wrapper must be refused instead of recursing"
   fi
+
+  log "Checking the PowerShell wrapper intercepts the same native host commands"
+  # bin/ai-memory.ps1 routes run/show/continue/resume/workstreams/rename-
+  # workstream to the native Windows client (#1545). Its list must match the
+  # POSIX wrapper's intercept exactly, and both must point a missing client
+  # at the documented Windows installer. Static only: this script has no pwsh.
+  local posix_list ps1_list
+  posix_list="$(grep -m1 '^  run | show | continue | resume | workstreams | rename-workstream)' bin/ai-memory \
+    | sed 's/^ *//; s/)$//' | tr '|' ' ' | tr -s ' ' '\n' | sort | paste -sd' ' -)"
+  ps1_list="$(sed -n '/^\$NativeHostCommands = @($/,/^)$/p' bin/ai-memory.ps1 \
+    | grep -o '"[a-z-]*"' | tr -d '"' | sort | paste -sd' ' -)"
+  test -n "${posix_list}" || fail "could not extract the native host command list from bin/ai-memory"
+  test "${posix_list}" = "${ps1_list}" \
+    || fail "native host command lists drifted between bin/ai-memory (${posix_list}) and bin/ai-memory.ps1 (${ps1_list})"
+  assert_contains bin/ai-memory.ps1 "https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1"
+  assert_contains bin/ai-memory "https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1"
 
   log "Checking the wrapper hands host commands the volume's root bearer"
   # New-install default: a server initialized on the named volume keeps its token at

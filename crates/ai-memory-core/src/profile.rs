@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::UserId;
+use crate::sanitize::truncate_utf8_bytes;
 
 /// Path prefix every profile entry lives under, in whichever scope holds the
 /// profile.
@@ -244,6 +245,8 @@ pub const DEFAULT_BASELINE_MAX_BYTES: usize = 6_000;
 pub const BASELINE_MAX_BYTES_RANGE: (usize, usize) = (2_000, 20_000);
 /// Default number of lines `profile apply` writes into a rules file.
 pub const DEFAULT_APPLY_MAX_LINES: usize = 40;
+/// Default output-token allowance for one profile LLM call.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2_000;
 
 /// `[profile]` server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +267,11 @@ pub struct ProfileSettings {
     pub baseline_max_bytes: usize,
     /// Lines `ai-memory profile apply` writes at most.
     pub apply_max_lines: usize,
+    /// Output-token allowance for one profile LLM call (classification and
+    /// merge). Raise it when the provider spends part of the budget before
+    /// the structured JSON (for example a thinking model) and the call
+    /// fails with `finish_reason=length`.
+    pub max_output_tokens: u32,
     /// Use the configured LLM provider, when there is one.
     pub llm: bool,
 }
@@ -278,6 +286,7 @@ impl Default for ProfileSettings {
             digest_max_bytes: DEFAULT_DIGEST_MAX_BYTES,
             baseline_max_bytes: DEFAULT_BASELINE_MAX_BYTES,
             apply_max_lines: DEFAULT_APPLY_MAX_LINES,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             llm: true,
         }
     }
@@ -463,8 +472,9 @@ impl ProfileEntry {
     ///
     /// The statement is the frontmatter `summary` or `abstract` when set,
     /// otherwise the first line of prose in the body, collapsed to one line
-    /// and capped at [`ENTRY_STATEMENT_MAX_BYTES`]. Returns `None` when the
-    /// page has nothing to state.
+    /// and capped at [`ENTRY_STATEMENT_MAX_BYTES`]. A longer statement ends in
+    /// `…` inside that cap, so the reader can tell the rule goes on. Returns
+    /// `None` when the page has nothing to state.
     #[must_use]
     pub fn from_page(
         path: &str,
@@ -472,19 +482,8 @@ impl ProfileEntry {
         body: &str,
         frontmatter: &serde_json::Value,
     ) -> Option<Self> {
-        let from_frontmatter = ["summary", "abstract"].iter().find_map(|key| {
-            frontmatter
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        });
-        let statement = from_frontmatter
-            .or_else(|| first_prose_line(body))
-            .or_else(|| Some(title.trim().to_owned()).filter(|t| !t.is_empty()))?;
-        let statement = collapse_whitespace(&statement);
-        let statement = truncate_bytes(&statement, ENTRY_STATEMENT_MAX_BYTES).to_owned();
+        let statement = profile_statement(title, body, frontmatter)?;
+        let statement = truncate_utf8_bytes(&statement, ENTRY_STATEMENT_MAX_BYTES);
         let applies_to = match frontmatter.get("applies_to") {
             Some(serde_json::Value::String(one)) => vec![one.trim().to_ascii_lowercase()],
             Some(serde_json::Value::Array(many)) => many
@@ -545,6 +544,29 @@ impl ProfileEntry {
             || self.applies_to.is_empty()
             || self.applies_to.iter().any(|tag| project_tags.contains(tag))
     }
+}
+
+/// Select and normalize the uncapped statement a profile digest would use.
+/// Writers use this before persistence so any truncation warning and the
+/// eventual session-start digest cannot disagree about the source text.
+#[must_use]
+pub fn profile_statement(
+    title: &str,
+    body: &str,
+    frontmatter: &serde_json::Value,
+) -> Option<String> {
+    let from_frontmatter = ["summary", "abstract"].iter().find_map(|key| {
+        frontmatter
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    from_frontmatter
+        .or_else(|| first_prose_line(body))
+        .or_else(|| Some(title.trim().to_owned()).filter(|title| !title.is_empty()))
+        .map(|statement| collapse_whitespace(&statement))
 }
 
 fn first_prose_line(body: &str) -> Option<String> {
@@ -622,18 +644,6 @@ fn labelled_field(line: &str) -> Option<(&str, &str)> {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Truncate to at most `max` bytes without splitting a UTF-8 character.
-fn truncate_bytes(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// Opening fence around stored text in injected context.
@@ -1107,6 +1117,38 @@ mod tests {
             ProfileEntry::from_page("profile/a.md", "A", &long, &serde_json::Value::Null).unwrap();
         assert_eq!(e.statement.len(), ENTRY_STATEMENT_MAX_BYTES);
         assert_eq!(e.category(), "");
+    }
+
+    #[test]
+    fn a_statement_over_the_cap_ends_in_an_ellipsis_inside_it() {
+        let entry = |statement: &str| {
+            ProfileEntry::from_page(
+                "profile/habits/a.md",
+                "A",
+                "# A\n",
+                &serde_json::json!({ "summary": statement }),
+            )
+            .unwrap()
+            .statement
+        };
+
+        // A cut mid-sentence used to read as the whole rule.
+        let long = format!("{} never commit the lockfile.", "word ".repeat(60));
+        let cut = entry(&long);
+        assert!(cut.len() <= ENTRY_STATEMENT_MAX_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(long.starts_with(cut.trim_end_matches('…')));
+
+        // The ellipsis never lands inside a multibyte character.
+        let accented = "é".repeat(ENTRY_STATEMENT_MAX_BYTES);
+        let cut = entry(&accented);
+        assert!(cut.len() <= ENTRY_STATEMENT_MAX_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.trim_end_matches('…').chars().all(|c| c == 'é'));
+
+        // A statement that fits is left alone.
+        let exact = "x".repeat(ENTRY_STATEMENT_MAX_BYTES);
+        assert_eq!(entry(&exact), exact);
     }
 
     #[test]

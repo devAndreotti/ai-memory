@@ -174,6 +174,20 @@ pub const MAX_PAGE_APPLIES_TO: usize = 16;
 pub const MAX_PAGE_APPLIES_TO_TAG_LEN: usize = 32;
 /// Maximum raw characters in `enforced_by`, before trimming.
 pub const MAX_PAGE_ENFORCED_BY_LEN: usize = 256;
+/// Maximum `source_files` entries in one write.
+pub const MAX_PAGE_SOURCES: usize = 16;
+/// Maximum raw characters in one `source_files` path, before trimming.
+pub const MAX_PAGE_SOURCE_PATH_LEN: usize = 1024;
+
+/// A repository file a page describes, and the commit the page was last
+/// checked against (`git rev-parse HEAD` when it was written).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PageSource {
+    /// Repository-relative path with `/` separators, at most 1024 raw characters.
+    pub path: String,
+    /// Commit id, 7-64 hex characters (SHA-1 or SHA-256 repositories); lowercased.
+    pub commit: String,
+}
 
 /// Editable metadata shared by public page-write surfaces.
 ///
@@ -214,6 +228,14 @@ pub struct PageWriteMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 256))]
     pub enforced_by: Option<String>,
+    /// Repository files this page describes, each with the commit it was
+    /// checked against. Up to 16. Stored as-is; the server never reads the
+    /// files: a client compares each entry with its checkout and records
+    /// `stale` feedback when one changed. Not OKF `sources`, which holds the
+    /// page's session provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub source_files: Vec<PageSource>,
 }
 
 impl PageWriteMetadata {
@@ -276,7 +298,19 @@ impl PageWriteMetadata {
                     None => target.as_str(),
                     Some((scope, path)) => {
                         let parts: Vec<_> = scope.split('/').collect();
+                        // `ai_memory_wiki::split_scope` only recognises a
+                        // scope built from alphanumerics and `-_/.`; on a
+                        // scope holding anything else it returns no scope at
+                        // all and leaves the colon inside the page path. That
+                        // path is one `PagePath::new` accepts but
+                        // `ensure_portable` refuses, so the write would mint a
+                        // `links` row no page write could ever repoint. The
+                        // write boundary has to agree with the reader on what
+                        // a scope is, so the character class is shared.
                         if parts.len() > 2
+                            || !scope
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
                             || parts.iter().any(|s| {
                                 s.trim().is_empty() || *s != s.trim() || matches!(*s, "." | "..")
                             })
@@ -335,6 +369,27 @@ impl PageWriteMetadata {
         }
         if !applies_to.is_empty() {
             fm.insert("applies_to".into(), serde_json::json!(applies_to));
+        }
+        if self.source_files.len() > MAX_PAGE_SOURCES {
+            return Err(invalid("source_files"));
+        }
+        let mut sources = Vec::with_capacity(self.source_files.len());
+        for source in self.source_files {
+            let path = source.path.trim();
+            let commit = source.commit.trim().to_ascii_lowercase();
+            if !valid_text(&source.path, MAX_PAGE_SOURCE_PATH_LEN)
+                || path.chars().any(char::is_control)
+                || path.contains('\\')
+                || path.split('/').any(|seg| matches!(seg, "" | "." | ".."))
+                || !(7..=64).contains(&commit.len())
+                || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("source_files"));
+            }
+            sources.push(serde_json::json!({ "path": path, "commit": commit }));
+        }
+        if !sources.is_empty() {
+            fm.insert("source_files".into(), serde_json::Value::Array(sources));
         }
         Ok(fm)
     }
@@ -606,6 +661,14 @@ pub struct Page {
 }
 
 impl Tier {
+    /// Every tier, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::Working,
+        Self::Episodic,
+        Self::Semantic,
+        Self::Procedural,
+    ];
+
     /// Canonical short string for storage and serialisation.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -698,6 +761,36 @@ impl FromStr for Tier {
 mod tests {
     use super::*;
 
+    /// A relation target's scope must be one `ai_memory_wiki::split_scope`
+    /// recognises. It accepts only alphanumerics and `-_/.`, and on anything
+    /// else it returns no scope and leaves the colon inside the page path —
+    /// a path `PagePath::new` accepts but `ensure_portable` refuses, so no
+    /// page write could ever create it and the `links` row stays unresolved
+    /// forever. A space is the realistic case: project names come from folder
+    /// basenames.
+    #[test]
+    fn page_write_metadata_refuses_a_scope_the_link_reader_cannot_parse() {
+        let metadata = |target: &str| -> PageWriteMetadata {
+            serde_json::from_value(serde_json::json!({
+                "relations": {"fixes": [target]}
+            }))
+            .unwrap()
+        };
+        for target in ["my project:notes/x", "a+b:notes/x", "ws/my project:notes/x"] {
+            assert!(
+                metadata(target).into_frontmatter().is_err(),
+                "{target} must be refused"
+            );
+        }
+        // Control: a scope the reader does parse still writes.
+        for target in ["other:notes/x", "workspace/other:notes/x"] {
+            assert!(
+                metadata(target).into_frontmatter().is_ok(),
+                "{target} must stay accepted"
+            );
+        }
+    }
+
     #[test]
     fn page_write_metadata_scope_components_refuse_surrounding_whitespace() {
         for target in ["other:notes/x", "workspace/other:notes/x"] {
@@ -782,6 +875,50 @@ mod tests {
                 serde_json::from_value::<PageWriteMetadata>(bad.clone()).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn page_write_metadata_source_files_are_validated_and_normalized() {
+        let parse = |sources: serde_json::Value| -> PageWriteMetadata {
+            serde_json::from_value(serde_json::json!({ "source_files": sources })).unwrap()
+        };
+        let ok = serde_json::json!({"path": "src/a.rs", "commit": "3f2a9c1"});
+        let fm = parse(serde_json::json!([
+            {"path": " bin/deploy.sh ", "commit": "3F2A9C1"},
+            {"path": "src/a.rs", "commit": "a".repeat(64)},
+        ]))
+        .into_frontmatter()
+        .unwrap();
+        assert_eq!(
+            fm["source_files"][0],
+            serde_json::json!({"path": "bin/deploy.sh", "commit": "3f2a9c1"})
+        );
+        assert_eq!(fm["source_files"][1]["commit"], "a".repeat(64));
+        assert!(fm.get("sources").is_none(), "OKF `sources` stays untouched");
+        assert!(
+            parse(serde_json::json!(vec![ok.clone(); MAX_PAGE_SOURCES]))
+                .into_frontmatter()
+                .is_ok()
+        );
+        for bad in [
+            serde_json::json!([{"path": "/etc/passwd", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "../x", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a/./b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a//b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a\\b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a\nb", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "", "commit": "3f2a9c1"}]),
+            serde_json::json!([{
+                "path": "a".repeat(MAX_PAGE_SOURCE_PATH_LEN + 1),
+                "commit": "3f2a9c1"
+            }]),
+            serde_json::json!([{"path": "x", "commit": "3f2a9c"}]),
+            serde_json::json!([{"path": "x", "commit": "3f2a9cz"}]),
+            serde_json::json!([{"path": "x", "commit": "a".repeat(65)}]),
+            serde_json::json!(vec![ok.clone(); MAX_PAGE_SOURCES + 1]),
+        ] {
+            assert!(parse(bad.clone()).into_frontmatter().is_err(), "{bad}");
         }
     }
 
@@ -878,6 +1015,21 @@ mod tests {
             Tier::Procedural,
         ] {
             assert_eq!(t.as_str().parse::<Tier>().unwrap(), t);
+        }
+    }
+
+    #[test]
+    fn tier_all_lists_every_variant() {
+        // An exhaustive match: a new variant fails to compile here until it is
+        // added to `ALL`, which the web search's tier filter offers.
+        for (index, tier) in Tier::ALL.into_iter().enumerate() {
+            let expected = match tier {
+                Tier::Working => 0,
+                Tier::Episodic => 1,
+                Tier::Semantic => 2,
+                Tier::Procedural => 3,
+            };
+            assert_eq!(index, expected);
         }
     }
 

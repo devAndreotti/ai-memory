@@ -50,6 +50,7 @@ pub mod data_purge;
 pub mod delete_page;
 pub mod doctor;
 pub mod embed;
+mod eval_embedding_cache;
 pub mod export_okf;
 pub mod finalize_session;
 pub mod forget_sweep;
@@ -68,7 +69,9 @@ pub mod install_skills;
 pub mod lint;
 pub mod list_projects;
 pub mod llm_test;
+mod managed_project;
 pub mod mcp_bridge;
+pub mod merge_project;
 pub mod message;
 pub mod move_project;
 pub mod move_session;
@@ -85,6 +88,7 @@ pub mod purge_preview;
 pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;
+pub mod recent;
 pub mod reclaim_ledger_versions;
 pub mod recovery;
 pub mod reindex;
@@ -104,8 +108,11 @@ pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod service_host;
+pub mod session_usage;
 pub mod setup;
 pub mod setup_agent;
+pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
 pub mod transcript_capture;
@@ -164,6 +171,26 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
+/// Refuse an explicitly empty or whitespace-only scope or target flag.
+///
+/// A shell wrapper or harness that fills an unset variable with `""` (or
+/// whitespace) must fail closed rather than silently falling back to the
+/// scope the current directory resolves to or forwarding a blank project/
+/// workspace name to the server.
+///
+/// # Errors
+/// Returns an error naming `flag` when it was passed as an empty or
+/// whitespace-only value.
+pub(crate) fn refuse_empty_explicit(value: Option<&str>, flag: &str) -> Result<()> {
+    if value.is_some_and(|v| v.trim().is_empty()) {
+        bail!(
+            "{flag} was passed empty; provide a non-empty value, or omit an optional scope \
+             flag to use the project this directory resolves to"
+        );
+    }
+    Ok(())
+}
+
 /// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
 pub(crate) fn resolve_scope(
     config: &Config,
@@ -182,8 +209,8 @@ pub(crate) fn resolve_scope_noting_marker_project(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String, bool)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
         return Ok((workspace.to_string(), project.to_string(), false));
     }
@@ -204,8 +231,9 @@ pub(crate) fn resolve_scope_with_marker(
     marker: Option<(crate::marker::MarkerScope, String, String)>,
     announce: bool,
 ) -> Result<(String, String)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    let i18n = &config.i18n;
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
 
     let mut decided: Vec<&str> = Vec::with_capacity(2);
     let workspace = match explicit_ws {
@@ -261,9 +289,16 @@ pub(crate) fn resolve_scope_with_marker(
         // Name only the halves the marker actually decided: an explicit flag
         // that was honoured must not read as if the file overrode it.
         eprintln!(
-            "ai-memory: scope {workspace}/{project} ({} from {})",
-            decided.join(" + "),
-            scope.path.display()
+            "{}",
+            i18n.format(
+                "cli-mod-ai-memory-scope-workspace-project-from",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string()),
+                    ("value2", decided.join(" + ").to_string()),
+                    ("value3", format!("{}", scope.path.display()))
+                ]
+            )
         );
     }
     Ok((workspace, project))
@@ -290,10 +325,14 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
+    let i18n = &config.i18n;
     if !cwd.exists() {
         return Err(anyhow!(
-            "project candidate does not exist: {}",
-            cwd.display()
+            "{}",
+            i18n.format(
+                "cli-mod-project-candidate-does-not-exist",
+                &[("value0", format!("{}", cwd.display()))]
+            )
         ));
     }
     let cwd = crate::marker::absolute_normalized(cwd);
@@ -323,7 +362,15 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
                         .map(|(name, _)| name)
                     }
                 })
-                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}",
+                        i18n.format(
+                            "cli-mod-could-not-derive-project-name-from",
+                            &[("value0", format!("{}", cwd.display()))]
+                        )
+                    )
+                })?,
             None => crate::marker::discover_remote_identity(&identity)
                 .and_then(|repository| {
                     ai_memory_core::repository_identity::path_style_name(&repository)
@@ -335,7 +382,15 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
                     )
                     .map(|(name, _)| name)
                 })
-                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}",
+                        i18n.format(
+                            "cli-mod-could-not-derive-project-name-from",
+                            &[("value0", format!("{}", cwd.display()))]
+                        )
+                    )
+                })?,
         }
     };
     Ok((workspace, project))
@@ -346,15 +401,23 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
 /// workspace). Resolving the pair there would make the command fail on the
 /// cwd-derived project name it is about to throw away.
 pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> Result<String> {
-    if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
+    let i18n = &config.i18n;
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    if let Some(explicit) = explicit_ws {
         return Ok(explicit.to_string());
     }
     Ok(match marker_scope(config)? {
         Some((scope, _, _)) => match scope.workspace {
             Some(declared) => {
                 eprintln!(
-                    "ai-memory: workspace {declared} (workspace from {})",
-                    scope.path.display()
+                    "{}",
+                    i18n.format(
+                        "cli-mod-ai-memory-workspace-declared-workspace-from",
+                        &[
+                            ("value0", declared.to_string()),
+                            ("value1", format!("{}", scope.path.display()))
+                        ]
+                    )
                 );
                 declared
             }
@@ -432,6 +495,7 @@ fn scope_cwd(config: &Config) -> Option<String> {
 /// have been writing into. Dot-prefixed dirs are preserved
 /// verbatim (`~/.config` → project `.config`).
 pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> Result<String> {
+    let i18n = &config.i18n;
     if let Some(p) = explicit.filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
     }
@@ -458,17 +522,11 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
     // pass `-e AI_MEMORY_HOST_CWD=$PWD` and the binary has no idea
     // which host dir invoked it. Bail with a clear remedy instead
     // of silently writing every project to `default/work`.
-    let cwd = std::env::current_dir().context("getting CWD for project auto-detect")?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-mod-getting-cwd-for-project-auto-detect"))?;
     if cwd.as_os_str() == "/work" {
         bail!(
-            "the `ai-memory` wrapper at ~/.local/bin/ai-memory looks stale \
-             (it didn't pass AI_MEMORY_HOST_CWD into the container). Without \
-             this, every project would land in `default/work` regardless of \
-             which host dir you ran from. Reinstall the checksum-verified \
-             wrapper from the latest GitHub Release as documented in README.md,\n  \
-             (or run `ai-memory upgrade` if your existing wrapper is recent enough \
-             to know that command)"
-        );
+            "{}", i18n.text("cli-mod-the-ai-memory-wrapper-at-local-bin-ai-memory-looks-stale-it-didn-t-pass-ai-m"));
     }
 
     // Shared with the hook router via `derive_project_name`: with no valid
@@ -486,9 +544,11 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
         return Ok(name);
     }
     Err(anyhow!(
-        "could not derive project name from CWD ({}); \
-         pass --project explicitly",
-        cwd.display()
+        "{}",
+        i18n.format(
+            "cli-mod-could-not-derive-project-name-from-cwd-pass-project-explicitly",
+            &[("value0", format!("{}", cwd.display()))]
+        )
     ))
 }
 
@@ -982,5 +1042,66 @@ mod tests {
         let (workspace, _) = resolve_scope(&config, None, None).unwrap();
 
         assert_eq!(workspace, crate::config::DEFAULT_WORKSPACE);
+    }
+
+    #[test]
+    fn resolve_scope_and_workspace_refuse_empty_and_whitespace_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(
+            tmp.path(),
+            Some("workspace = \"acme\"\nproject = \"pinned\"\n"),
+        );
+
+        for empty in ["", " ", " \t\n "] {
+            let err = resolve_scope(&config, Some(empty), None).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, Some(empty), Some("explicit")).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, None, Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, Some("explicit"), Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err =
+                resolve_scope_with_marker(&config, Some(empty), None, None, false).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err =
+                resolve_scope_with_marker(&config, None, Some(empty), None, false).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err = resolve_workspace(&config, Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+        }
+
+        // Legitimate controls: omitted flags use the marker; non-empty flags override it.
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "pinned".to_string())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("ws"), Some("proj")).unwrap(),
+            ("ws".to_string(), "proj".to_string())
+        );
+        assert_eq!(resolve_workspace(&config, None).unwrap(), "acme");
+        assert_eq!(resolve_workspace(&config, Some("ws")).unwrap(), "ws");
     }
 }

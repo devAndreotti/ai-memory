@@ -26,8 +26,11 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
+use crate::commands::render_shared::{
+    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+};
 use crate::config::{Config, DEFAULT_MCP_URL};
+use crate::local_auth::HookCredential;
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
 
@@ -69,6 +72,7 @@ pub(crate) fn run_with_opencode_dialect(
     mut args: InstallMcpArgs,
     dialect: Option<ai_memory_workstream::OpenCodeDialect>,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
     args.client = match (args.client, dialect) {
         (McpClient::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V1)) => {
@@ -89,7 +93,7 @@ pub(crate) fn run_with_opencode_dialect(
         let path = resolve_config_file(&args)?;
         fs::read_to_string(path)
             .ok()
-            .map(|content| infer_owned_opencode_mcp_config(&content, args.client))
+            .map(|content| infer_owned_opencode_mcp_config(i18n, &content, args.client))
             .transpose()?
             .flatten()
     } else {
@@ -99,7 +103,7 @@ pub(crate) fn run_with_opencode_dialect(
         effective_mcp_server_url(config, &args)
     } else {
         inferred.as_ref().map_or_else(
-            || DEFAULT_MCP_URL.to_string(),
+            || effective_mcp_server_url(config, &args),
             |entry| entry.mcp_url.clone(),
         )
     };
@@ -108,6 +112,7 @@ pub(crate) fn run_with_opencode_dialect(
     // inferred literal from an old entry is ignored then too, since it would
     // re-embed a stale credential.
     let token_file = config.auth.token_file_path();
+    let token_given = args.auth_token.is_some();
     let auth_token = args
         .auth_token
         .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
@@ -121,32 +126,96 @@ pub(crate) fn run_with_opencode_dialect(
         auth_token,
         ..args
     };
-    // Muse starts stdio servers with a cleared environment (`HOME`, `PATH`
-    // and its own `MUSE_SESSION_ID`), so the bridge it launches finds this
-    // install's config and token only through an explicit `--data-dir`, as
-    // the Muse hooks do. Not from inside the Docker helper, whose data dir is
-    // a container path the host-side bridge cannot open.
-    if args.client == McpClient::Muse && config.runtime_env.host_cwd().is_none() {
-        args.bridge_data_dir = Some(config.data_dir.clone());
-    }
     if args.auth_token.is_none()
         && let Some(token_file) = token_file
     {
         route_file_token(&mut args, token_file)?;
     }
+    // The bridge loads its config and token from a data dir the way any CLI
+    // call does. Muse starts stdio servers with a cleared environment (`HOME`,
+    // `PATH` and its own `MUSE_SESSION_ID`), so its bridge finds this install
+    // only through an explicit `--data-dir`, as the Muse hooks do. Hermes
+    // keeps only a short allowlist (`PATH`, `HOME`, `XDG_*`, ...;
+    // `_build_safe_env` in `tools/mcp_tool_config.py`), which drops
+    // `AI_MEMORY_DATA_DIR` the same way. Any other
+    // bridge needs it when this install was given a data dir: the hooks name
+    // that dir, and a bridge without it would read the default one, with its
+    // own config and bearer. Not from inside the Docker helper, whose data dir
+    // is a container path the host-side bridge cannot open.
+    let runs_bridge = (args.client == McpClient::ClaudeCode && args.session_aware)
+        || args.stdio_bridge
+        || args.client == McpClient::Qoder;
+    if config.runtime_env.host_cwd().is_none()
+        && (matches!(
+            args.client,
+            McpClient::Muse | McpClient::Freebuff | McpClient::Hermes
+        ) || (runs_bridge && config.data_dir_explicit))
+    {
+        args.bridge_data_dir = Some(config.data_dir.clone());
+    }
+    // An explicit `--auth-token` for an entry that runs `mcp-bridge` goes where
+    // the hooks keep theirs, `<data_dir>/auth-token`, and the bridge reads it
+    // from there when nothing else is configured. Inline in the harness config
+    // it would sit outside the data dir's protection and outlive a rotation,
+    // the reasons #552 moved the hooks' copy. The entry then names that data
+    // dir, so the bridge reads the file the key went into. Only `--apply`
+    // stores, as with `install-hooks`: a printed snippet is the operator's to
+    // place. The key stays inline, as before, whenever the bridge would not
+    // reach it: a bearer this config is configured with would win over it, a
+    // different key already stored belongs to the hooks, the store failed, or
+    // this is the Docker helper, whose data dir the host-side bridge cannot
+    // open.
+    // FreeBuff belongs here for the same reason Muse does: its entry is always
+    // the session-less bridge (`build_json_mcp_entry` routes the client to
+    // `stdio_bridge_entry` unconditionally), and it already gets the
+    // `--data-dir` above, so the bridge reads the file the key goes into.
+    let bridge_carries_token = matches!(
+        args.client,
+        McpClient::Muse | McpClient::Freebuff | McpClient::Qoder
+    ) || (args.client == McpClient::ClaudeCode && args.session_aware);
+    let may_store_bridge_key = args.apply
+        && token_given
+        && bridge_carries_token
+        && config.auth.configured_bearer_token().is_none()
+        && config.runtime_env.host_cwd().is_none()
+        && same_mcp_endpoint(
+            &config.server_url,
+            args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        );
     validate_args(&args)?;
     if args.apply {
-        return apply_to_config_file(&args);
+        if may_store_bridge_key
+            && let Some(token) = args.auth_token.clone()
+            && let Some(stored) = store_bridge_key(i18n, &config.data_dir, &token)
+        {
+            args.auth_token = None;
+            args.bridge_data_dir = Some(config.data_dir.clone());
+            if let Err(error) = apply_to_config_file(i18n, &args) {
+                if stored == HookCredential::Seeded
+                    && crate::config::read_hook_auth_token(&config.data_dir).as_deref()
+                        == Some(token.as_str())
+                {
+                    crate::config::clear_hook_auth_token(&config.data_dir).with_context(
+                        || "rolling back the bridge credential after MCP config update failed",
+                    )?;
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
+        return apply_to_config_file(i18n, &args);
     }
     let snippet = match args.client {
         McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
-        McpClient::Codex => render_codex(&args),
+        McpClient::Codex => render_codex(&args)?,
         McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
         McpClient::OpenCode2 => render_opencode2(&args)?,
         McpClient::Cursor => render_cursor(&args)?,
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
         McpClient::GeminiCli => render_gemini_cli(&args)?,
+        McpClient::QwenCode => render_qwen_code(&args)?,
+        McpClient::Qoder => render_json_mcp_fragment(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
@@ -157,6 +226,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::IbmBob => render_ibm_bob(&args)?,
         McpClient::CopilotCli => render_copilot_cli(&args)?,
         McpClient::Droid => render_droid(&args)?,
         McpClient::Swival => render_swival(&args)?,
@@ -164,7 +234,10 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
         McpClient::Dsh => render_dsh(&args)?,
+        McpClient::Hermes => render_hermes(&args),
         McpClient::PrimeAgent => render_prime_agent(&args)?,
+        McpClient::Cline => render_json_mcp_fragment(&args)?,
+        McpClient::Freebuff => render_json_mcp_fragment(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -205,30 +278,120 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
     Ok(())
 }
 
-/// The command a stdio bridge entry runs. Resolved through `PATH` like the
-/// Claude Code entry, so the Docker wrapper (which intercepts `mcp-bridge`)
-/// and a native install both answer to it.
+/// Store `token` in `<data_dir>/auth-token` for the bridge, the file and
+/// format `install-hooks --apply` uses. Returns whether this call created the
+/// files or found the same key; `None` means the caller must keep the key in
+/// the entry.
+fn store_bridge_key(
+    i18n: &ai_memory_core::i18n::Localizer,
+    data_dir: &Path,
+    token: &str,
+) -> Option<HookCredential> {
+    // The hooks present an OIDC `auth.json` only while no key is stored, so
+    // storing one here would quietly switch them to this key.
+    if crate::config::read_hook_auth_token(data_dir).is_none()
+        && ai_memory_llm::OidcToken::load(&data_dir.join("auth.json"))
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        eprintln!(
+            "{}", i18n.text("cli-install-mcp-ai-memory-this-install-s-hooks-sign-in-with-oidc-keeping-the-auth-token-key"));
+        return None;
+    }
+    match crate::local_auth::seed_hook_credential(data_dir, token) {
+        Ok(outcome @ (HookCredential::Seeded | HookCredential::Current)) => {
+            eprintln!(
+                "{}", i18n.format("cli-install-mcp-ai-memory-stored-the-bridge-s-key-in-the-mcp-entry-carries-no-token", &[("value0", format!("{}", crate::config::hook_auth_token_path_in(data_dir).display()))]));
+            Some(outcome)
+        }
+        Ok(HookCredential::KeptOther) => {
+            eprintln!(
+                "{}", i18n.format("cli-install-mcp-ai-memory-warning-already-holds-a-different-key-for-this-install-s-hooks-kee", &[("value0", format!("{}", crate::config::hook_auth_token_path_in(data_dir).display()))]));
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "{}", i18n.format("cli-install-mcp-ai-memory-warning-could-not-store-the-key-under-e-keeping-it-in-the-mcp-entr", &[("value0", format!("{}", data_dir.display())), ("value1", format!("{:#}", e))]));
+            None
+        }
+    }
+}
+
+/// The bare command name, resolved through `PATH`. Inside a container the
+/// Docker wrapper on the host intercepts `mcp-bridge`, so the entry must name
+/// the wrapper rather than the container's own binary.
 const BRIDGE_COMMAND: &str = "ai-memory";
+
+/// The command a stdio bridge entry runs: this binary's absolute path, the
+/// same one hook commands embed, because clients often start MCP servers
+/// without the login shell's `PATH` and a bare `ai-memory` then fails to
+/// spawn. Inside a container, or when the path cannot be trusted to survive
+/// (see [`hook_embedded_exe_path`]), the bare [`BRIDGE_COMMAND`].
+fn bridge_command() -> String {
+    bridge_command_for(
+        ai_memory_wiki::backup::running_in_container(),
+        hook_embedded_exe_path(),
+    )
+}
+
+fn bridge_command_for(in_container: bool, exe: PathBuf) -> String {
+    if in_container {
+        BRIDGE_COMMAND.to_owned()
+    } else {
+        exe.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether `command` runs ai-memory: the bare name, what [`bridge_command`]
+/// writes from this binary, or an absolute path to a binary named `ai-memory`
+/// that an earlier install wrote.
+fn is_bridge_command(command: &str) -> bool {
+    if command == BRIDGE_COMMAND || command == bridge_command() {
+        return true;
+    }
+    let path = Path::new(command);
+    path.is_absolute() && path.file_stem().and_then(|stem| stem.to_str()) == Some(BRIDGE_COMMAND)
+}
 
 /// Arguments of the session-less bridge for `args`: the URL carries the
 /// client's schema-flavor marker, because the bridge forwards `tools/list`
 /// to it verbatim and the client is the one that needs the dialect.
 fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
-    vec![
+    let mut argv = vec![
         "mcp-bridge".to_owned(),
         "--no-session-id".to_owned(),
         "--server-url".to_owned(),
         flavored_url_for(args, base_url),
-    ]
+    ];
+    argv.extend(bridge_data_dir_args(args));
+    argv
 }
 
-/// The upstream URL of an ai-memory bridge entry: `command: "ai-memory"` with
+/// `--data-dir <dir>` for a bridge entry when [`InstallMcpArgs::bridge_data_dir`]
+/// is set, else nothing.
+fn bridge_data_dir_args(args: &InstallMcpArgs) -> Vec<String> {
+    args.bridge_data_dir
+        .as_ref()
+        .map_or_else(Vec::new, |data_dir| {
+            vec![
+                "--data-dir".to_owned(),
+                data_dir.to_string_lossy().into_owned(),
+            ]
+        })
+}
+
+/// The upstream URL of an ai-memory bridge entry: an ai-memory `command` with
 /// `args`, or OpenCode's single `command` array, running `mcp-bridge` with a
 /// `--server-url`. `None` for any other entry.
 pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
+    let entry = entry
+        .get("transport")
+        .filter(|transport| transport.is_object())
+        .unwrap_or(entry);
     let argv: Vec<&str> = match entry.get("command")? {
-        serde_json::Value::String(command) if command == BRIDGE_COMMAND => entry
+        serde_json::Value::String(command) if is_bridge_command(command) => entry
             .get("args")?
             .as_array()?
             .iter()
@@ -236,7 +399,7 @@ pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
             .collect(),
         serde_json::Value::Array(command) => {
             let mut words = command.iter().filter_map(serde_json::Value::as_str);
-            if words.next() != Some(BRIDGE_COMMAND) {
+            if !words.next().is_some_and(is_bridge_command) {
                 return None;
             }
             words.collect()
@@ -318,6 +481,11 @@ pub(crate) fn existing_entry_endpoint(
     if let Some(url) = ["url", "httpUrl", "serverUrl"]
         .iter()
         .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            entry
+                .pointer("/transport/url")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| bridge_entry_url(entry))
     {
         return Ok(Some(url.to_owned()));
@@ -339,10 +507,10 @@ pub(crate) fn existing_entry_endpoint(
 /// take no stdio entry here.
 fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
     let bridge = session_less_bridge_args(args);
-    let plain = || json!({"command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let typed =
-        |kind: &str| json!({"type": kind, "command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let mut opencode_argv = vec![BRIDGE_COMMAND.to_owned()];
+    let command = bridge_command();
+    let plain = || json!({"command": command, "args": bridge.clone()});
+    let typed = |kind: &str| json!({"type": kind, "command": command, "args": bridge.clone()});
+    let mut opencode_argv = vec![command.clone()];
     opencode_argv.extend(bridge.iter().cloned());
     Some(match args.client {
         McpClient::ClaudeDesktop
@@ -350,31 +518,51 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::Devin
         | McpClient::KimiCode
         | McpClient::KiroCli
-        | McpClient::Openclaw => plain(),
-        McpClient::GeminiCli | McpClient::AntigravityCli => json!({
-            "command": BRIDGE_COMMAND,
+        | McpClient::Openclaw
+        | McpClient::IbmBob
+        | McpClient::Cline => plain(),
+        McpClient::Qoder => {
+            let env = args
+                .auth_token
+                .as_ref()
+                .map_or_else(|| json!({}), |token| json!({"AI_MEMORY_AUTH_TOKEN": token}));
+            json!({"command": command, "args": bridge, "env": env})
+        }
+        McpClient::GeminiCli | McpClient::AntigravityCli | McpClient::QwenCode => json!({
+            "command": command,
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
         McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
             typed("stdio")
         }
+        McpClient::Freebuff => {
+            let env = args
+                .auth_token
+                .as_ref()
+                .map_or_else(|| json!({}), |token| json!({"AI_MEMORY_AUTH_TOKEN": token}));
+            json!({
+                "command": BRIDGE_COMMAND,
+                "args": bridge,
+                "env": env,
+            })
+        }
         McpClient::Omp => json!({
             "type": "stdio",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "enabled": true,
         }),
         McpClient::CopilotCli => json!({
             "type": "local",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "tools": ["*"],
         }),
         McpClient::CommandCode => json!({
             "transport": "stdio",
             "enabled": true,
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
         }),
         McpClient::OpenCode => json!({"type": "local", "command": opencode_argv, "enabled": true}),
@@ -393,7 +581,10 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
         // so callers who already pass the endpoint are unchanged.
         return mcp_server_url_from_base(url);
     }
-    if config.server_url_configured() {
+    // A URL derived from `bind` counts here too: with nothing configured and no
+    // existing entry to infer from, the client should reach the server this
+    // config starts (#1269).
+    if config.server_url_configured() || config.server_url_derived_from_bind {
         return mcp_server_url_from_base(&config.server_url);
     }
     DEFAULT_MCP_URL.to_string()
@@ -416,6 +607,16 @@ pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
         Some(query) => format!("{path}?{query}"),
         None => path,
     }
+}
+
+fn same_mcp_endpoint(left: &str, right: &str) -> bool {
+    fn normalized(url: &str) -> String {
+        mcp_server_url_from_base(url).split_once('?').map_or_else(
+            || mcp_server_url_from_base(url),
+            |(base, _)| base.to_owned(),
+        )
+    }
+    normalized(left) == normalized(right)
 }
 
 fn validate_args(args: &InstallMcpArgs) -> Result<()> {
@@ -506,7 +707,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
 /// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`,
-/// `PRIME_AGENT_CODING_AGENT_DIR`, and OMP's
+/// `PRIME_AGENT_CODING_AGENT_DIR`, `CLINE_MCP_SETTINGS_PATH`, and OMP's
 /// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
 /// through `env`,
 /// so `ai-memory run --env` can point auto-wire at the same config home
@@ -516,7 +717,13 @@ pub(crate) fn mcp_config_path_with(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathBuf> {
     use crate::cli::McpClient;
-    let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
+    let home = || {
+        env("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .context("could not locate $HOME for config-file auto-detect")
+    };
     Ok(match client {
         McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
         McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
@@ -573,6 +780,8 @@ pub(crate) fn mcp_config_path_with(
             }
         }
         McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
+        McpClient::QwenCode => home()?.join(".qwen").join("settings.json"),
+        McpClient::Qoder => home()?.join(".qoder").join("settings.json"),
         McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
@@ -580,6 +789,7 @@ pub(crate) fn mcp_config_path_with(
         McpClient::Dsh => bail!(
             "DeepSeek Harness has no fixed MCP config file; merge the printed snippet into $DSH_HOME/profiles/<profile>/cordis.patch.yml."
         ),
+        McpClient::Hermes => bail!(HERMES_MCP_APPLY_GUIDANCE),
         // OMP reads mcp.json from its agent dir, the one its extensions live
         // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
         McpClient::Omp => {
@@ -606,6 +816,7 @@ pub(crate) fn mcp_config_path_with(
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        McpClient::IbmBob => home()?.join(".bob").join("settings").join("mcp.json"),
         // Copilot CLI keeps its whole config dir at $COPILOT_HOME when set,
         // falling back to ~/.copilot; user-level MCP servers live in
         // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
@@ -646,6 +857,11 @@ pub(crate) fn mcp_config_path_with(
         McpClient::PrimeAgent => {
             prime_agent_dir_in(env("PRIME_AGENT_CODING_AGENT_DIR"))?.join("settings.json")
         }
+        McpClient::Cline => env("CLINE_MCP_SETTINGS_PATH")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(home()?.join(".cline/data/settings/cline_mcp_settings.json")),
+        McpClient::Freebuff => home()?.join(".agents").join("mcp.json"),
     })
 }
 
@@ -945,14 +1161,34 @@ pub(crate) fn existing_entry_is_session_aware(
     is_stdio && runs_bridge
 }
 
+/// True when Claude Code or Muse still holds an ai-memory bridge entry under
+/// `name` in its default config file. `install-mcp --apply --auth-token`
+/// writes those two without the key, which the bridge then reads from
+/// `<data_dir>/auth-token`, so an uninstall that keeps such an entry must keep
+/// that file. Unreadable files answer `false`, as for the session-aware check.
+pub(crate) fn bridge_entry_remains(name: &str) -> bool {
+    existing_entry_is_session_aware(McpClient::ClaudeCode, None, name)
+        || mcp_config_path(McpClient::Muse)
+            .ok()
+            .and_then(|path| existing_entry_endpoint(McpClient::Muse, &path, name).ok())
+            .flatten()
+            .is_some()
+}
+
 /// Mutate the resolved client config file in place. Idempotent —
 /// re-runs that produce the same content are reported as no-op.
-fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
+fn apply_to_config_file(
+    i18n: &ai_memory_core::i18n::Localizer,
+    args: &InstallMcpArgs,
+) -> Result<()> {
     if matches!(args.client, McpClient::Pi) {
         bail!(pi_mcp_apply_guidance(args));
     }
     if matches!(args.client, McpClient::Dsh) {
         bail!(dsh_mcp_apply_guidance(args));
+    }
+    if matches!(args.client, McpClient::Hermes) {
+        bail!(HERMES_MCP_APPLY_GUIDANCE);
     }
     let path = resolve_config_file(args)?;
     let outcome = match args.client {
@@ -964,7 +1200,7 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         })?,
         McpClient::Zed => apply_atomic(&path, |existing| zed_upsert_mcp_server(existing, args))?,
         _ => apply_atomic(&path, |existing| {
-            mutate_json(existing, |root| upsert_json_mcp_entry(root, args))
+            mutate_json(existing, |root| upsert_json_mcp_entry(i18n, root, args))
         })?,
     };
     println!(
@@ -981,19 +1217,15 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         && (args.auth_token.is_some() || args.token_env_var)
     {
         println!(
-            "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
-        );
+            "{}", i18n.format("cli-install-mcp-prime-agent-reads-the-token-from-prime-agent-token-env-export-it-where-you-l", &[("value0", PRIME_AGENT_TOKEN_ENV.to_string())]));
     }
     if matches!(args.client, McpClient::Droid) && (args.auth_token.is_some() || args.token_env_var)
     {
-        println!(
-            "  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect."
-        );
+        println!("{}", i18n.diagnostic(&format!("  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect.")));
     }
     if matches!(args.client, McpClient::Codex) && args.token_env_var {
         println!(
-            "  Codex reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex."
-        );
+            "{}", i18n.format("cli-install-mcp-codex-reads-the-token-from-prime-agent-token-env-export-it-where-you-launch", &[("value0", PRIME_AGENT_TOKEN_ENV.to_string())]));
     }
     Ok(())
 }
@@ -1042,16 +1274,20 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
         | McpClient::GeminiCli
+        | McpClient::QwenCode
+        | McpClient::Qoder
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::IbmBob
         | McpClient::CopilotCli
         | McpClient::Droid
         | McpClient::Swival
         | McpClient::PrimeAgent => Some(JsonMcpLocation::RootMcpServers),
+        McpClient::Cline | McpClient::Freebuff => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
         // Zero, and ZCode use.
@@ -1064,13 +1300,20 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Muse => Some(JsonMcpLocation::MuseServers),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh | McpClient::Hermes => {
+            None
+        }
     }
 }
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     validate_args(args)?;
-    if args.stdio_bridge
+    // FreeBuff supports local stdio MCP servers, not remote HTTP entries.
+    // Always bridge to the configured ai-memory HTTP server; starting another
+    // `serve` process would contend for the data-dir lock. Keep this at the
+    // typed builder boundary so auth-enable and other internal callers cannot
+    // accidentally request an unsupported direct entry.
+    if (args.stdio_bridge || matches!(args.client, McpClient::Freebuff | McpClient::Qoder))
         && let Some(entry) = stdio_bridge_entry(args)
     {
         return Ok(entry);
@@ -1082,17 +1325,22 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
         McpClient::Muse => build_mcp_entry_muse(args),
+        McpClient::Cline => build_mcp_entry_cline(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
         }
         McpClient::Dsh => {
             bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
         }
+        McpClient::Hermes => {
+            bail!("internal: Hermes Agent MCP config is ~/.hermes/config.yaml, not JSON")
+        }
         _ => build_mcp_entry(args),
     }
 }
 
 fn migrate_opencode_mcp_entry(
+    i18n: &ai_memory_core::i18n::Localizer,
     root: &mut serde_json::Map<String, serde_json::Value>,
     args: &InstallMcpArgs,
 ) -> Result<()> {
@@ -1101,9 +1349,7 @@ fn migrate_opencode_mcp_entry(
             .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
     {
         bail!(
-            "refusing to replace user-owned OpenCode MCP entry '{}' in the selected major-version location",
-            args.name
-        );
+            "{}", i18n.format("cli-install-mcp-refusing-to-replace-user-owned-opencode-mcp-entry-in-the-selected-major-vers", &[("value0", args.name.to_string())]));
     }
     let alternate = match args.client {
         McpClient::OpenCode => root
@@ -1134,21 +1380,17 @@ fn migrate_opencode_mcp_entry(
         .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
     {
         bail!(
-            "refusing to replace a user-owned OpenCode MCP entry '{}' in the selected major-version location while migrating the generated alternate entry",
-            args.name
-        );
+            "{}", i18n.format("cli-install-mcp-refusing-to-replace-a-user-owned-opencode-mcp-entry-in-the-selected-major-ve", &[("value0", args.name.to_string())]));
     }
     if !opencode_mcp_entry_is_owned(&alternate, args) {
         eprintln!(
-            "[ai-memory] warning: preserving ambiguous OpenCode MCP entry '{}' in the alternate major-version location",
-            args.name
-        );
+            "{}", i18n.format("cli-install-mcp-ai-memory-warning-preserving-ambiguous-opencode-mcp-entry-in-the-alternate-m", &[("value0", args.name.to_string())]));
         return Ok(());
     }
     let mcp = root
         .get_mut("mcp")
         .and_then(serde_json::Value::as_object_mut)
-        .context("`mcp` is present but not an object")?;
+        .context(i18n.text("cli-install-mcp-mcp-is-present-but-not-an-object"))?;
     match args.client {
         McpClient::OpenCode => {
             if let Some(servers) = mcp
@@ -1176,6 +1418,7 @@ pub(crate) struct InferredOpenCodeMcpConfig {
 }
 
 pub(crate) fn infer_owned_opencode_mcp_config(
+    i18n: &ai_memory_core::i18n::Localizer,
     content: &str,
     selected: McpClient,
 ) -> Result<Option<InferredOpenCodeMcpConfig>> {
@@ -1199,13 +1442,11 @@ pub(crate) fn infer_owned_opencode_mcp_config(
     };
     if selected_is_user_owned && alternate_is_generated {
         bail!(
-            "a user-owned OpenCode MCP entry occupies the selected major-version location while a generated entry remains in the alternate location; preserved both, pass explicit --server-url and --auth-token after resolving the conflict"
-        );
+            "{}", i18n.text("cli-install-mcp-a-user-owned-opencode-mcp-entry-occupies-the-selected-major-version-location"));
     }
     match (v1, v2) {
         (Some(v1), Some(v2)) if v1 != v2 => bail!(
-            "conflicting generated OpenCode MCP entries exist in the V1 and V2 locations; pass explicit --server-url and --auth-token before installing"
-        ),
+            "{}", i18n.text("cli-install-mcp-conflicting-generated-opencode-mcp-entries-exist-in-the-v1-and-v2-locations")),
         (Some(v1), Some(_)) | (Some(v1), None) => Ok(Some(v1)),
         (None, Some(v2)) => Ok(Some(v2)),
         (None, None) => {
@@ -1216,8 +1457,7 @@ pub(crate) fn infer_owned_opencode_mcp_config(
             };
             if selected_entry.is_some() {
                 eprintln!(
-                    "[ai-memory] warning: preserving user-owned OpenCode MCP entry in the selected major-version location; pass explicit --server-url and --auth-token rather than inferring from it"
-                );
+                    "{}", i18n.text("cli-install-mcp-ai-memory-warning-preserving-user-owned-opencode-mcp-entry-in-the-selected-m"));
             }
             Ok(None)
         }
@@ -1339,6 +1579,11 @@ fn entry_endpoint(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("url")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            entry
+                .pointer("/transport/url")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| bridge_entry_url(entry))
 }
 
@@ -1356,18 +1601,21 @@ fn opencode_mcp_entry_is_owned(entry: &serde_json::Value, args: &InstallMcpArgs)
 }
 
 fn upsert_json_mcp_entry(
+    i18n: &ai_memory_core::i18n::Localizer,
     root: &mut serde_json::Map<String, serde_json::Value>,
     args: &InstallMcpArgs,
 ) -> Result<()> {
     let entry = build_json_mcp_entry(args)?;
-    migrate_opencode_mcp_entry(root, args)?;
-    match json_mcp_location(args.client).context("internal: unsupported JSON MCP client")? {
+    migrate_opencode_mcp_entry(i18n, root, args)?;
+    match json_mcp_location(args.client)
+        .context(i18n.text("cli-install-mcp-internal-unsupported-json-mcp-client"))?
+    {
         JsonMcpLocation::RootMcpServers => {
             let servers = root
                 .entry("mcpServers")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`mcpServers` is present but not an object")?;
+                .context(i18n.text("cli-install-mcp-mcpservers-is-present-but-not-an-object"))?;
             servers.insert(args.name.clone(), entry);
         }
         JsonMcpLocation::RootMcp => {
@@ -1375,7 +1623,7 @@ fn upsert_json_mcp_entry(
                 .entry("mcp")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`mcp` is present but not an object")?;
+                .context(i18n.text("cli-install-mcp-mcp-is-present-but-not-an-object"))?;
             mcp.insert(args.name.clone(), entry);
         }
         JsonMcpLocation::NestedMcpServers => {
@@ -1383,12 +1631,12 @@ fn upsert_json_mcp_entry(
                 .entry("mcp")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`mcp` is present but not an object")?;
+                .context(i18n.text("cli-install-mcp-mcp-is-present-but-not-an-object"))?;
             let servers = mcp
                 .entry("servers")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`mcp.servers` is present but not an object")?;
+                .context(i18n.text("cli-install-mcp-mcp-servers-is-present-but-not-an-object"))?;
             servers.insert(args.name.clone(), entry);
         }
         JsonMcpLocation::RootServers => {
@@ -1396,7 +1644,7 @@ fn upsert_json_mcp_entry(
                 .entry("servers")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`servers` is present but not an object")?;
+                .context(i18n.text("cli-install-mcp-servers-is-present-but-not-an-object"))?;
             servers.insert(args.name.clone(), entry);
         }
         JsonMcpLocation::RootContextServers => {
@@ -1404,7 +1652,9 @@ fn upsert_json_mcp_entry(
                 .entry("context_servers")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`context_servers` is present but not an object")?;
+                .context(
+                    i18n.text("cli-install-mcp-context-servers-is-present-but-not-an-object"),
+                )?;
             servers.insert(args.name.clone(), entry);
         }
         JsonMcpLocation::MuseServers => {
@@ -1534,11 +1784,14 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::ClaudeCode => {
             if args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
-                entry.insert("command".into(), json!("ai-memory"));
-                entry.insert(
-                    "args".into(),
-                    json!(["mcp-bridge", "--server-url", base_url]),
-                );
+                entry.insert("command".into(), json!(bridge_command()));
+                let mut argv = vec![
+                    "mcp-bridge".to_owned(),
+                    "--server-url".to_owned(),
+                    base_url.to_owned(),
+                ];
+                argv.extend(bridge_data_dir_args(args));
+                entry.insert("args".into(), json!(argv));
                 if let Some(token) = &args.auth_token {
                     entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
                 }
@@ -1568,7 +1821,10 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
         }
-        McpClient::GeminiCli => {
+        McpClient::GeminiCli | McpClient::QwenCode => {
+            // Qwen Code uses the same `httpUrl` field as Gemini CLI for
+            // streamable HTTP; the plain `url` key is legacy SSE
+            // (<https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/>).
             entry.insert("httpUrl".into(), json!(server_url));
             entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
             if let Some(b) = &bearer {
@@ -1616,6 +1872,17 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("transport".into(), json!("http"));
             entry.insert("enabled".into(), json!(true));
             entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::IbmBob => {
+            // Bob's HTTP client sends a non-standard `server/discover` probe
+            // in automatic mode. ai-memory implements the MCP initialize
+            // handshake, so pin Bob to its documented legacy negotiation path.
+            entry.insert("type".into(), json!("streamable-http"));
+            entry.insert("url".into(), json!(server_url));
+            entry.insert("protocolNegotiation".into(), json!("legacy"));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1684,6 +1951,9 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("bearerTokenEnvVar".into(), json!(PRIME_AGENT_TOKEN_ENV));
             }
         }
+        McpClient::Cline | McpClient::Freebuff => {
+            bail!("internal: client has a dedicated MCP entry builder")
+        }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
     Ok(serde_json::Value::Object(entry))
@@ -1691,7 +1961,11 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 
 fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    // `--flavor` is a `tools/list` concern, so it rides on the URL OpenCode
+    // fetches schemas from — the same place `build_mcp_entry` puts it. The
+    // flag's own documentation names an OpenCode install routed to Vertex.
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -1702,15 +1976,32 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     Ok(serde_json::Value::Object(entry))
 }
 
-/// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
+/// Cline's MCP entry uses top-level transport fields. Keeping the explicit
+/// `streamableHttp` discriminator is load-bearing: a bare `url` is parsed as
+/// legacy SSE and sends GET requests to ai-memory's POST-only MCP endpoint.
+fn build_mcp_entry_cline(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("streamableHttp"));
+    entry.insert("url".into(), json!(flavored_url_for(args, base_url)));
+    if let Some(bearer) = bearer_header_value(args.auth_token.as_deref()) {
+        entry.insert("headers".into(), json!({"Authorization": bearer}));
+    }
+    entry.insert("disabled".into(), json!(false));
+    entry.insert("autoApprove".into(), json!([]));
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// OpenCode V2 MCP entry: `type: "remote"` + `url` + optional
 /// `headers` under `mcp.servers`. V2 has no `enabled` field (servers
 /// connect unless `disabled: true`), and header-credentialed servers
-/// must set `oauth: false` so the beta does not attempt OAuth discovery
+/// must set `oauth: false` so V2 does not attempt OAuth discovery
 /// against ai-memory's local endpoint
 /// (https://opencode.ai/v2/docs/mcp-servers).
 fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -1778,7 +2069,8 @@ fn build_mcp_entry_zcode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 /// the install's data dir (`--data-dir`, when [`InstallMcpArgs::bridge_data_dir`]
 /// is set) and the bridge reads its bearer from that install's config
 /// (`[auth].bearer_token_file`) at launch; a token given explicitly is
-/// passed in `env` the way Claude Code's session-aware entry carries it. `mode` is written
+/// passed in `env` the way Claude Code's session-aware entry carries it,
+/// unless `--apply` stored it in that data dir for the bridge. `mode` is written
 /// explicitly because Muse defaults it to `required`, which aborts the whole
 /// run when the server cannot start; ai-memory augments a session and must
 /// never gate it.
@@ -1786,7 +2078,7 @@ fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("stdio"));
-    entry.insert("command".into(), json!(BRIDGE_COMMAND));
+    entry.insert("command".into(), json!(bridge_command()));
     let mut argv = vec![
         json!("mcp-bridge"),
         json!("--agent"),
@@ -1794,10 +2086,7 @@ fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         json!("--server-url"),
         json!(base_url),
     ];
-    if let Some(data_dir) = &args.bridge_data_dir {
-        argv.push(json!("--data-dir"));
-        argv.push(json!(data_dir.to_string_lossy()));
-    }
+    argv.extend(bridge_data_dir_args(args).into_iter().map(|arg| json!(arg)));
     entry.insert("args".into(), serde_json::Value::Array(argv));
     if let Some(token) = &args.auth_token {
         entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
@@ -1888,20 +2177,27 @@ fn codex_upsert_mcp_server(
     //   - v3 (this): `[mcp_servers.X.http_headers]` with
     //     `Authorization = "Bearer ..."`. Codex schema-validates
     //     and uses it as a static auth header.
+    // Read before the server table is replaced: per-tool approval
+    // overrides the user already chose survive a re-install.
+    let tools = codex_tool_approvals(
+        doc.get("mcp_servers")
+            .and_then(|servers| servers.get(&args.name))
+            .and_then(|server| server.get("tools")),
+    );
     let mut server = Table::new();
     server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     // Auto-approve ai-memory's tool calls. Without this, Codex
     // prompts on EVERY tool invocation ("approve memory_query?"
     // "approve memory_briefing?" …) which makes the MCP unusable
-    // for an auto-capture workflow. The valid TOML values per
-    // Codex's `AppToolApproval` enum are "auto" / "prompt" /
-    // "approve" — `approve` means "no prompt, just run it". ai-
-    // memory's surface is dominantly read-only (query, recent,
-    // status, briefing, explore); the few writes (consolidate,
-    // forget_sweep) are tagged `destructiveHint: true` upstream
-    // so any agent that wants to gate THOSE specifically can
-    // override per-tool — see Codex's `[mcp_servers.X.tools]`
-    // map.
+    // for an auto-capture workflow. The valid values per Codex's
+    // config reference are "auto" / "prompt" / "writes" /
+    // "approve" — `approve` means "no prompt, just run it". The
+    // tools annotated destructive get a per-tool
+    // `[mcp_servers.X.tools.<tool>] approval_mode = "prompt"`
+    // override below (`codex_tool_approvals`).
+    // https://developers.openai.com/codex/config-reference
+    // (`mcp_servers.<id>.default_tools_approval_mode`,
+    // `mcp_servers.<id>.tools.<tool>.approval_mode`).
     server["default_tools_approval_mode"] = value("approve");
     if args.token_env_var {
         server["bearer_token_env_var"] = value(PRIME_AGENT_TOKEN_ENV);
@@ -1910,9 +2206,47 @@ fn codex_upsert_mcp_server(
         headers["Authorization"] = value(b);
         server["http_headers"] = Item::Table(headers);
     }
+    server.insert("tools", Item::Table(tools));
 
     upsert_toml_mcp_server(doc, &args.name, server);
     Ok(())
+}
+
+/// Codex `[mcp_servers.<name>.tools]`: the user's existing per-tool entries,
+/// copied as plain keys, plus `approval_mode = "prompt"` for every tool
+/// annotated destructive that has no approval mode yet. The server-wide
+/// default stays `approve`, so the read tools never prompt, while every tool
+/// annotated destructive asks first.
+fn codex_tool_approvals(existing: Option<&toml_edit::Item>) -> toml_edit::Table {
+    use toml_edit::{Item, Table, value};
+
+    let mut tools = Table::new();
+    tools.set_implicit(true);
+    if let Some(existing) = existing.and_then(Item::as_table_like) {
+        for (tool, entry) in existing.iter() {
+            let Some(entry) = entry.as_table_like() else {
+                continue;
+            };
+            let mut copy = Table::new();
+            for (key, item) in entry.iter() {
+                if let Some(value) = item.as_value() {
+                    copy.insert(key, Item::Value(value.clone()));
+                }
+            }
+            tools.insert(tool, Item::Table(copy));
+        }
+    }
+    for tool in ai_memory_mcp::AiMemoryServer::destructive_tool_names() {
+        if !tools.contains_key(&tool) {
+            tools.insert(&tool, Item::Table(Table::new()));
+        }
+        if let Some(entry) = tools.get_mut(&tool).and_then(Item::as_table_mut)
+            && !entry.contains_key("approval_mode")
+        {
+            entry.insert("approval_mode", value("prompt"));
+        }
+    }
+    tools
 }
 
 /// Insert / replace `[mcp_servers.<name>]` in a Grok `config.toml`.
@@ -1934,7 +2268,7 @@ fn grok_upsert_mcp_server(
     let mut server = Table::new();
     if args.stdio_bridge {
         // Grok picks stdio from `command` (and HTTP from `url`).
-        server["command"] = value(BRIDGE_COMMAND);
+        server["command"] = value(bridge_command());
         server["args"] = value(
             session_less_bridge_args(args)
                 .iter()
@@ -1994,10 +2328,18 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .as_deref()
             .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
             .unwrap_or_default();
+        let data_dir = args
+            .bridge_data_dir
+            .as_ref()
+            .map_or_else(String::new, |path| {
+                format!(" --data-dir {}", shell_quote(&path.to_string_lossy()))
+            });
         format!(
-            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}{data_dir}",
             name = args.name,
+            command = shell_quote(&bridge_command()),
             url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+            data_dir = data_dir,
         )
     } else if let Some(b) = &bearer {
         format!(
@@ -2026,9 +2368,20 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
     ))
 }
 
-fn render_codex(args: &InstallMcpArgs) -> String {
-    // Codex uses TOML, not JSON. Hand-render the snippet so the
-    // table headers stay deterministic.
+fn render_codex(args: &InstallMcpArgs) -> Result<String> {
+    // Codex uses TOML, not JSON. Build the printed table with the very
+    // writer `--apply` uses (`codex_upsert_mcp_server`) so the snippet and
+    // the file can never disagree. Hand-interpolating `[mcp_servers.{name}]`
+    // made them disagree for any name TOML has to quote: `--name ai.memory`
+    // printed a header that reads as `mcp_servers` -> `ai` -> `memory`, and
+    // `--name "my memory"` printed an unparseable header that breaks the
+    // whole `config.toml` it is pasted into -- while `--apply` wrote
+    // `[mcp_servers."ai.memory"]` correctly all along. `render_grok` was
+    // moved onto its writer for exactly this reason; Codex is the other
+    // TOML client and was missed.
+    //
+    // The explanatory comments ride along as `toml_edit` decor, so the
+    // snippet for an ordinary name is byte-for-byte what it always was.
     //
     // Schema: Codex's MCP `streamable_http` transport accepts
     //   - `bearer_token_env_var = "NAME"` (env-var indirection)
@@ -2037,35 +2390,44 @@ fn render_codex(args: &InstallMcpArgs) -> String {
     // — NOT a literal `bearer_token = "..."` (that's stdio-only)
     // and NOT a `[mcp_servers.<name>.headers]` sub-table (the key
     // is `http_headers`, with the `http_` prefix).
-    let mut out = format!(
-        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
-         #\n\
-         [mcp_servers.{name}]\n\
-         url = \"{url}\"\n\
-         # Skip per-call approval prompts on ai-memory's tools.\n\
-         # ai-memory is read-mostly + writes are auto-capture; the\n\
-         # approval friction makes it unusable otherwise.\n\
-         default_tools_approval_mode = \"approve\"\n",
-        name = args.name,
-        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+    let mut doc = toml_edit::DocumentMut::new();
+    codex_upsert_mcp_server(&mut doc, args)?;
+    let server = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|servers| servers.get_mut(&args.name))
+        .and_then(toml_edit::Item::as_table_mut)
+        .context("internal: generated Codex TOML table missing")?;
+    if let Some(mut key) = server.key_mut("default_tools_approval_mode") {
+        key.leaf_decor_mut().set_prefix(
+            "# Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n",
+        );
+    }
+    if let Some(headers) = server
+        .get_mut("http_headers")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        headers.decor_mut().set_prefix("\n");
+    }
+    let mut out = String::from(
+        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n#\n",
     );
+    out.push_str(&doc.to_string());
+    // Trailing prose: `toml_edit` 0.22 has no document-trailer setter, and a
+    // comment after the last key carries no TOML structure either way.
     if args.token_env_var {
         out.push_str(&format!(
-            "bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
-             # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+            "# The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
         ));
-    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        out.push_str(&format!(
-            "\n[mcp_servers.{name}.http_headers]\n\
-             Authorization = \"{b}\"\n\
-             # Alternative (avoids embedding the literal token):\n\
+    } else if bearer_header_value(args.auth_token.as_deref()).is_some() {
+        out.push_str(
+            "# Alternative (avoids embedding the literal token):\n\
              # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
              # — and export AI_MEMORY_AUTH_TOKEN in your shell init.\n",
-            name = args.name,
-            b = b,
-        ));
+        );
     }
-    out
+    Ok(out)
 }
 
 fn render_grok(args: &InstallMcpArgs) -> Result<String> {
@@ -2112,7 +2474,7 @@ fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
+        "# OpenCode V2 (`opencode2` compatibility alias) — merge into\n\
          # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
          #\n\
          # V2 nests servers under `mcp.servers` (V1 used direct `mcp`)\n\
@@ -2171,6 +2533,19 @@ fn render_gemini_cli(args: &InstallMcpArgs) -> Result<String> {
          #\n\
          # Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP\n\
          # endpoints. The `timeout` is in milliseconds.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_qwen_code(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Qwen Code — merge into ~/.qwen/settings.json:\n\
+         #\n\
+         # Qwen Code uses `httpUrl` (not `url`) for streamable-HTTP\n\
+         # endpoints; `url` is the legacy SSE transport. The `timeout` is\n\
+         # in milliseconds. Pair with `ai-memory install-hooks --agent\n\
+         # qwen-code --apply` for lifecycle capture.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -2307,7 +2682,7 @@ fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
         out.push_str("        transport: stdio\n");
         out.push_str(&format!(
             "        command: {}\n",
-            yaml_single_quote(BRIDGE_COMMAND)
+            yaml_single_quote(&bridge_command())
         ));
         out.push_str("        args:\n");
         for arg in session_less_bridge_args(args) {
@@ -2342,6 +2717,61 @@ fn dsh_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
     )
 }
 
+/// Hermes Agent reads MCP servers from the `mcp_servers:` map of
+/// `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`), keyed by server name
+/// with `command`/`args` for a stdio server
+/// (<https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp>,
+/// v0.22.2). Print the entry to merge by hand; --apply is refused.
+///
+/// The entry is always the session-less stdio bridge. Hermes passes an MCP
+/// server a filtered environment with no session id in it, so the client is
+/// static, and a bridge keeps the bearer out of the file: it authenticates
+/// with this install's own token.
+fn render_hermes(args: &InstallMcpArgs) -> String {
+    let token_note = if args.auth_token.is_some() {
+        "#\n\
+         # The token is not written here. The bridge sends this install's\n\
+         # [auth].bearer_token or [auth].bearer_token_file; Hermes does not\n\
+         # pass AI_MEMORY_AUTH_TOKEN from its own environment to MCP servers.\n"
+    } else {
+        ""
+    };
+    format!(
+        "# Hermes Agent - merge the entry below into the `mcp_servers:` map of\n\
+         # ~/.hermes/config.yaml ($HERMES_HOME/config.yaml), then restart\n\
+         # Hermes; a running gateway reloads MCP servers within about a minute.\n\
+         #\n\
+         # Hermes does not read an MCP server's instructions, so the routing\n\
+         # rules reach the model through the ai-memory skills\n\
+         # (`ai-memory install-skills --scope global --agent hermes`, into\n\
+         # ~/.hermes/skills) and the handoff `install-hooks --agent hermes`\n\
+         # brings into the next primary-session turn.\n\
+         {token_note}\
+         {snippet}\n",
+        snippet = render_hermes_snippet(args),
+    )
+}
+
+fn render_hermes_snippet(args: &InstallMcpArgs) -> String {
+    // Single-quote every scalar, as for DSH: a plain `--name 123` would key
+    // the map with an integer, and a path with ` #` would be cut at the
+    // comment.
+    let mut out = String::from("mcp_servers:\n");
+    out.push_str(&format!("  {}:\n", yaml_single_quote(&args.name)));
+    out.push_str(&format!(
+        "    command: {}\n",
+        yaml_single_quote(&bridge_command())
+    ));
+    out.push_str("    args:");
+    for arg in session_less_bridge_args(args) {
+        out.push_str(&format!("\n      - {}", yaml_single_quote(&arg)));
+    }
+    out
+}
+
+/// Why `install-mcp --client hermes --apply` writes nothing, and what to do.
+const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in ~/.hermes/config.yaml, a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into ~/.hermes/config.yaml ($HERMES_HOME/config.yaml).";
+
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
 }
@@ -2352,7 +2782,9 @@ fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
          # Install ai-memory's generated Pi extension instead; it includes\n\
          # lifecycle capture and an HTTP MCP bridge that registers tools in Pi.\n\
          ai-memory install-hooks --agent pi --apply --server-url {}{}\n\
-         # Restart Pi after installing ~/.pi/agent/extensions/ai-memory.ts.\n",
+         # The extension is installed at ~/.pi/agent/extensions/ai-memory-pi.ts by default.\n\
+         # If PI_CODING_AGENT_DIR is set, it is at $PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts instead.\n\
+         # Restart Pi after installing the extension.\n",
         hook_server_url_from_mcp_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL)),
         if args.auth_token.is_some() {
             " --auth-token <token>"
@@ -2455,6 +2887,20 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
          {snippet}\n",
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_ibm_bob(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# IBM Bob IDE — merge into ~/.bob/settings/mcp.json, or re-run with\n\
+         # --apply to merge it in place preserving other servers. Bob also\n\
+         # supports project-level .bob/mcp.json via --config-file.\n\
+         # protocolNegotiation is set to legacy because Bob's automatic mode\n\
+         # probes server/discover before the standard MCP initialize handshake.\n\
+         # Pair with `ai-memory install-hooks --agent ibm-bob --apply` for\n\
+         # lifecycle capture and automatic handoff delivery.\n\
+         {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
 }
@@ -2585,6 +3031,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cline_entry_explicitly_selects_streamable_http() {
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::Cline)).unwrap();
+        assert_eq!(entry["type"], "streamableHttp");
+        assert_eq!(entry["url"], "http://127.0.0.1:49374/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert!(entry.get("transport").is_none(), "{entry:#}");
+        assert_eq!(entry["disabled"], false);
+        assert_eq!(entry["autoApprove"], json!([]));
+    }
+
+    #[test]
+    fn cline_apply_replaces_the_old_nested_entry_and_preserves_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cline_mcp_settings.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "transport": {
+                            "type": "streamableHttp",
+                            "url": "https://old.example/mcp"
+                        },
+                        "disabled": false,
+                        "autoApprove": []
+                    },
+                    "other": {"command": "other"}
+                },
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::Cline);
+        args.apply = true;
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "type": "streamableHttp",
+                "url": "https://memory.example/mcp",
+                "disabled": false,
+                "autoApprove": []
+            })
+        );
+    }
+
+    #[test]
+    fn freebuff_entry_uses_sessionless_bridge_not_a_second_server() {
+        let mut args = args_for(McpClient::Freebuff);
+        args.server_url = Some("https://memory.example/mcp".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(
+            entry["args"],
+            json!([
+                "mcp-bridge",
+                "--no-session-id",
+                "--server-url",
+                "https://memory.example/mcp"
+            ])
+        );
+        assert_eq!(entry["env"], json!({}));
+        assert!(
+            !entry["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str() == Some("serve"))
+        );
+
+        let mut authenticated = args_for(McpClient::Freebuff);
+        authenticated.server_url = Some("https://memory.example/mcp".into());
+        authenticated.auth_token = Some("explicit-token".into());
+        authenticated.bridge_data_dir = Some(PathBuf::from("/srv/ai-memory"));
+        let entry = build_json_mcp_entry(&authenticated).unwrap();
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "explicit-token");
+        assert_eq!(
+            entry["args"],
+            json!([
+                "mcp-bridge",
+                "--no-session-id",
+                "--server-url",
+                "https://memory.example/mcp",
+                "--data-dir",
+                "/srv/ai-memory"
+            ])
+        );
+    }
+
     /// Droid's `mcp.json` HTTP entry (#1240): the URL is literal (Droid
     /// never expands variables there), and a configured bearer becomes the
     /// `${AI_MEMORY_AUTH_TOKEN}` reference Droid expands in headers, never
@@ -2628,9 +3178,9 @@ mod tests {
         args.apply = true;
         args.config_file = Some(file.clone());
         args.server_url = Some("http://memory:49374/mcp".into());
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = std::fs::read_to_string(&file).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         assert_eq!(first, std::fs::read_to_string(&file).unwrap());
         let root: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(root["keep"], 1);
@@ -2660,6 +3210,133 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen_code_entry_uses_documented_http_url_shape() {
+        assert_eq!(
+            build_json_mcp_entry(&args_with_token(McpClient::QwenCode)).unwrap(),
+            json!({
+                "httpUrl": "http://127.0.0.1:49374/mcp",
+                "timeout": 5000,
+                "headers": {"Authorization": "Bearer test-token-deadbeef"},
+            })
+        );
+        assert_eq!(
+            build_json_mcp_entry(&args_for(McpClient::QwenCode)).unwrap(),
+            json!({
+                "httpUrl": "http://127.0.0.1:49374/mcp",
+                "timeout": 5000,
+            })
+        );
+        let path = mcp_config_path_with(McpClient::QwenCode, &|_| None).unwrap();
+        assert!(
+            path.ends_with(Path::new(".qwen/settings.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn qwen_code_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("settings.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {"other": {"command": "other"}},
+                "hooks": {"PreToolUse": []},
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::QwenCode);
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["hooks"]["PreToolUse"], json!([]));
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "httpUrl": "https://memory.example/mcp",
+                "timeout": 5000,
+            })
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::QwenCode, &file, "ai-memory").unwrap(),
+            Some("https://memory.example/mcp".into())
+        );
+    }
+
+    #[test]
+    fn ibm_bob_entry_uses_documented_legacy_streamable_http_shape() {
+        assert_eq!(
+            build_json_mcp_entry(&args_with_token(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+                "headers": {"Authorization": "Bearer test-token-deadbeef"},
+            })
+        );
+        assert_eq!(
+            build_json_mcp_entry(&args_for(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        let path = mcp_config_path_with(McpClient::IbmBob, &|_| None).unwrap();
+        assert!(
+            path.ends_with(Path::new(".bob/settings/mcp.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn ibm_bob_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("mcp.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {"other": {"type": "stdio", "command": "other"}},
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::IbmBob);
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "type": "streamable-http",
+                "url": "https://memory.example/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::IbmBob, &file, "ai-memory").unwrap(),
+            Some("https://memory.example/mcp".into())
+        );
+    }
+
     /// Muse's entry is the session-aware stdio bridge for `--agent muse`, so
     /// Muse forwards `MUSE_SESSION_ID`; a streamable-HTTP entry would carry no
     /// session id. `mode` is `optional` because Muse's default `required`
@@ -2672,7 +3349,7 @@ mod tests {
             entry,
             json!({
                 "type": "stdio",
-                "command": "ai-memory",
+                "command": bridge_command(),
                 "args": ["mcp-bridge", "--agent", "muse", "--server-url", "http://127.0.0.1:49374/mcp"],
                 "mode": "optional",
             })
@@ -2707,7 +3384,12 @@ mod tests {
             json!({"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}),
         );
 
-        upsert_json_mcp_entry(&mut root, &args_for(McpClient::Muse)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args_for(McpClient::Muse),
+        )
+        .unwrap();
 
         // Without this key every muse command fails at startup.
         assert_eq!(root["schema_version"], 1);
@@ -2730,7 +3412,12 @@ mod tests {
             "mcp_servers".into(),
             json!({"my-tools": {"transport": "stdio", "command": "my-mcp-server"}}),
         );
-        upsert_json_mcp_entry(&mut legacy, &args_for(McpClient::Muse)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut legacy,
+            &args_for(McpClient::Muse),
+        )
+        .unwrap();
         assert!(!legacy.contains_key("mcpServers"), "{legacy:#?}");
         let ours = &legacy["mcp_servers"]["ai-memory"];
         assert_eq!(ours["transport"], "stdio");
@@ -2745,12 +3432,22 @@ mod tests {
         both.insert("mcpServers".into(), json!({"a": {"type": "stdio"}}));
         both.insert("mcp_servers".into(), json!({"b": {"transport": "stdio"}}));
         let before = both.clone();
-        let error = upsert_json_mcp_entry(&mut both, &args_for(McpClient::Muse)).unwrap_err();
+        let error = upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut both,
+            &args_for(McpClient::Muse),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("both"), "{error:#}");
         assert_eq!(both, before, "a refused file is not touched");
 
         let mut empty = serde_json::Map::new();
-        upsert_json_mcp_entry(&mut empty, &args_for(McpClient::Muse)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut empty,
+            &args_for(McpClient::Muse),
+        )
+        .unwrap();
         assert!(empty.contains_key("mcpServers"));
         assert!(!empty.contains_key("mcp_servers"));
     }
@@ -2772,9 +3469,9 @@ mod tests {
         args.apply = true;
         args.config_file = Some(file.clone());
         args.server_url = Some(DEFAULT_MCP_URL.into());
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = std::fs::read_to_string(&file).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
         let root: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(root["theme"], "dark");
@@ -2791,7 +3488,7 @@ mod tests {
         let text = r#"{"schema_version":1,"mcpServers":{},"mcp_servers":{}}"#;
         std::fs::write(&both, text).unwrap();
         args.config_file = Some(both.clone());
-        assert!(apply_to_config_file(&args).is_err());
+        assert!(apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).is_err());
         assert_eq!(std::fs::read_to_string(&both).unwrap(), text);
     }
 
@@ -2833,7 +3530,12 @@ mod tests {
         let mut root = serde_json::Map::new();
         root.insert("schema_version".into(), json!(2));
 
-        upsert_json_mcp_entry(&mut root, &args_for(McpClient::Muse)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args_for(McpClient::Muse),
+        )
+        .unwrap();
 
         // Downgrading a future schema would break the user's settings file;
         // an unrecognized value is Muse's own error to report.
@@ -2868,12 +3570,22 @@ mod tests {
         .unwrap()
         .clone();
 
-        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args,
+        )
+        .unwrap();
         assert!(root["mcp"].get("ai-memory").is_none());
         assert_eq!(root["mcp"]["other"]["url"], "https://example.invalid/mcp");
         assert_eq!(root["mcp"]["servers"]["ai-memory"]["oauth"], json!(false));
         let once = serde_json::to_string_pretty(&root).unwrap();
-        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args,
+        )
+        .unwrap();
         assert_eq!(serde_json::to_string_pretty(&root).unwrap(), once);
     }
 
@@ -2894,7 +3606,12 @@ mod tests {
         .unwrap()
         .clone();
 
-        upsert_json_mcp_entry(&mut root, &args_for(McpClient::OpenCode)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args_for(McpClient::OpenCode),
+        )
+        .unwrap();
         assert!(root["mcp"].get("servers").is_none());
         assert_eq!(root["mcp"]["ai-memory"]["enabled"], json!(true));
     }
@@ -2916,7 +3633,12 @@ mod tests {
             .unwrap()
             .clone();
 
-        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args,
+        )
+        .unwrap();
         assert_eq!(root["mcp"]["ai-memory"], user_entry);
         assert!(root["mcp"]["servers"]["ai-memory"].is_object());
     }
@@ -3121,9 +3843,9 @@ mod tests {
         args.config_file = Some(config.clone());
         args.apply = true;
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read(&config).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         assert_eq!(fs::read(&config).unwrap(), first);
     }
 
@@ -3141,7 +3863,12 @@ mod tests {
             .unwrap()
             .clone();
 
-        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args,
+        )
+        .unwrap();
         assert_eq!(root["mcp"]["ai-memory"], user_entry);
         assert!(root["mcp"]["servers"]["ai-memory"].is_object());
     }
@@ -3161,13 +3888,23 @@ mod tests {
         );
 
         let mut root = serde_json::Map::new();
-        upsert_json_mcp_entry(&mut root, &args_with_token(McpClient::OpenCode2)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut root,
+            &args_with_token(McpClient::OpenCode2),
+        )
+        .unwrap();
         assert!(root["mcp"]["servers"]["ai-memory"].is_object());
         assert!(root.get("mcpServers").is_none());
 
         // v1 still lands under top-level `mcp`, so both stay wired.
         let mut v1 = serde_json::Map::new();
-        upsert_json_mcp_entry(&mut v1, &args_with_token(McpClient::OpenCode)).unwrap();
+        upsert_json_mcp_entry(
+            &ai_memory_core::i18n::Localizer::default(),
+            &mut v1,
+            &args_with_token(McpClient::OpenCode),
+        )
+        .unwrap();
         assert!(v1["mcp"]["ai-memory"].is_object());
         assert!(v1["mcp"].get("servers").is_none());
     }
@@ -3236,11 +3973,63 @@ mod tests {
         validate_args(&args).expect("valid name");
     }
 
+    /// Hermes' entry is the session-less stdio bridge under `mcp_servers:`,
+    /// every scalar a single-quoted YAML string.
+    #[test]
+    fn hermes_render_is_a_quoted_stdio_bridge_entry() {
+        let mut args = args_for(McpClient::Hermes);
+        args.name = "123".into();
+        args.server_url = Some("http://h:1/mcp?a=\"b\" #c".into());
+        args.bridge_data_dir = Some(PathBuf::from("/data dir/it's"));
+        let rendered = render_hermes(&args);
+        let command = yaml_single_quote(&bridge_command());
+        let expected = format!(
+            "mcp_servers:\n  '123':\n    command: {command}\n    args:\n      \
+             - 'mcp-bridge'\n      - '--no-session-id'\n      - '--server-url'\n      \
+             - 'http://h:1/mcp?a=\"b\" #c'\n      - '--data-dir'\n      - '/data dir/it''s'\n"
+        );
+        assert!(rendered.ends_with(&expected), "{rendered}");
+        // The model never sees ai-memory's MCP instructions in Hermes, so the
+        // header points at what carries them instead.
+        assert!(rendered.contains("does not read an MCP server's instructions"));
+        assert!(rendered.contains("~/.hermes/skills"));
+        assert!(rendered.contains("next primary-session turn"));
+    }
+
+    /// No bearer reaches Hermes' config: the bridge authenticates with the
+    /// install's own token.
+    #[test]
+    fn hermes_render_never_embeds_the_token() {
+        let rendered = render_hermes(&args_with_token(McpClient::Hermes));
+        assert!(!rendered.contains("test-token-deadbeef"), "{rendered}");
+        assert!(!rendered.contains("Bearer"), "{rendered}");
+        assert!(!rendered.contains("headers"), "{rendered}");
+        assert!(rendered.contains("The token is not written here"));
+        assert!(!render_hermes(&args_for(McpClient::Hermes)).contains("The token is not"));
+    }
+
+    #[test]
+    fn hermes_apply_and_config_path_are_refused_with_guidance() {
+        let mut args = args_with_token(McpClient::Hermes);
+        args.apply = true;
+        let error = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
+            .expect_err("apply must be refused");
+        let message = format!("{error}");
+        assert!(message.contains("~/.hermes/config.yaml"), "{message}");
+        assert!(message.contains("without --apply"), "{message}");
+        assert!(!message.contains("test-token-deadbeef"), "{message}");
+        let error = mcp_config_path(McpClient::Hermes).expect_err("no writable config");
+        assert!(format!("{error}").contains("~/.hermes/config.yaml"));
+        assert!(json_mcp_location(McpClient::Hermes).is_none());
+        assert!(build_json_mcp_entry(&args_for(McpClient::Hermes)).is_err());
+    }
+
     #[test]
     fn dsh_apply_is_refused_with_the_patch_pointer() {
         let mut args = args_for(McpClient::Dsh);
         args.apply = true;
-        let error = apply_to_config_file(&args).expect_err("apply must be refused");
+        let error = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
+            .expect_err("apply must be refused");
         assert!(format!("{error}").contains("cordis.patch.yml"));
     }
 
@@ -3332,6 +4121,25 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+
+        let cline_file = root.join("cline-mcp.json");
+        let env = |name: &str| {
+            (name == "CLINE_MCP_SETTINGS_PATH").then(|| cline_file.clone().into_os_string())
+        };
+        assert_eq!(
+            mcp_config_path_with(McpClient::Cline, &env).unwrap(),
+            cline_file
+        );
+
+        let env = |name: &str| (name == "HOME").then(|| root.as_os_str().to_owned());
+        assert_eq!(
+            mcp_config_path_with(McpClient::Cline, &env).unwrap(),
+            root.join(".cline/data/settings/cline_mcp_settings.json")
+        );
+        assert_eq!(
+            mcp_config_path_with(McpClient::Freebuff, &env).unwrap(),
+            root.join(".agents/mcp.json")
+        );
     }
 
     #[test]
@@ -3435,7 +4243,7 @@ mod tests {
     /// rendered inside the Docker image, whose paths mean nothing on the host.
     #[test]
     fn codex_render_names_codex_home() {
-        let out = render_codex(&args_for(McpClient::Codex));
+        let out = render_codex(&args_for(McpClient::Codex)).unwrap();
         assert!(
             out.contains("$CODEX_HOME/config.toml"),
             "render must point a relocated Codex at its config home:\n{out}"
@@ -3579,9 +4387,9 @@ mod tests {
         let mut args = args_with_token(McpClient::Zed);
         args.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second);
@@ -3609,7 +4417,8 @@ mod tests {
         let mut args = args_for(McpClient::Zed);
         args.config_file = Some(config_path.clone());
 
-        let error = apply_to_config_file(&args).unwrap_err();
+        let error =
+            apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap_err();
 
         assert!(error.to_string().contains("not an object"));
         assert_eq!(fs::read_to_string(config_path).unwrap(), original);
@@ -3725,18 +4534,61 @@ mod tests {
     }
 
     #[test]
+    fn bridge_command_names_the_binary_by_absolute_path_outside_a_container() {
+        let exe = PathBuf::from("/opt/ai-memory/ai-memory");
+        assert_eq!(
+            bridge_command_for(false, exe.clone()),
+            "/opt/ai-memory/ai-memory"
+        );
+        assert_eq!(bridge_command_for(true, exe), BRIDGE_COMMAND);
+    }
+
+    #[test]
+    fn bridge_entries_are_recognized_by_bare_name_or_absolute_path() {
+        #[cfg(windows)]
+        let absolute_command = r"C:\opt\ai-memory.exe";
+        #[cfg(not(windows))]
+        let absolute_command = "/opt/ai-memory/ai-memory";
+
+        for command in ["ai-memory", absolute_command] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), Some("http://h/mcp"), "{command}");
+            let opencode =
+                json!({"command": [command, "mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(
+                bridge_entry_url(&opencode),
+                Some("http://h/mcp"),
+                "{command}"
+            );
+        }
+        for command in ["other", "/usr/bin/other", "bin/ai-memory"] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), None, "{command}");
+        }
+    }
+
+    #[test]
     fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
         let mut args = args_with_token(McpClient::ClaudeCode);
         args.server_url = Some("https://memory.example/mcp".into());
         args.session_aware = true;
+        args.bridge_data_dir = Some(PathBuf::from("/srv/AI Memory/data"));
 
         let entry = build_mcp_entry(&args).unwrap();
 
         assert_eq!(entry["type"], "stdio");
-        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(entry["command"], bridge_command());
         assert_eq!(
             entry["args"],
-            json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
+            json!([
+                "mcp-bridge",
+                "--server-url",
+                "https://memory.example/mcp",
+                "--data-dir",
+                "/srv/AI Memory/data"
+            ])
         );
         assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "test-token-deadbeef");
         assert!(entry.get("url").is_none());
@@ -3744,7 +4596,11 @@ mod tests {
 
         let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
         assert!(rendered.contains("claude mcp add --transport stdio"));
-        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+        assert!(rendered.contains(&format!(
+            "{} mcp-bridge --server-url",
+            shell_quote(&bridge_command())
+        )));
+        assert!(rendered.contains("--data-dir '/srv/AI Memory/data'"));
     }
 
     #[test]
@@ -3757,9 +4613,9 @@ mod tests {
         args.session_aware = true;
         args.apply = true;
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_file).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_file).unwrap();
 
         assert_eq!(first, second);
@@ -3795,13 +4651,15 @@ mod tests {
             McpClient::ClaudeCode => {
                 render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
             }
-            McpClient::Codex => render_codex(&args),
+            McpClient::Codex => render_codex(&args).unwrap(),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
+            McpClient::QwenCode => render_qwen_code(&args).unwrap(),
+            McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -3812,6 +4670,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
@@ -3819,7 +4678,14 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::Hermes => render_hermes(&args),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
+            McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::Freebuff => {
+                let mut args = args;
+                args.stdio_bridge = true;
+                render_json_mcp_fragment(&args).unwrap()
+            }
         }
     }
 
@@ -3836,6 +4702,8 @@ mod tests {
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
+            McpClient::QwenCode,
+            McpClient::Qoder,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -3845,11 +4713,13 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::IbmBob,
             McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
             McpClient::Dsh,
+            McpClient::Cline,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -3860,8 +4730,10 @@ mod tests {
             // server entry, etc.), but the literal `Bearer
             // <token>` substring shows up in all of them. Keep
             // the assertion uniform.
+            let carries_token = out.contains("Bearer test-token-deadbeef")
+                || (client == McpClient::Qoder && out.contains("test-token-deadbeef"));
             assert!(
-                out.contains("Bearer test-token-deadbeef"),
+                carries_token,
                 "client {client:?} did not embed the bearer token:\n{out}"
             );
         }
@@ -3880,6 +4752,8 @@ mod tests {
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
+            McpClient::QwenCode,
+            McpClient::Qoder,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -3887,6 +4761,7 @@ mod tests {
             McpClient::Zcode,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::IbmBob,
             McpClient::KiroCli,
             McpClient::CommandCode,
             McpClient::CopilotCli,
@@ -3896,7 +4771,10 @@ mod tests {
             McpClient::Zed,
             McpClient::Muse,
             McpClient::Dsh,
+            McpClient::Hermes,
             McpClient::PrimeAgent,
+            McpClient::Cline,
+            McpClient::Freebuff,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -3906,19 +4784,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qoder_always_uses_the_sessionless_bridge_in_its_native_stdio_shape() {
+        let mut args = args_for(McpClient::Qoder);
+        args.auth_token = Some("qoder-token".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        // The command is this binary (or the bare name inside a container), so
+        // compare against what the builder is contracted to produce rather than
+        // a substring of the test binary's path: under `cargo test` that path is
+        // `ai_memory_cli-<hash>`, which only happens to contain `ai-memory` when
+        // the checkout does, and an out-of-tree `CARGO_TARGET_DIR` then fails
+        // the suite for the fixture's spelling (#1691).
+        let command = entry["command"].as_str().unwrap();
+        assert!(
+            is_bridge_command(command),
+            "the Qoder entry must run this binary: {command}"
+        );
+        let bridge_args = entry["args"].as_array().unwrap();
+        assert!(bridge_args.iter().any(|arg| arg == "mcp-bridge"));
+        assert!(bridge_args.iter().any(|arg| arg == "--no-session-id"));
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "qoder-token");
+        assert!(entry.get("url").is_none());
+    }
+
     fn render_for_test(client: McpClient) -> String {
         let args = args_for(client);
         match args.client {
             McpClient::ClaudeCode => {
                 render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
             }
-            McpClient::Codex => render_codex(&args),
+            McpClient::Codex => render_codex(&args).unwrap(),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
+            McpClient::QwenCode => render_qwen_code(&args).unwrap(),
+            McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -3929,6 +4832,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
@@ -3936,7 +4840,14 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::Hermes => render_hermes(&args),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
+            McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::Freebuff => {
+                let mut args = args;
+                args.stdio_bridge = true;
+                render_json_mcp_fragment(&args).unwrap()
+            }
         }
     }
 
@@ -3977,7 +4888,7 @@ mod tests {
         let config = file_token_config(tmp.path());
         let url = DEFAULT_MCP_URL;
         for &client in <McpClient as clap::ValueEnum>::value_variants() {
-            if matches!(client, McpClient::Pi | McpClient::Dsh) {
+            if matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Hermes) {
                 continue; // no config file: an extension, and print-only
             }
             let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
@@ -4045,7 +4956,7 @@ mod tests {
         };
         let opencode = entry(McpClient::OpenCode);
         assert_eq!(opencode["type"], "local");
-        assert_eq!(opencode["command"][0], "ai-memory");
+        assert_eq!(opencode["command"][0], bridge_command());
         assert_eq!(opencode["command"][1], "mcp-bridge");
         assert_eq!(opencode["enabled"], true);
         assert!(entry(McpClient::OpenCode2).get("enabled").is_none());
@@ -4054,6 +4965,10 @@ mod tests {
         assert_eq!(entry(McpClient::CommandCode)["transport"], "stdio");
         assert_eq!(entry(McpClient::VsCodeCopilot)["type"], "stdio");
         assert!(entry(McpClient::Zed).get("type").is_none());
+        let cline = entry(McpClient::Cline);
+        assert_eq!(cline["command"], bridge_command());
+        assert_eq!(cline["args"][0], "mcp-bridge");
+        assert!(cline.get("transport").is_none(), "{cline:#}");
         // Kimi Code's schema dialect rides the bridge's upstream URL.
         assert_eq!(
             entry(McpClient::KimiCode)["args"][3],
@@ -4065,7 +4980,12 @@ mod tests {
         let mut doc = toml_edit::DocumentMut::new();
         grok_upsert_mcp_server(&mut doc, &grok).unwrap();
         let text = doc.to_string();
-        assert!(text.contains("command = \"ai-memory\""), "{text}");
+        let expected_command = bridge_command();
+        assert_eq!(
+            doc["mcp_servers"]["ai-memory"]["command"].as_str(),
+            Some(expected_command.as_str()),
+            "{text}"
+        );
         assert!(!text.contains("url ="), "{text}");
 
         let mut dsh = args_for(McpClient::Dsh);
@@ -4114,6 +5034,206 @@ mod tests {
         let text = std::fs::read_to_string(&explicit).unwrap();
         assert!(text.contains("Bearer explicit-token"), "{text}");
         assert!(!text.contains(FILE_TOKEN), "{text}");
+    }
+
+    /// Every bridge entry names a data dir the install was given, as the
+    /// install's hooks do, so the bridge reads that install's config and
+    /// bearer rather than the default data dir's. Controls: a default install
+    /// keeps its entries unchanged (only Muse, which clears the environment,
+    /// names the dir regardless), and the Docker helper, whose data dir is a
+    /// container path, names it for no client.
+    /// Whether a written entry names `path`. JSON (and TOML basic strings)
+    /// escape a Windows path's backslashes, so look for that form too.
+    fn names_path(text: &str, path: &Path) -> bool {
+        let raw = path.to_string_lossy();
+        let escaped = serde_json::to_string(raw.as_ref()).unwrap();
+        text.contains(raw.as_ref()) || text.contains(escaped.trim_matches('"'))
+    }
+
+    #[test]
+    fn bridge_entries_name_a_data_dir_the_install_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("client-data");
+        let installed = |config: &Config, label: &str| {
+            let mut bridges = 0;
+            for &client in <McpClient as clap::ValueEnum>::value_variants() {
+                if matches!(
+                    client,
+                    McpClient::Pi | McpClient::Dsh | McpClient::Zcode | McpClient::Hermes
+                ) {
+                    continue; // no config file, print-only, HTTP-only, and YAML print-only
+                }
+                let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
+                    "toml"
+                } else {
+                    "json"
+                };
+                let file = tmp.path().join(format!("{label}-{client:?}.{ext}"));
+                apply_with(config, client, &file).unwrap_or_else(|e| panic!("{client:?}: {e:#}"));
+                let text = std::fs::read_to_string(&file).unwrap();
+                if text.contains("mcp-bridge") {
+                    bridges += 1;
+                }
+                let names_dir = text.contains("--data-dir") && names_path(&text, &data_dir);
+                let expected = match label {
+                    "explicit" => text.contains("mcp-bridge"),
+                    "default" => matches!(client, McpClient::Muse | McpClient::Freebuff),
+                    _ => false,
+                };
+                assert_eq!(names_dir, expected, "{label} {client:?}: {text}");
+            }
+            assert!(
+                bridges > 2,
+                "{label}: too few bridge entries to prove anything"
+            );
+        };
+
+        let mut explicit = file_token_config(&data_dir);
+        explicit.data_dir = data_dir.clone();
+        explicit.data_dir_explicit = true;
+        installed(&explicit, "explicit");
+
+        let mut default = explicit.clone();
+        default.data_dir_explicit = false;
+        installed(&default, "default");
+
+        let mut docker = explicit.clone();
+        docker.runtime_env = crate::config::RuntimeEnv::with_host_cwd_for_tests("/host/repo");
+        installed(&docker, "docker");
+    }
+
+    /// An explicit `--auth-token` for an entry that runs the bridge is stored
+    /// in `<data_dir>/auth-token`, where the bridge reads it, and the entry
+    /// names that data dir instead of carrying the key. Controls, each of
+    /// which keeps the key inline as before and stores nothing new: the print
+    /// path, a bearer the config already resolves (it would win over the
+    /// stored key), a different key already stored for the hooks, hooks that
+    /// sign in with OIDC, the Docker helper, and an HTTP entry, whose literal
+    /// header is documented.
+    #[test]
+    fn an_explicit_key_for_a_bridge_is_stored_instead_of_written_inline() {
+        const KEY: &str = "aim_explicit_key";
+        let tmp = tempfile::tempdir().unwrap();
+        let config_in = |name: &str| Config {
+            data_dir: tmp.path().join(name),
+            ..Config::default()
+        };
+        let install = |config: &Config, client: McpClient, apply: bool| -> String {
+            let file = config.data_dir.with_extension(format!("{client:?}.json"));
+            let mut args = args_for(client);
+            args.apply = apply;
+            args.config_file = Some(file.clone());
+            args.session_aware = client == McpClient::ClaudeCode;
+            args.auth_token = Some(KEY.into());
+            run_with_opencode_dialect(config, args, None).unwrap();
+            std::fs::read_to_string(&file).unwrap_or_default()
+        };
+        let stored = |config: &Config| crate::config::read_hook_auth_token(&config.data_dir);
+
+        for client in [McpClient::ClaudeCode, McpClient::Muse] {
+            let config = config_in(&format!("stored-{client:?}"));
+            let text = install(&config, client, true);
+            assert!(
+                !text.contains(KEY),
+                "{client:?} entry still carries the key: {text}"
+            );
+            assert!(!text.contains("AI_MEMORY_AUTH_TOKEN"), "{client:?}: {text}");
+            assert!(text.contains("--data-dir"), "{client:?}: {text}");
+            assert!(
+                names_path(&text, &config.data_dir),
+                "{client:?} entry must name the dir the key went into: {text}"
+            );
+            assert_eq!(stored(&config).as_deref(), Some(KEY), "{client:?}");
+            // The shell hooks read the header file of the same pair.
+            assert_eq!(
+                std::fs::read_to_string(crate::config::hook_auth_header_path_in(&config.data_dir))
+                    .unwrap(),
+                format!("Authorization: Bearer {KEY}\n")
+            );
+        }
+
+        let printed = config_in("printed");
+        install(&printed, McpClient::ClaudeCode, false);
+        assert_eq!(
+            stored(&printed),
+            None,
+            "a printed snippet must store nothing"
+        );
+
+        let mut configured = config_in("configured");
+        configured.auth.bearer_token = Some("configured-bearer".into());
+        assert!(install(&configured, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&configured), None);
+
+        let remote = config_in("different-endpoint");
+        let remote_file = remote.data_dir.with_extension("remote.json");
+        let mut remote_args = args_for(McpClient::ClaudeCode);
+        remote_args.apply = true;
+        remote_args.session_aware = true;
+        remote_args.config_file = Some(remote_file.clone());
+        remote_args.server_url = Some("https://other.example/mcp".into());
+        remote_args.auth_token = Some(KEY.into());
+        run_with_opencode_dialect(&remote, remote_args, None).unwrap();
+        let remote_text = std::fs::read_to_string(remote_file).unwrap();
+        assert!(remote_text.contains(KEY));
+        assert_eq!(
+            stored(&remote),
+            None,
+            "a key for another server is not hook auth"
+        );
+
+        let other = config_in("other");
+        crate::config::store_hook_auth_token(&other.data_dir, "aim_hooks_key").unwrap();
+        assert!(install(&other, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&other).as_deref(), Some("aim_hooks_key"));
+
+        let oidc = config_in("oidc");
+        let response = ai_memory_llm::OidcTokenResponse {
+            access_token: "oidc-access".into(),
+            refresh_token: Some("oidc-refresh".into()),
+            expires_in: None,
+        };
+        std::fs::create_dir_all(&oidc.data_dir).unwrap();
+        ai_memory_llm::OidcToken::from_token_response(&response, "iss", "cid", "ep", None)
+            .unwrap()
+            .save(&oidc.data_dir.join("auth.json"))
+            .unwrap();
+        assert!(install(&oidc, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(
+            stored(&oidc),
+            None,
+            "OIDC hooks must not be switched to the key"
+        );
+
+        let mut docker = config_in("docker");
+        docker.runtime_env = crate::config::RuntimeEnv::with_host_cwd_for_tests("/host/repo");
+        assert!(install(&docker, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&docker), None);
+
+        let http = config_in("http");
+        assert!(install(&http, McpClient::Cursor, true).contains(&format!("Bearer {KEY}")));
+        assert_eq!(stored(&http), None);
+    }
+
+    #[test]
+    fn failed_bridge_apply_rolls_back_a_newly_stored_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let config_file = tmp.path().join("broken.json");
+        std::fs::write(&config_file, "[]").unwrap();
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.apply = true;
+        args.session_aware = true;
+        args.config_file = Some(config_file);
+        args.auth_token = Some("aim_must_rollback".into());
+
+        let error = run_with_opencode_dialect(&config, args, None).unwrap_err();
+        assert!(error.to_string().contains("object"), "{error:#}");
+        assert_eq!(crate::config::read_hook_auth_token(&config.data_dir), None);
+        assert!(!crate::config::hook_auth_header_path_in(&config.data_dir).exists());
     }
 
     #[test]
@@ -4210,6 +5330,27 @@ mod tests {
         );
     }
 
+    /// #1269: with only a custom `bind`, the MCP entry points at the server
+    /// that bind starts rather than the compiled default; a plain default
+    /// config is unchanged.
+    #[test]
+    fn mcp_server_url_uses_a_bind_derived_url() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        let args = args_for(McpClient::OpenCode);
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "http://127.0.0.1:49921/mcp"
+        );
+        assert_eq!(
+            effective_mcp_server_url(&Config::default(), &args),
+            DEFAULT_MCP_URL
+        );
+    }
+
     /// Specific shape checks — each client has a distinguishing key
     /// in its JSON snippet. This catches accidental cross-pollination
     /// between renderers (e.g. Gemini's `httpUrl` showing up under
@@ -4218,6 +5359,7 @@ mod tests {
     fn client_specific_shape_keys() {
         assert!(render_for_test(McpClient::Cursor).contains("\"url\""));
         assert!(render_for_test(McpClient::GeminiCli).contains("\"httpUrl\""));
+        assert!(render_for_test(McpClient::QwenCode).contains("\"httpUrl\""));
         assert!(render_for_test(McpClient::ClaudeDesktop).contains("mcp-remote"));
         assert!(render_for_test(McpClient::Openclaw).contains("\"streamable-http\""));
         assert!(render_for_test(McpClient::Codex).contains("[mcp_servers.ai-memory]"));
@@ -4248,7 +5390,9 @@ mod tests {
         let pi = render_pi(&args_for(McpClient::Pi)).unwrap();
         assert!(pi.contains("Pi has no native mcp.json"));
         assert!(pi.contains("install-hooks --agent pi --apply"));
-        assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
+        assert!(pi.contains("~/.pi/agent/extensions/ai-memory-pi.ts"));
+        assert!(pi.contains("$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts"));
+        assert!(!pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
         // The snippet must point at the documented global config, not the
@@ -4411,9 +5555,9 @@ mod tests {
         let mut args = args_with_token(McpClient::Zcode);
         args.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second);
@@ -4447,6 +5591,50 @@ mod tests {
             entry["url"].as_str().unwrap(),
             "https://memory.example/mcp?flavor=gemini"
         );
+    }
+
+    /// OpenCode is the other client `--flavor`'s documentation names, and it
+    /// has its own entry builders. They read `server_url` directly, so the
+    /// flag was silently dropped and Vertex 400'd every `tools/list`.
+    #[test]
+    fn an_explicit_flavor_reaches_the_opencode_entry_builders() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+            args.flavor = Some(SchemaFlavor::Gemini);
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp?flavor=gemini",
+                "{client:?}"
+            );
+        }
+    }
+
+    /// Control: OpenCode has no built-in dialect, so an install that did not
+    /// ask for one must still get the bare endpoint.
+    #[test]
+    fn opencode_stays_unflavored_without_the_flag() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp",
+                "{client:?}"
+            );
+        }
     }
 
     #[test]
@@ -4600,9 +5788,9 @@ mod tests {
         args.server_url = Some("https://memory.example/mcp".into());
         args.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second);
@@ -4693,9 +5881,9 @@ mod tests {
         args.server_url = Some("https://memory.example/mcp".into());
         args.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second);
@@ -4732,7 +5920,8 @@ mod tests {
             let mut args = args_for(McpClient::PrimeAgent);
             args.name = name.to_string();
             args.config_file = Some(config_path.clone());
-            let error = apply_to_config_file(&args).unwrap_err();
+            let error = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
+                .unwrap_err();
             assert!(
                 error.to_string().contains("Prime Agent MCP server names"),
                 "{name:?}: {error:#}"
@@ -4770,9 +5959,9 @@ mod tests {
         args.server_url = Some("https://memory.example/mcp".into());
         args.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second);
@@ -4796,7 +5985,9 @@ mod tests {
         args.apply = true;
         args.config_file = Some(path.clone());
 
-        let err = apply_to_config_file(&args).unwrap_err().to_string();
+        let err = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("has no native mcp.json"),
@@ -4900,6 +6091,77 @@ mod tests {
         assert_eq!(
             first, second,
             "second apply must produce identical bytes; diff:\n--- first\n{first}\n--- second\n{second}"
+        );
+    }
+
+    /// Codex keeps auto-approving the read tools, but every tool annotated
+    /// destructive gets a per-tool prompt.
+    #[test]
+    fn codex_apply_prompts_for_every_destructive_tool() {
+        let destructive = ai_memory_mcp::AiMemoryServer::destructive_tool_names();
+        assert!(
+            destructive.iter().any(|tool| tool == "memory_delete_page"),
+            "{destructive:?}"
+        );
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let out = doc.to_string();
+        assert!(
+            out.contains("default_tools_approval_mode = \"approve\""),
+            "{out}"
+        );
+        let server = &doc["mcp_servers"]["ai-memory"];
+        for tool in &destructive {
+            assert_eq!(
+                server["tools"][tool.as_str()]["approval_mode"].as_str(),
+                Some("prompt"),
+                "{tool} must prompt:\n{out}"
+            );
+        }
+        for read_tool in ["memory_query", "memory_recent", "memory_briefing"] {
+            assert!(
+                server["tools"].get(read_tool).is_none(),
+                "{read_tool} keeps the approve default:\n{out}"
+            );
+        }
+
+        let rendered = render_codex(&args_for(McpClient::Codex)).unwrap();
+        for tool in &destructive {
+            assert!(
+                rendered.contains(&format!(
+                    "[mcp_servers.ai-memory.tools.{tool}]\napproval_mode = \"prompt\""
+                )),
+                "{tool} missing from the printed snippet:\n{rendered}"
+            );
+        }
+        rendered.parse::<toml_edit::DocumentMut>().unwrap();
+    }
+
+    /// A re-install keeps the per-tool choices the user already made.
+    #[test]
+    fn codex_apply_keeps_existing_per_tool_overrides() {
+        let original = "[mcp_servers.ai-memory]\n\
+                        url = \"http://old\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                        approval_mode = \"approve\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_query]\n\
+                        approval_mode = \"prompt\"\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let tools = &doc["mcp_servers"]["ai-memory"]["tools"];
+        assert_eq!(
+            tools["memory_delete_page"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            tools["memory_query"]["approval_mode"].as_str(),
+            Some("prompt")
+        );
+        assert_eq!(
+            tools["memory_forget_sweep"]["approval_mode"].as_str(),
+            Some("prompt")
         );
     }
 
@@ -5045,7 +6307,7 @@ mod tests {
         let mut args_with_path = args.clone();
         args_with_path.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args_with_path).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args_with_path).unwrap();
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -5070,11 +6332,11 @@ mod tests {
         let mut args_with_path = args.clone();
         args_with_path.config_file = Some(config_path.clone());
 
-        apply_to_config_file(&args_with_path).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args_with_path).unwrap();
 
         let first_content = fs::read_to_string(&config_path).unwrap();
 
-        apply_to_config_file(&args_with_path).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args_with_path).unwrap();
 
         let second_content = fs::read_to_string(&config_path).unwrap();
         assert_eq!(
@@ -5096,9 +6358,9 @@ mod tests {
 
         let mut args = args_with_token(McpClient::Swival);
         args.config_file = Some(config_path.clone());
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
-        apply_to_config_file(&args).unwrap();
+        apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args).unwrap();
         let second = fs::read_to_string(&config_path).unwrap();
 
         assert_eq!(first, second, "Swival MCP apply must be idempotent");
@@ -5144,6 +6406,218 @@ mod tests {
         assert_eq!(
             swival_project_root(&plain),
             fs::canonicalize(&plain).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_print_uses_apply_toml_builder_for_dotted_names_and_quotes() {
+        let mut args = args_with_token(McpClient::Codex);
+        args.name = "ai.memory".into();
+        args.server_url = Some("https://memory.example/mcp?note=\"quoted\"".into());
+
+        let printed = render_codex(&args).unwrap();
+        let mut applied = toml_edit::DocumentMut::new();
+        codex_upsert_mcp_server(&mut applied, &args).unwrap();
+
+        // The print path and the --apply path must agree on the table name.
+        let parsed: toml_edit::DocumentMut = printed
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("printed snippet is not valid TOML: {error}\n{printed}")
+            });
+        let servers = parsed.get("mcp_servers").unwrap().as_table().unwrap();
+        assert_eq!(servers.len(), 1, "print output:\n{printed}");
+        assert!(
+            servers.get("ai.memory").is_some(),
+            "print output:\n{printed}"
+        );
+        assert_eq!(
+            servers
+                .get("ai.memory")
+                .and_then(|server| server.get("url"))
+                .and_then(|url| url.as_str()),
+            Some("https://memory.example/mcp?note=\"quoted\""),
+            "print output:\n{printed}"
+        );
+        assert!(
+            printed.contains(&format!("[mcp_servers.{:?}]", "ai.memory")),
+            "print output:\n{printed}"
+        );
+        assert!(
+            applied
+                .to_string()
+                .contains(&format!("[mcp_servers.{:?}]", "ai.memory")),
+            "applied output:\n{applied}"
+        );
+    }
+
+    #[test]
+    fn codex_print_quotes_a_table_name_containing_a_space() {
+        let mut args = args_for(McpClient::Codex);
+        args.name = "my memory".into();
+
+        let printed = render_codex(&args).unwrap();
+        let parsed: toml_edit::DocumentMut = printed
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("printed snippet is not valid TOML: {error}\n{printed}")
+            });
+        let servers = parsed.get("mcp_servers").unwrap().as_table().unwrap();
+        assert_eq!(servers.len(), 1, "print output:\n{printed}");
+        assert!(
+            servers.get("my memory").is_some(),
+            "print output:\n{printed}"
+        );
+    }
+
+    #[test]
+    fn codex_print_is_byte_identical_for_an_ordinary_name() {
+        let mut plain = args_for(McpClient::Codex);
+        plain.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        assert_eq!(
+            render_codex(&plain).unwrap(),
+            "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+             #\n\
+             [mcp_servers.ai-memory]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_patch_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
+             approval_mode = \"prompt\"\n"
+        );
+
+        let mut with_token = args_with_token(McpClient::Codex);
+        with_token.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        assert_eq!(
+            render_codex(&with_token).unwrap(),
+            "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+             #\n\
+             [mcp_servers.ai-memory]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [mcp_servers.ai-memory.http_headers]\n\
+             Authorization = \"Bearer test-token-deadbeef\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_patch_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
+             approval_mode = \"prompt\"\n\
+             # Alternative (avoids embedding the literal token):\n\
+             # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
+             # — and export AI_MEMORY_AUTH_TOKEN in your shell init.\n"
+        );
+
+        let mut env_var = args_for(McpClient::Codex);
+        env_var.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        env_var.token_env_var = true;
+        assert_eq!(
+            render_codex(&env_var).unwrap(),
+            format!(
+                "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+                 #\n\
+                 [mcp_servers.ai-memory]\n\
+                 url = \"http://127.0.0.1:49374/mcp\"\n\
+                 # Skip per-call approval prompts on ai-memory's read tools;\n\
+                 # the destructive ones below still ask first.\n\
+                 default_tools_approval_mode = \"approve\"\n\
+                 bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_feedback]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_patch_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
+                 approval_mode = \"prompt\"\n\
+                 # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+            )
         );
     }
 

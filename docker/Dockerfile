@@ -17,10 +17,12 @@ ARG CARGO_PROFILE_RELEASE_LTO=false
 ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}
+# Optional console; default builds retain the existing feature set.
+ARG AI_MEMORY_FEATURES=""
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE ./
 COPY crates ./crates
 # `evals/` is a workspace member (off-tree A/B harness, not shipped
 # in the image — but Cargo refuses to parse the workspace manifest
@@ -30,13 +32,15 @@ COPY evals ./evals
 # `docs/logo*.png` are include_bytes!'d by ai-memory-web's static
 # routes at compile time, so they must be in the build context.
 COPY docs ./docs
+# Product documentation embeds the current changelog into the web binary.
+COPY CHANGELOG.md ./
 # `ai-memory setup` renders the user service from these packaged templates,
 # include_str!'d at compile time.
 COPY packaging/systemd ./packaging/systemd
 COPY packaging/launchd ./packaging/launchd
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
-    cargo build --locked --release -p ai-memory-cli \
+    cargo build --locked --release -p ai-memory-cli --features "${AI_MEMORY_FEATURES}" \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
 FROM debian:bookworm-slim AS runtime-base

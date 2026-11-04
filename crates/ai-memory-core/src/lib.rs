@@ -8,14 +8,17 @@
 pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
+pub mod compaction_recap;
 pub mod error;
+pub mod excerpt;
 pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
-pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
+pub use ingest_metrics::{FilePathOutcome, IngestMetrics, IngestMetricsSnapshot};
+pub mod i18n;
 pub mod ids;
 pub mod latency;
-pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
+pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
 pub mod observation;
@@ -27,7 +30,8 @@ pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
-    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+    is_codex_memory_agent_cwd, looks_like_codex_generated_prompt, looks_like_codex_instructions,
+    looks_like_codex_memory_agent_prompt, looks_like_markup_block, looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;
@@ -56,9 +60,9 @@ pub use active_project::{
     DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
-    SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
-    skip_admission_chain_for,
+    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
+    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
+    parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
@@ -76,10 +80,15 @@ pub use ids::{
     portable_page_key,
 };
 pub use message::{
-    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
-    UNTRUSTED_MESSAGE_NOTICE,
+    AgentMessage, MessageBox, MessageClaim, MessageNature, MessageOrigin, MessageState,
+    NewAgentMessage, UNTRUSTED_MESSAGE_NOTICE,
 };
-pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
+pub use observation::{
+    FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,
+    Observation, ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR,
+    TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
+    valid_file_path_key,
+};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
@@ -105,9 +114,10 @@ pub use user::{
 };
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
-    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
-    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
-    RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent,
-    WorkstreamEventKind, scrub_workstream_provenance,
+    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedNativeSessionReference,
+    ManagedProjectCandidatesRequest, ManagedProjectCandidatesResponse, ManagedProjectScope,
+    ManagedRunContextResponse, ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    RenameManagedWorkstreamRequest, RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE,
+    WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind, scrub_workstream_provenance,
 };

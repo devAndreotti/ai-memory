@@ -55,6 +55,7 @@ fn provider_404() -> LlmError {
     LlmError::Provider {
         status: 404,
         body: "404 page not found".into(),
+        retry_after: None,
     }
 }
 
@@ -97,7 +98,10 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: llm,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -109,7 +113,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,

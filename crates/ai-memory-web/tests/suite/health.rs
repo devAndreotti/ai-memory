@@ -49,6 +49,7 @@ impl LlmProvider for FailingLlm {
         Err(LlmError::Provider {
             status: 401,
             body: format!("invalid api key {PLANTED_PROVIDER}"),
+            retry_after: None,
         })
     }
     async fn complete_structured_raw(
@@ -59,6 +60,7 @@ impl LlmProvider for FailingLlm {
         Err(LlmError::Provider {
             status: 401,
             body: PLANTED_PROVIDER.into(),
+            retry_after: None,
         })
     }
 }
@@ -80,6 +82,7 @@ impl Embedder for FailingEmbedder {
         Err(LlmError::Provider {
             status: 503,
             body: format!("upstream said {PLANTED_EMBED}"),
+            retry_after: None,
         })
     }
 }
@@ -204,6 +207,7 @@ fn app(
             base_path: "",
             trusted_proxy_identity: false,
             recall,
+            runtime: None,
             health: health.map(Arc::new),
         },
     )
@@ -356,6 +360,128 @@ async fn health_page_renders_each_failing_check_with_its_fix_line() {
         "{body}"
     );
     assert!(!body.contains("data-check=\"none\""), "{body}");
+}
+
+#[tokio::test]
+async fn task_only_provider_is_visible_and_failure_raises_a_check() {
+    let f = fixture().await;
+    let health = ProviderHealth::default();
+    let routes = health.wrap_llm_providers(
+        ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: [(
+                ai_memory_llm::LlmWorkload::Rerank,
+                Arc::new(FailingLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    );
+    let sources = HealthSources {
+        ingest: Arc::new(IngestMetrics::default()),
+        providers: health,
+        probe: Arc::new(FixedProbe(ProcessState::default())),
+    };
+    let (_, _, body) = get(
+        app(
+            &f,
+            AuthLevel::Root,
+            Some(sources.clone()),
+            Recall::default(),
+        ),
+        true,
+    )
+    .await;
+    assert!(body.contains("default llm provider"), "{body}");
+    assert!(body.contains("llm provider (rerank)"), "{body}");
+    assert!(body.contains("openai/gpt-test"), "{body}");
+    assert!(!body.contains("data-check=\"llm_task_provider\""), "{body}");
+
+    assert!(
+        routes
+            .get(ai_memory_llm::LlmWorkload::Rerank)
+            .unwrap()
+            .complete(ChatRequest::user_prompt("ping"))
+            .await
+            .is_err()
+    );
+    let (_, _, body) = get(
+        app(&f, AuthLevel::Root, Some(sources), Recall::default()),
+        true,
+    )
+    .await;
+    assert_check(&body, "llm_task_provider", None);
+    assert!(body.contains("openai/gpt-test"), "{body}");
+    assert!(!body.contains(PLANTED_PROVIDER), "{body}");
+}
+
+/// A page whose only vector was made under another triple must fire
+/// `missing_vectors` now that the count is computed against the configured
+/// embedder's triple: before the count knew the triple, such a page read
+/// as covered and the check stayed silent.
+#[tokio::test]
+async fn missing_vectors_fires_when_the_only_vector_is_from_another_triple() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "models", None)
+        .await
+        .unwrap();
+    // A single page; its only vector is the old model's (8-dim synthetic)
+    // triple.
+    let embedding_wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_embedder(Arc::new(SyntheticEmbedder::new(8)));
+    embedding_wiki
+        .write_page(page(
+            ws,
+            proj,
+            "notes/old-model.md",
+            "the only vector here is stale",
+        ))
+        .await
+        .unwrap();
+    let wiki = embedding_wiki.without_embedder();
+    let f = Fixture {
+        _tmp: tmp,
+        store,
+        wiki,
+    };
+    let sources = HealthSources {
+        ingest: Arc::new(IngestMetrics::default()),
+        providers: ProviderHealth::default(),
+        probe: Arc::new(FixedProbe(ProcessState {
+            write_queue: Some((0, 100)),
+            spool: Some(SpoolState {
+                capacity: 500,
+                ..SpoolState::default()
+            }),
+            journal: Some(JournalState::default()),
+        })),
+    };
+    // The configured embedder is the new model (16-dim synthetic).
+    let (status, _, body) = get(
+        app(&f, AuthLevel::Root, Some(sources), configured_embedder()),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_check(&body, "missing_vectors", Some("ai-memory embed"));
+    // The counter behind it: one latest page without a 16-dim vector.
+    assert!(body.contains("1 latest pages missing"), "{body}");
+    // The row still shows up as a stored triple — the page is not
+    // silently dropped from the index picture.
+    assert!(
+        body.contains("synthetic/bag-of-words-v1 dim 8: 1 rows"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -512,8 +638,9 @@ async fn health_page_refuses_a_db_user_and_admits_root() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(location, None, "a non-root 403 is not a password redirect");
     assert!(body.contains("Root access required"), "{body}");
+    let content = body.split("<main").nth(1).expect("refusal content");
     for leaked in ["Server health", "ai-memory recover", "90/100", "saturated"] {
-        assert!(!body.contains(leaked), "DB user saw {leaked}: {body}");
+        assert!(!content.contains(leaked), "DB user saw {leaked}: {body}");
     }
 
     // Control: root on the same multi-user server.

@@ -4,6 +4,8 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+mod presentation;
+
 use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
@@ -74,6 +76,38 @@ struct Report {
     /// Wiki-format state (2.0 servers).
     #[serde(default)]
     wiki_format: Option<WikiFormatReport>,
+    /// SessionEnd consolidation queue (#1692). Absent from older servers, and
+    /// skipped on the way out so their shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consolidation: Option<ConsolidationReport>,
+}
+
+/// Consolidation queue as the server reports it: counts plus the sessions that
+/// gave up, so a watchdog reads one JSON field instead of parsing logs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsolidationReport {
+    #[serde(default)]
+    pending: u64,
+    #[serde(default)]
+    running: u64,
+    #[serde(default)]
+    completed: u64,
+    #[serde(default)]
+    failed: u64,
+    #[serde(default)]
+    failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session from [`ConsolidationReport`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FailedConsolidationSession {
+    session_id: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    failed_at_us: i64,
+    #[serde(default)]
+    last_error: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -160,29 +194,47 @@ fn last_write_line(unix_ms: Option<u64>) -> String {
     spool_age_line(Some(now_ms.saturating_sub(ms)))
 }
 
-fn report_offline_spool(spool: &SpoolHealth, json: bool) {
+fn report_offline_spool(i18n: &ai_memory_core::i18n::Localizer, spool: &SpoolHealth, json: bool) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
-            eprintln!("local spool (server unreachable): {rendered}");
+            eprintln!(
+                "{}",
+                i18n.format(
+                    "cli-status-local-spool-server-unreachable-rendered",
+                    &[("value0", rendered.to_string())]
+                )
+            );
         }
         return;
     }
-    eprintln!("local spool (server unreachable):");
-    eprintln!("  pending:    {}", spool.pending);
-    eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
-    eprintln!("  retries:    {}", spool.retries_total);
-    if spool.evicting() {
+    eprintln!("{}", i18n.text("cli-status-local-spool-server-unreachable"));
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-pending",
+            &[("value0", format!("{}", spool.pending))]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-oldest",
+            &[("value0", spool_age_line(spool.oldest_age_ms).to_string())]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-retries",
+            &[("value0", format!("{}", spool.retries_total))]
+        )
+    );
+    if spool.at_capacity() {
         eprintln!(
-            "  The spool is full ({} events): each new event evicts the oldest \
-             undelivered one, which is lost. Bring the server back to stop the loss.",
-            spool.capacity
-        );
+            "{}", i18n.format("cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av", &[("value0", format!("{}", spool.capacity))]));
     } else if spool.pending > 0 {
         eprintln!(
-            "  {} event(s) are queued locally and will be delivered once the \
-             server is reachable again.",
-            spool.pending
-        );
+            "{}", i18n.format("cli-status-event-s-are-queued-locally-and-will-be-delivered-once-the-server-is-reachabl", &[("value0", format!("{}", spool.pending))]));
     }
 }
 
@@ -191,23 +243,71 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
 /// outage runs. Goes to stderr like the spool block above, so `--json`
 /// consumers' stdout stays a single object.
 fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
+    for line in offline_recovery_hint_lines(config, spool, json) {
+        eprintln!("{line}");
+    }
+}
+
+/// The hint's lines, or empty when there is nothing to say. Split out from
+/// the `eprintln!` wrapper so both renderings are assertable without a
+/// running server.
+///
+/// An unreadable journal is reported in BOTH renderings. It is what opens
+/// this gate in the first place (it defeats the early return), and a journal
+/// we cannot parse reports `0` pending: staying silent about the error turned
+/// the human line into `repair unrecorded runs (0 journaled)` and the
+/// `--json` object into an all-clear, for a journal that is actually broken.
+/// The online path at `status/presentation.rs` and `journal_error` in
+/// [`json_report`] already treat it as reportable; this matches their label
+/// and key.
+fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool) -> Vec<String> {
     let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
     if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
-        return;
+        return Vec::new();
     }
     if json {
-        eprintln!(
-            "recovery hint (server unreachable): {{\"journal_pending\": {journal_pending},\
-             \"spool_pending\": {}}}",
-            spool.pending
-        );
-        return;
+        let rendered = serde_json::json!({
+            "journal_pending": journal_pending,
+            "journal_error": journal_error,
+            "spool_pending": spool.pending,
+        });
+        return vec![format!("recovery hint (server unreachable): {rendered}")];
     }
-    eprintln!(
+    let mut lines = Vec::new();
+    if let Some(error) = &journal_error {
+        lines.push(format!("  error:      {error}"));
+    }
+    lines.push(format!(
         "  run `{}` once the server is back to deliver queued events and \
          repair unrecorded runs ({journal_pending} journaled)",
         fix_lines::RECOVER
-    );
+    ));
+    lines
+}
+
+/// The missing logon binary while the server is down, on stderr like the
+/// spool block, so `--json` consumers' stdout stays a single object.
+fn report_offline_logon_binary(
+    i18n: &ai_memory_core::i18n::Localizer,
+    problem: Option<&super::user_service::MissingLogonBinary>,
+    json: bool,
+) {
+    let Some(problem) = problem else {
+        return;
+    };
+    if json {
+        if let Ok(rendered) = serde_json::to_string(problem) {
+            eprintln!(
+                "{}",
+                i18n.format(
+                    "cli-status-windows-logon-server-unreachable-rendered",
+                    &[("value0", rendered.to_string())]
+                )
+            );
+        }
+        return;
+    }
+    eprint!("{}", problem.render_human());
 }
 
 /// Which capture mode the hook would enforce for this install (#446).
@@ -226,6 +326,7 @@ fn resolve_capture_mode(data_dir: &std::path::Path) -> &'static str {
 /// Returns an error if the server is unreachable, returns non-2xx, or
 /// the response can't be parsed.
 pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let capture_mode = resolve_capture_mode(&config.data_dir);
 
@@ -238,12 +339,16 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     // the one question this section exists for could not be asked in the one
     // situation that prompts it.
     let spool = spool_health(&spool_dir(&config.data_dir));
+    // Also local, and for the same reason: a quarantined binary (#1280)
+    // usually means nothing is listening.
+    let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
 
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
-            report_offline_spool(&spool, args.json);
+            report_offline_spool(i18n, &spool, args.json);
             report_offline_recovery_hint(config, &spool, args.json);
+            report_offline_logon_binary(i18n, windows_logon.as_ref(), args.json);
             return Err(err);
         }
     };
@@ -266,184 +371,25 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 capture_mode,
                 &ep,
                 auth_posture,
+                windows_logon.as_ref(),
             ))?
         );
     } else {
-        println!("ai-memory {} (server)", report.version);
-        println!("  server:       {}", ep.url);
-        println!("  data-dir:     {}", report.data_dir);
-        println!("  db:           {}", report.db_path);
-        println!("  bind:         {}", report.bind);
-        println!("  auth:         {}", auth_posture.line());
-        println!(
-            "  pages:        {} (all versions: {})",
-            report.counts.pages_latest, report.counts.pages_all
+        presentation::render(
+            &crate::terminal::Terminal::stdout(&config.runtime_env, &config.i18n),
+            presentation::View {
+                report: &report,
+                ep: &ep,
+                spool: &spool,
+                journal_pending,
+                journal_degraded,
+                journal_finish_failed,
+                journal_error: journal_error.as_deref(),
+                capture_mode,
+                auth_posture,
+                windows_logon: windows_logon.as_ref(),
+            },
         );
-        println!("  sessions:     {}", report.counts.sessions);
-        println!("  observations: {}", report.counts.observations);
-        println!(
-            "  fts:          pages {}/{}; observations {}/{}",
-            report.derived.pages_fts_rows,
-            report.derived.pages_rows,
-            report.derived.observations_fts_rows,
-            report.derived.observations_rows
-        );
-        println!(
-            "  embeddings:   {} rows; {} latest pages missing",
-            report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
-        );
-        if report.derived.latest_pages_unembeddable > 0 {
-            println!(
-                "    unembeddable: {} (empty body; no embedder can cover these)",
-                report.derived.latest_pages_unembeddable
-            );
-        }
-        for triple in &report.derived.embedding_triples {
-            println!(
-                "    {}/{} dim {}: {} rows",
-                triple.provider, triple.model, triple.dim, triple.count
-            );
-        }
-        // Only shown when there is something to act on. A recovered count with
-        // no outstanding failures is history, not a problem.
-        if report.derived.embed_failures_unresolved > 0 {
-            println!(
-                "    embed failures: {} unresolved ({} recovered since)",
-                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
-            );
-        }
-        // The figure that makes a `compact` decision possible. Reported
-        // always, so "should I VACUUM?" has an answer other than a guess; the
-        // advisory line only appears once it is worth the exclusive lock.
-        if report.storage.database_bytes > 0 {
-            let pct = (report.storage.reclaimable_bytes as f64
-                / report.storage.database_bytes as f64)
-                * 100.0;
-            println!(
-                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
-                super::compact::human_bytes(report.storage.database_bytes),
-                super::compact::human_bytes(report.storage.reclaimable_bytes),
-            );
-            if let Some(free) = report.storage.data_dir_free_bytes {
-                println!("    filesystem free: {}", super::compact::human_bytes(free));
-            }
-            if fix_lines::reclaim_advised(
-                report.storage.reclaimable_bytes,
-                report.storage.database_bytes,
-            ) {
-                println!(
-                    "    `{}` would return it (blocks writes while it runs)",
-                    fix_lines::COMPACT
-                );
-            }
-        }
-        println!(
-            "  links:        {} latest-page links (unresolved: {}, stale: {})",
-            report.derived.links_from_latest_pages,
-            report.derived.unresolved_links_from_latest_pages,
-            report.derived.stale_links_from_latest_pages
-        );
-        if !report.derived.typed_links_from_latest_pages.is_empty() {
-            let typed: Vec<String> = report
-                .derived
-                .typed_links_from_latest_pages
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect();
-            println!("    typed edges: {}", typed.join(", "));
-        }
-        if let Some(wiki) = &report.wiki_format {
-            let migrated = if wiki.okf_migrated {
-                "OKF v0.2 (migrated)"
-            } else {
-                "OKF v0.2 (native, no migration needed)"
-            };
-            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
-                (Some(path), Some(bytes)) => println!(
-                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
-                     {path} ({})",
-                    super::compact::human_bytes(bytes)
-                ),
-                _ => println!("  wiki format:  {migrated}"),
-            }
-        }
-        if let Some((queued, capacity)) = report.write_queue {
-            // A queue pinned near capacity is the wedged-writer signal.
-            if queued > 0 {
-                println!("  write queue:  {queued}/{capacity}");
-            }
-        }
-        println!("  spool:");
-        println!("    pending:    {}", spool.pending);
-        println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
-        println!("    retries:    {}", spool.retries_total);
-        if journal_pending > 0 || journal_error.is_some() {
-            println!("  recovery:");
-            println!(
-                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
-            );
-            if let Some(error) = &journal_error {
-                println!("    error:      {error}");
-            }
-            println!("    action:     run `{}`", fix_lines::RECOVER);
-        }
-        if let Some(ingest) = &report.ingest {
-            println!("  ingest (server, this process):");
-            println!("    accepted:   {}", ingest.accepted);
-            println!(
-                "    dropped:    {} (capture policy)",
-                ingest.dropped_by_policy
-            );
-            println!(
-                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
-                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
-            );
-            println!(
-                "    drops:      {} unauthorized, {} collision, {} invalid",
-                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
-            );
-            println!(
-                "    shed:       {} saturated, {} rate-limited",
-                ingest.shed_saturated, ingest.shed_rate_limited
-            );
-            println!(
-                "    last write: {}",
-                last_write_line(ingest.last_persisted_ms)
-            );
-        }
-        // #446 + #428 interact here: under allowlist mode an unmarked
-        // repository never sends, so zero counters read exactly like a broken
-        // install. Deliberately outside the ingest block above: the mode is a
-        // client-side fact, and an older server returns no ingest section at
-        // all — which is precisely a case where the operator needs telling.
-        if capture_mode == "allowlist" {
-            println!(
-                "  capture mode: allowlist — repositories without a \
-                 .ai-memory.toml marker send nothing"
-            );
-        }
-        println!("  providers:");
-        println!(
-            "    llm:       {}",
-            provider_health_line(&report.providers.llm)
-        );
-        println!(
-            "    embedding: {}",
-            provider_health_line(&report.providers.embedding)
-        );
-        if report.providers.llm.status == ProviderHealthStatus::Error
-            && let Some(hint) = &report.providers.llm.retry_hint
-        {
-            println!("    retry:     {hint}");
-        }
-        // Only present when `llm_fallbacks` is configured — an older server
-        // or a plain single-provider setup reports an empty list.
-        if !report.providers.llm_candidates.is_empty() {
-            println!("    fallback chain:");
-            for candidate in &report.providers.llm_candidates {
-                println!("      {}", fallback_candidate_line(candidate));
-            }
-        }
     }
     Ok(())
 }
@@ -485,6 +431,41 @@ pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     }
 }
 
+/// This binary's version. `report.version` is the server's, and the two drift
+/// apart when a split install (native client, server in a container or on
+/// another host) upgrades only one side.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The client line of the human report, plus a warning when the client and
+/// the server differ in major version, the only difference the semver policy
+/// treats as breaking. A version that does not start with a number never
+/// warns.
+fn client_version_lines(
+    i18n: &ai_memory_core::i18n::Localizer,
+    server_version: &str,
+    client_version: &str,
+) -> Vec<String> {
+    let mut lines = vec![i18n.one("cli-status-client-version", client_version)];
+    let major = |version: &str| -> Option<u64> {
+        version
+            .trim_start_matches('v')
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    };
+    if let (Some(server), Some(client)) = (major(server_version), major(client_version))
+        && server != client
+    {
+        lines.push(i18n.two(
+            "cli-status-major-version-mismatch",
+            client_version,
+            server_version,
+        ));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn json_report(
     report: Report,
@@ -496,8 +477,9 @@ fn json_report(
     capture_mode: &str,
     endpoint: &ServerEndpoint,
     auth_posture: crate::local_auth::AuthPosture,
+    windows_logon: Option<&super::user_service::MissingLogonBinary>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "version": report.version,
         "data_dir": report.data_dir,
         "bind": report.bind,
@@ -520,28 +502,46 @@ fn json_report(
         },
         "capture_mode": capture_mode,
         "ingest": report.ingest,
-        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "client": {
+            "version": CLIENT_VERSION,
+            "server_url": endpoint.url,
+            "auth": endpoint.auth_token.is_some(),
+        },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
-    })
+    });
+    // Absent when there is nothing to say, so the shape consumers read is
+    // unchanged.
+    if let Some(problem) = windows_logon {
+        value["windows_logon"] = serde_json::json!(problem);
+    }
+    // Present whenever the server reports it; an older server has no queue in
+    // `/admin/status`, and its shape stays exactly as before (#1692).
+    if let Some(consolidation) = report.consolidation {
+        value["consolidation"] = serde_json::json!(consolidation);
+    }
+    value
 }
 
-fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
+fn provider_health_line(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     match role.status {
-        ProviderHealthStatus::Disabled => "disabled".to_string(),
+        ProviderHealthStatus::Disabled => i18n.text("cli-status-provider-disabled"),
         ProviderHealthStatus::Unknown => {
-            format!("{} unknown (no calls yet)", provider_label(role))
+            i18n.one("cli-status-provider-unknown", provider_label(role))
         }
         ProviderHealthStatus::Ok => {
             let when = role
                 .last_call_at
                 .as_ref()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| "unknown time".to_string());
-            format!("{} ok (last call: {when})", provider_label(role))
+                .unwrap_or_else(|| i18n.text("cli-status-time-unknown"));
+            i18n.two("cli-status-provider-ok", provider_label(role), when)
         }
         ProviderHealthStatus::Error => {
-            let detail = error_detail(role);
-            format!("{} error ({detail})", provider_label(role))
+            let detail = error_detail(i18n, role);
+            i18n.two("cli-status-provider-error", provider_label(role), detail)
         }
     }
 }
@@ -555,7 +555,10 @@ fn provider_label(role: &ProviderRoleHealthSnapshot) -> String {
     }
 }
 
-fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
+fn error_detail(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     let mut parts = Vec::new();
     if let Some(status) = role.last_error_status {
         parts.push(format!("status {status}"));
@@ -566,7 +569,7 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
         parts.push(message.clone());
     }
     if let Some(when) = &role.last_error_at {
-        parts.push(format!("last error: {when}"));
+        parts.push(i18n.one("cli-status-last-error", when));
     }
     if parts.is_empty() {
         "last call failed".to_string()
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {
-        let report: Report = serde_json::from_value(serde_json::json!({
+        let report_json = serde_json::json!({
             "version": "2.6.0",
             "data_dir": "/data",
             "bind": "127.0.0.1:49374",
@@ -604,8 +607,8 @@ mod tests {
             "ingest": null,
             "write_queue": null,
             "wiki_format": null
-        }))
-        .unwrap();
+        });
+        let report: Report = serde_json::from_value(report_json.clone()).unwrap();
         let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
         let value = json_report(
             report,
@@ -617,7 +620,9 @@ mod tests {
             "denylist",
             &endpoint,
             crate::local_auth::AuthPosture::NoneLoopback,
+            None,
         );
+        assert!(value.get("windows_logon").is_none(), "{value}");
         assert_eq!(value["auth_posture"]["posture"], "none_loopback");
         assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
         for key in [
@@ -638,6 +643,180 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
+
+        // The server's version stays at the top level; the client's is new.
+        assert_eq!(value["version"], "2.6.0");
+        assert_eq!(value["client"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["client"]["server_url"], "http://127.0.0.1:49374");
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
+
+        // A missing logon binary (#1280) adds one key and changes no other.
+        let problem = super::super::user_service::MissingLogonBinary {
+            classification: super::super::user_service::LOGON_BINARY_MISSING,
+            executable: r"C:\bin\ai-memory.exe".into(),
+            detail: "gone".into(),
+            fix: "restore it",
+        };
+        let warned = json_report(
+            serde_json::from_value(report_json).unwrap(),
+            SpoolHealth::default(),
+            2,
+            1,
+            1,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            Some(&problem),
+        );
+        assert_eq!(
+            warned["windows_logon"]["classification"],
+            "logon_binary_missing"
+        );
+        assert_eq!(
+            warned["windows_logon"]["executable"],
+            r"C:\bin\ai-memory.exe"
+        );
+        assert_eq!(warned["windows_logon"]["fix"], "restore it");
+        let mut without = warned.clone();
+        without.as_object_mut().unwrap().remove("windows_logon");
+        assert_eq!(without, value);
+    }
+
+    #[test]
+    fn client_version_line_warns_only_across_a_major_version() {
+        let same = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "3.1.1",
+            "3.1.1",
+        );
+        assert_eq!(same, ["ai-memory 3.1.1 (client)"]);
+        // A minor or patch difference is shown, not warned about.
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "3.2.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "v3.0.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
+
+        let across = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "2.6.0",
+            "3.1.1",
+        );
+        assert_eq!(across.len(), 2, "{across:?}");
+        assert!(
+            across[1].contains("client is 3.1.1 but the server is 2.6.0"),
+            "{across:?}"
+        );
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "4.0.0",
+                "3.1.1"
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn client_version_line_never_warns_on_an_unparseable_version() {
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "dev", "3.1.1").len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "", "3.1.1").len(),
+            1
+        );
     }
 
     #[test]
@@ -717,10 +896,18 @@ mod tests {
         );
 
         // Both render paths must tolerate an empty spool.
-        report_offline_spool(&SpoolHealth::default(), false);
-        report_offline_spool(&SpoolHealth::default(), true);
-        report_offline_spool(&spool, false);
-        report_offline_spool(&spool, true);
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            true,
+        );
+        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, false);
+        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, true);
     }
 
     /// A pre-#629 server's `/admin/status` response has no
@@ -752,7 +939,10 @@ mod tests {
     #[test]
     fn provider_health_line_renders_unknown_and_disabled() {
         assert_eq!(
-            provider_health_line(&ProviderRoleHealthSnapshot::default()),
+            provider_health_line(
+                &ai_memory_core::i18n::Localizer::default(),
+                &ProviderRoleHealthSnapshot::default()
+            ),
             "disabled"
         );
 
@@ -763,7 +953,7 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
         assert_eq!(
-            provider_health_line(&role),
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role),
             "openai/gpt-5.5 unknown (no calls yet)"
         );
     }
@@ -781,9 +971,18 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
 
-        assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
-        assert!(provider_health_line(&role).contains("status 401"));
-        assert!(provider_health_line(&role).contains("bad token"));
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("anthropic-oauth/claude-sonnet-4-6 error")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("status 401")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("bad token")
+        );
     }
 
     #[test]
@@ -820,6 +1019,73 @@ mod tests {
         assert!(line.contains("openai-compat/local-router"));
         assert!(line.contains("circuit open until"));
         assert!(!line.contains("last error"));
+    }
+
+    /// A `Config` whose data dir is `dir`, so the journal read under test
+    /// hits a temp dir rather than the developer's real install.
+    fn config_for(dir: &std::path::Path) -> Config {
+        Config {
+            data_dir: dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn offline_recovery_hint_reports_an_unreadable_journal_to_humans() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let lines =
+            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("error:"),
+            "an unreadable journal must be named, not reported as `0 journaled`: {rendered}"
+        );
+        assert!(
+            rendered.contains("recovery-journal.json"),
+            "the error must say which file failed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_hint_json_reports_an_unreadable_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let lines =
+            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let payload = lines[0].split_once(": ").expect("prefix then object").1;
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["journal_pending"], 0);
+        assert!(
+            value["journal_error"].is_string(),
+            "a monitoring consumer must not read `journal_pending: 0` as an \
+             all-clear while the journal is unreadable: {value}"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_hint_stays_quiet_on_a_healthy_install() {
+        let temp = tempfile::tempdir().unwrap();
+        for json in [false, true] {
+            assert!(
+                offline_recovery_hint_lines(
+                    &config_for(temp.path()),
+                    &SpoolHealth::default(),
+                    json
+                )
+                .is_empty(),
+                "nothing queued and no journal error must print nothing (json={json})"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,16 @@ standardized. The files are greppable, open in Obsidian, and import into
 anything OKF-aware. Nothing is locked in: the export is a validated copy of
 the files ai-memory already stores its memory in.
 
+Local wikilink labels containing brackets or backslashes remain ordinary
+Markdown links in an exported bundle. Reindexing the extracted concept files
+preserves their link targets.
+
+Backup and OKF export downloads replace their output only after the whole
+response arrives. An interrupted download keeps the previous archive intact.
+New files and replacement symlinks are private; existing regular files keep
+their permissions and still require write access. Read-only files and
+directory destinations are refused. A symlink target is never changed.
+
 The rest of this page is the design: how conformance is enforced and
 how existing stores migrate.
 
@@ -49,6 +59,11 @@ families. Summary of what conformance requires:
 
 ## Field mapping
 
+Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
+to `notes/my note.md`. Import and the web UI decode that path once before
+resolving it. A literal percent sequence in a filename uses `%25` in a
+Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
+
 | OKF key | ai-memory source |
 |---|---|
 | `type` (required) | derived from path family + existing frontmatter: `sessions/` → `Session Summary`, `_rules/` → `Rule`, `gotchas/` → `Gotcha`, `decisions/` → `Decision`, `procedures/` → `Procedure`, `concepts/` → `Concept`, `notes/` → `Note`, `runbooks/` → `Runbook`, `_slots/` → `Invariant`/`State` (from `slot_kind`), `_lint/` → `Lint Report`, `_pending/` → `Pending Note`; `kind:` frontmatter (`fact`/`note`/`procedure`/`decision`) wins over the path default when present |
@@ -63,7 +78,10 @@ families. Summary of what conformance requires:
 
 Extension fields kept verbatim (unknown keys are conformant): `tier`,
 `kind`, `slot_kind`, `entities`, `pinned`, `consolidated`,
-`session_id`, `agent`, `summary`, `expires_at`.
+`session_id`, `agent`, `summary`, `expires_at`, `source_files`.
+`source_files` (`[{path, commit}]`, the repository files a page describes) is
+deliberately a separate key: OKF `sources` holds the page's session
+provenance, and the two never share entries.
 
 ## Bundle boundary
 
@@ -101,7 +119,7 @@ Order is fixed; each step gates the next:
 1. **Proactive backup, first, always.** The migration compresses the
    entire data dir (wiki, SQLite DB, manifests) to
    `~/ai-memory-backup-pre-2.0-<date>.tar.gz` (outside the data dir),
-   verifies the archive is listable and size-sane, and **aborts if the
+   fsyncs it, verifies the archive is listable and size-sane, and **aborts if the
    backup cannot be written or verified**. The archive path is recorded
    in the wiki meta manifest.
 2. **In-place frontmatter rewrite.** Same page id, same version row,

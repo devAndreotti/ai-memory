@@ -53,3 +53,4 @@ perf.data*
 *.bak-*
 evals/datasets/
 evals/models/
+evals/.cache/

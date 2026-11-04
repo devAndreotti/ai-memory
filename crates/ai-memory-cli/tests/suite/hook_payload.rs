@@ -27,6 +27,24 @@ fn run_hook_full_agent(
     payload: &[u8],
     capture_assistant: bool,
 ) -> Output {
+    run_hook_at(
+        data_dir,
+        agent,
+        event,
+        payload,
+        capture_assistant,
+        &ai_memory_test_support::dead_http_endpoint(),
+    )
+}
+
+fn run_hook_at(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    payload: &[u8],
+    capture_assistant: bool,
+    server: &str,
+) -> Output {
     let mut args = vec![
         "hook".to_string(),
         "--event".to_string(),
@@ -34,7 +52,7 @@ fn run_hook_full_agent(
         "--agent".to_string(),
         agent.to_string(),
         "--server-url".to_string(),
-        ai_memory_test_support::dead_http_endpoint(),
+        server.to_owned(),
     ];
     if capture_assistant {
         args.push("--capture-assistant".to_string());
@@ -89,6 +107,125 @@ fn spooled_entry(data_dir: &Path) -> serde_json::Value {
     assert_eq!(entries.len(), 1);
     serde_json::from_slice(&std::fs::read(entries[0].path()).expect("read spool entry"))
         .expect("parse spool entry")
+}
+
+#[test]
+fn native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure() {
+    for agent in ["claude-code", "codex"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        let text=(1..=300).map(|n| {
+            let row=if agent=="claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":format!("r-{n}"),"usage":{"input_tokens":100,"output_tokens":20}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100*n,"output_tokens":20*n}}}})
+            };
+            format!("{row}\n")
+        }).collect::<String>();
+        std::fs::write(&transcript, text).unwrap();
+        let payload=serde_json::json!({"session_id":"native-backlog","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo test"},"tool_response":"test"}).to_string();
+        let endpoint = ai_memory_test_support::dead_http_endpoint();
+        std::fs::write(tmp.path().join("hook-spool"), "unwritable spool fixture").unwrap();
+        let failed = run_hook_at(
+            tmp.path(),
+            agent,
+            "post-tool-use",
+            payload.as_bytes(),
+            false,
+            &endpoint,
+        );
+        assert!(failed.status.success());
+        std::fs::remove_file(tmp.path().join("hook-spool")).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for expected in [256, 300, 300] {
+            let output = run_hook_at(
+                tmp.path(),
+                agent,
+                "post-tool-use",
+                payload.as_bytes(),
+                false,
+                &endpoint,
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for entry in spool_entries(tmp.path()) {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(v["body"].as_str().unwrap()).unwrap();
+                if let Some(calls) = body["_ai_memory_usage_calls"].as_array() {
+                    assert!(calls.len() <= 256);
+                    ids.extend(
+                        calls
+                            .iter()
+                            .map(|c| c["call_id"].as_str().unwrap().to_owned()),
+                    );
+                }
+            }
+            assert_eq!(
+                ids.len(),
+                expected,
+                "{agent} must recover the backlog across separate hook processes"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
+    for agent in ["claude-code", "codex"] {
+        for event in [
+            "post-tool-use",
+            "stop",
+            "pre-compact",
+            "session-end",
+            "pre-tool-use",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let transcript = tmp.path().join("transcript.jsonl");
+            let row = if agent == "claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":"response-1","model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":80,"cache_creation_input_tokens":10}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800},"last_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800}}}})
+            };
+            std::fs::write(&transcript, format!("{row}\n{row}\n")).unwrap();
+            let payload = serde_json::json!({"session_id":"live-native-hook","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo fixture"},"tool_response":"fixture"});
+            let output = run_hook_full_agent(
+                tmp.path(),
+                agent,
+                event,
+                payload.to_string().as_bytes(),
+                false,
+            );
+            assert!(
+                output.status.success(),
+                "{agent}/{event}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let delivered: serde_json::Value =
+                serde_json::from_str(&spooled_body(tmp.path())).unwrap();
+            if event == "pre-tool-use" {
+                assert!(delivered.get("_ai_memory_usage_calls").is_none());
+                continue;
+            }
+            let calls = delivered["_ai_memory_usage_calls"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{agent}/{event} did not report live usage"));
+            assert_eq!(calls.len(), 1, "A replay is not a second response");
+            assert_eq!(
+                calls[0]["input_tokens"],
+                if agent == "codex" { 200 } else { 100 }
+            );
+            assert_eq!(
+                calls[0]["cache_read_tokens"],
+                if agent == "codex" { 800 } else { 80 }
+            );
+            assert_eq!(calls[0]["output_tokens"], 20);
+        }
+    }
 }
 
 #[test]
@@ -456,4 +593,85 @@ fn codex_capture_off_does_not_capture_assistant_message() {
     );
     // Unrelated fields survive so the Codex Stop event is still ingested.
     assert!(body.contains("codex-off"), "session_id was dropped: {body}");
+}
+
+// --- Lone UTF-16 surrogate escapes -----------------------------------------
+//
+// A harness that cuts tool output in the middle of an emoji can send half of a
+// `\uD83D\uDE00` pair. `serde_json` rejects that escape, and so does the
+// server's JSON extractor, so the hook replaces only the unpaired half with
+// U+FFFD instead of dropping the whole event.
+
+fn spooled_stdout(tmp: &Path, payload: &[u8]) -> String {
+    let output = run_hook_event(tmp, "post-tool-use", payload);
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&spooled_body(tmp)).expect("spooled body is JSON");
+    body["tool_response"]["stdout"]
+        .as_str()
+        .expect("tool_response.stdout")
+        .to_owned()
+}
+
+#[test]
+fn lone_leading_surrogate_escape_is_spooled_as_replacement_character() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"lone-lead","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"ok \ud83d\n... (truncated)"}}"#;
+    assert_eq!(
+        spooled_stdout(tmp.path(), payload),
+        "ok \u{FFFD}\n... (truncated)"
+    );
+}
+
+#[test]
+fn lone_trailing_surrogate_escape_is_spooled_as_replacement_character() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"lone-trail","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"\ude00 tail"}}"#;
+    assert_eq!(spooled_stdout(tmp.path(), payload), "\u{FFFD} tail");
+}
+
+#[test]
+fn surrogate_repair_keeps_pairs_and_escaped_backslashes() {
+    // A lead followed by a full pair: only the first lead is unpaired. The
+    // `\\ud83d` is an escaped backslash followed by text, not an escape.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"mixed","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"\ud83d\ud83d\ude00 \\ud83d \\\ude00"}}"#;
+    assert_eq!(
+        spooled_stdout(tmp.path(), payload),
+        "\u{FFFD}\u{1F600} \\ud83d \\\u{FFFD}"
+    );
+}
+
+#[test]
+fn payload_with_a_full_surrogate_pair_keeps_its_exact_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"pair","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"ok \ud83d\ude00"}}"#;
+    let output = run_hook_event(tmp.path(), "post-tool-use", payload);
+    assert!(output.status.success());
+    assert_eq!(spooled_body(tmp.path()).as_bytes(), payload);
+}
+
+#[test]
+fn malformed_payload_with_a_lone_surrogate_still_warns_without_spooling() {
+    // Invalid JSON stays invalid after the repair; a backslash before a
+    // multibyte character or at the end must not crash the hook.
+    for payload in [
+        r#"{"x":"\ud83d \é"#.as_bytes(),
+        r#"{"x":"\ud83d \"#.as_bytes(),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = run_hook(tmp.path(), payload);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr utf8"),
+            "ai-memory hook warning: could not parse event payload as JSON; nothing was captured\n"
+        );
+        assert!(!tmp.path().join("hook-spool").exists());
+    }
 }

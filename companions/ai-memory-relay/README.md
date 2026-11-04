@@ -79,7 +79,8 @@ ai-memory-relay flush --queue-dir "$HOME/.ai-memory-relay"
 ai-memory-relay status --queue-dir "$HOME/.ai-memory-relay"
 ```
 
-`enqueue` validates the whole array and commits it in one transaction. Each body
+`enqueue` validates the whole array and commits it in one transaction. A leading
+UTF-8 byte-order mark in the file is skipped. Each body
 must be an object with explicit `session_id` and `cwd` strings. Use the harness's
 native identity and canonical hook event names. Sensitive identities are refused
 without renaming them. Shared private capture helpers scrub new body text and
@@ -121,6 +122,12 @@ partial success in HTTP 200 or 429 responses. Malformed acknowledgements,
 authentication failures and transport errors retain unacknowledged events.
 A failed head blocks its own session. HTTP 429 ends the flush; the caller should
 back off before scheduling another one.
+
+An HTTP response whose body exceeds the 64 KiB acknowledgement limit also ends
+the flush without a transport retry. Its status is preserved, its body is never
+parsed or printed, and the batch stays pending. This includes oversized 200/429
+acknowledgements and error responses such as 413 or 500; only transport failures
+trigger the bounded automatic retries within a flush.
 
 An acknowledgement can also mean the server deliberately dropped an event, for
 example because of capture policy or a session identity collision. A drained

@@ -49,7 +49,9 @@ automatically, and (with an LLM) consolidation compiles them into pages.
 Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
-prepended to the agent's context automatically. To make it apply to **all** your
+prepended to the agent's context automatically: an excerpt of every rule first,
+whole bodies while the budget lasts, and `memory_read_page` for the rest. Pin
+the rule to have it shown in full before the others. To make it apply to **all** your
 projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
@@ -58,6 +60,27 @@ another project's page, link to that standing page with `[[_global:path]]`, whic
 always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
+
+## Recipe: notice when a page's code has changed
+
+> "Remember this deploy gotcha; it is about `bin/deploy.sh`."
+
+Your agent can pass `source_files` to `memory_write_page`: the repository
+files the page describes, each with the commit it was checked against
+(`[{"path": "bin/deploy.sh", "commit": "3f2a9c1"}]`, up to 16). The server
+stores the list in the page's frontmatter and never opens the files, so it
+works the same against a remote or containerized server. To check a page, read
+it, then run this from the checkout for each entry:
+
+```bash
+git --literal-pathspecs diff --quiet 3f2a9c1 -- bin/deploy.sh
+```
+
+A non-zero exit, or a path that no longer exists, means the file changed:
+record `memory_feedback` with `signal: "stale"` and a reason such as
+`source-changed: bin/deploy.sh since 3f2a9c1`. The page drops in rank and shows
+up as a `feedback_flagged` finding in `memory_lint`. Rewriting the page with
+the new commit clears the flag.
 
 ## Recipe: stop re-explaining your habits in every new project
 
@@ -120,6 +143,39 @@ bring an existing body of documents in as project memory:
 Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
+
+## Recipe: bootstrap many repositories at once
+
+`ai-memory bootstrap` seeds a project from its git log, README and docs. Run it
+from several shells (or a loop with `&`) to seed many repositories; the server
+decides how many call the LLM at a time with `bootstrap_max_concurrent`
+(default 1). Runs for the same project always wait for each other, and chunks
+within one run stay sequential, so the largest repository sets the floor.
+
+- **Local GPU (vLLM, llama.cpp server):** the server batches concurrent
+  requests, so a single run leaves it mostly idle. Raise the limit until the
+  engine starts queueing (vLLM's `num_requests_waiting` metric) or its KV
+  cache fills; 4–8 per GPU is a reasonable start.
+- **Hosted API (DeepSeek, OpenAI, …):** each call is latency-bound, so the
+  speedup is close to linear until your account's rate or concurrency limit.
+  Set the limit below that quota.
+- **Hosted API with a fallback:** add a `[[llm_fallbacks]]` entry. When the
+  primary answers `429`, its circuit opens for the provider's `Retry-After` and
+  the remaining runs go to the next candidate instead of failing.
+
+```toml
+llm_provider = "openai-compat"
+llm_model = "deepseek-chat"
+llm_base_url = "https://api.deepseek.com/v1"   # key from the LLM_API_KEY env var
+bootstrap_max_concurrent = 8
+
+# Takes the overflow while the primary is rate-limited.
+[[llm_fallbacks]]
+provider = "openai-compat"
+model = "<another-model>"
+base_url = "<another OpenAI-compatible endpoint>/v1"
+api_key_env = "FALLBACK_API_KEY"
+```
 
 ## Coming from agentmemory
 
@@ -274,11 +330,12 @@ compacted or merged stays in git and the supersession chain, recoverable with
 - **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
-- **Surface likely contradictions:** run `memory_lint` (through your agent or the
-  CLI); with embeddings configured it flags pairs of same-topic pages that look
-  like they conflict, advisory only. Similarity reads shared vocabulary as much
-  as disagreement, so a single-domain or single-language store yields mostly
-  candidate pairs: read each finding as a pair to check, not as a defect. If
+- **Review similar knowledge:** run `memory_lint` (through your agent or the
+  CLI); with embeddings configured it emits `similarity_candidate` findings
+  for same-topic page pairs, advisory only. Similarity reads shared vocabulary
+  as much as disagreement, so read each candidate as a pair to check, not as a
+  contradiction or a supersession instruction. Explicit `contradicts` edges
+  remain `contradiction` findings. If
   that noise is too high, raise `contradiction_band_min` (`config.toml` or
   `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`). On such a store the
   band measures domain proximity more than conflict, so a higher floor trims
@@ -289,6 +346,34 @@ compacted or merged stays in git and the supersession chain, recoverable with
   moment you return. It is off by default, never deletes a source, and is gated on
   an internal recall eval before it could ever become default behavior.
 
+## Recipe: long sessions on a small context window
+
+A local model with a context window around 200k tokens, or any long-horizon
+session, compacts again and again. Each compaction keeps a lossy summary, and
+the first thing it loses is the start of the session: the task you gave, its
+constraints, the early decisions. ai-memory has the prompts you actually
+typed, so the agent can re-ground on them.
+
+- On Claude Code, Codex, Factory Droid and OpenCode V1/V2, after each
+  compaction the hooks inject a small post-compaction anchor (about 2,000
+  characters by default) with the session's first and latest prompts, and the
+  installed instructions tell the agent to trust it over the summary.
+- On Gemini CLI, Cursor, Copilot CLI, Kimi Code, Grok, Kiro, Cline, Muse and
+  the rest, nothing is injected: the routing block and the handoff skill tell
+  the agent to read its own session's prompts with
+  `memory_read_session_observations` after a compaction. Install the managed
+  routing (`ai-memory install-instructions`, or ask "install ai-memory
+  routing") so every session gets that rule.
+- Anywhere the hooks answer a prompt, you can start one with
+  `reload context` to get the stretch the last compaction dropped, for example
+  `reload context, then finish the migration`.
+
+Codex's `compact_prompt` setting replaces Codex's whole compaction prompt and
+applies only to local providers, so it cannot add one line the way the OpenCode
+hook does. Change it only if you mean to rewrite how Codex summarizes. See
+[`usage.md`](usage.md#reload-context-after-a-compaction) for the per-harness
+details.
+
 ## Recipe: two agents / two repos working together
 
 - **Continuity across agents in the same project** (quit Claude Code, open Codex
@@ -298,6 +383,38 @@ compacted or merged stays in git and the supersession chain, recoverable with
   project's context here: use cross-project messaging. Say "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
+
+## Recipe: ask an operator to decide
+
+When an orchestrator has to stop for a person, send a normal cross-project
+message and poll for a normal reply. The subject lines are the shared
+convention; `memory_message_send` and `memory_message_list` are the tools.
+
+1. Send to the project the operator reads. `subject` is
+   `decision: <short question>`. The body names the question, each option's
+   `id` and label, and `reply_project: <your workspace>/<your project>`.
+   Save the returned `message_id`. You need write on that mailbox project,
+   and it must already exist.
+2. The operator, or a companion, answers with `memory_message_send` back to
+   `reply_project`. `subject` is `decision-reply: <message_id>`. The body
+   carries `option: <id>`. Sending the reply needs write on your project.
+3. Poll `memory_message_list` on your inbox until a pending row's subject is
+   that exact `decision-reply:` line. The oldest match is the answer. Pop it
+   when you take it, then `memory_message_cancel` the question.
+
+Before you act on a `requires_root: true` decision, compare `from_owner_user`
+on the reply with the root identity you were configured with. It is
+attribution, not a role, and it is empty on anonymous and single-operator
+servers, so treat an empty value as not root. The server itself does not check
+who answers. `/web` shows the mailbox and leaves every message pending.
+
+The list is oldest-first, 50 rows by default and 200 at most, so keep the
+inbox you poll from drained. A companion can wake on the `message_send`
+observer webhook, then list; the webhook carries scope and actor, and the
+orchestrator still polls.
+
+Full layout and limits:
+[`agent-messaging.md`](agent-messaging.md#operator-decisions-by-subject-and-body).
 
 ## Recipe: several accounts or an external launcher
 
@@ -384,6 +501,14 @@ ai-memory run --yolo claude
   flags on purpose: they would collide with the harness's own flags (Claude
   Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
   your installed ai-jail lacks are hidden, and naming one is an error.
+- **Connecting back to ai-memory.** The jailed process automatically receives
+  the resolved server URL and URL base path, including a remote server from
+  `config.toml`. A root bearer read from `config.toml` or
+  `bearer_token_file` is not exposed to the managed harness; the launch stops
+  instead. For an authenticated server, give the launch a least-privilege API
+  token with `AI_MEMORY_AUTH_TOKEN=... ai-memory run --jail ...`, or run
+  without the jail. An explicitly supplied environment token already belongs
+  to the child-process boundary and is forwarded.
 - **A project `.ai-jail` wins.** If the directory you launch from has its own
   `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
   no toggles; `--jail=…` still applies its list on top. A project file cannot
@@ -500,6 +625,8 @@ ai-memory list-projects              # every workspace/project the server knows 
 ai-memory project init               # pin this checkout's scope in a .ai-memory.toml
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
+ai-memory search "wal mode"          # FTS5 lookup in this project
+ai-memory recent                     # newest wiki pages in this project
 ai-memory write-page …               # save a durable page
 ai-memory handoffs                   # list open handoffs for the project
 ai-memory message list               # cross-project inbox
@@ -507,6 +634,11 @@ ai-memory server list                # server profiles a marker can route to
 ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```
+
+On an interactive terminal, `status` and `doctor` group and wrap their output
+for readability. Redirected output, JSON, `NO_COLOR`, and `TERM=dumb` remain
+plain; see [Diagnostic report presentation](diagnostics.md) for the exact
+contract.
 
 ## When it isn't doing what you expect
 
@@ -569,11 +701,11 @@ ai-memory serve                      # run the server
   exclusions.
 - **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
   with the server down and says so; it reports the local hook spool (events
-  waiting for the server, and a warning once it is full and each new event
-  evicts the oldest undelivered one); and when ai-memory's Codex hooks are
-  installed, it asks Codex whether it will run them. Codex skips a hook you
-  have not trusted, and skips it again after its command changes, without
-  telling you: open Codex, run `/hooks`, and trust them.
+  waiting for the server, and a warning once it is full and newly captured
+  events are dropped until space is available); and when ai-memory's Codex
+  hooks are installed, it asks Codex whether it will run them. Codex skips a
+  hook you have not trusted, and skips it again after its command changes,
+  without telling you: open Codex, run `/hooks`, and trust them.
 - **Agents keep calling `memory_recall`, `memory_save` or other tools ai-memory
   does not have**: agentmemory's MCP entry or its rules-file guideline block is
   still there. `ai-memory doctor` names each one with the fix (see
@@ -584,7 +716,9 @@ ai-memory serve                      # run the server
   empty store) so it isn't starting from nothing. It runs automatically in the
   background; you can trigger or preview it yourself with `ai-memory backfill`
   (`--dry-run` to see what it would import), or turn it off with
-  `AI_MEMORY_BACKFILL_ON_START=false`.
+  `AI_MEMORY_BACKFILL_ON_START=false`. A single transcript record over 1 MiB
+  (usually a screenshot in a tool result) is skipped and counted on stderr;
+  the rest of that session is still imported.
 - **A search misses something you saved**: confirm the scope. Memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.

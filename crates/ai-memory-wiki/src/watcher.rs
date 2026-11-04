@@ -12,7 +12,10 @@
 //!    raw event ledgers, and symlinks). Catches any events the OS dropped
 //!    (basic-memory #580 — file watchers go stale under FSEvents buffer
 //!    overflow, hidden-dir globs, etc.). Hidden-directory paths are
-//!    explicitly NOT skipped (#798 lesson).
+//!    explicitly NOT skipped (#798 lesson). A file whose metadata matches
+//!    the last pass that indexed it is skipped: reindexing it would be a
+//!    no-op, and doing that for every page every tick kept a large wiki's
+//!    server busy while idle (#1975).
 //!
 //! Deletions are not reconciled (see #929): the watcher only handles
 //! create/modify events, so a page whose file disappears stays indexed until
@@ -44,6 +47,20 @@ use crate::wiki::Wiki;
 
 /// Reconciliation tick interval.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How recent a file's mtime or change time may be, relative to the start of
+/// the reconcile pass that walked it, before the pass refuses to trust its
+/// fingerprint (git's "racily clean" rule). A same-length edit landing after
+/// the reindex read but inside the same timestamp tick leaves a fingerprint
+/// identical to the recorded one; if its notify event was also dropped, the
+/// skip would hide that edit until the file changed again. Any such edit
+/// happens after the pass started, so its timestamp, truncated to the
+/// filesystem's granularity, is at most one tick before the pass start. Five
+/// seconds covers the coarsest common tick (FAT's 2 s; HFS+ and many SMB/NFS
+/// servers use 1 s) with room for a few seconds of skew between this clock
+/// and a network filesystem server's. The cost is one extra read, on the next
+/// pass, of a file written in the last few seconds.
+const RACY_FINGERPRINT_WINDOW: Duration = Duration::from_secs(5);
 
 /// Debounce window for filesystem events.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
@@ -166,6 +183,7 @@ async fn run_loop(
     // for the same reason `consecutive_failures` does: it is this task's own
     // pass-to-pass memory, not shared server state.
     let mut missing_streaks: MissingStreaks = HashMap::new();
+    let mut indexed_fingerprints: IndexedFingerprints = HashMap::new();
 
     loop {
         tokio::select! {
@@ -178,7 +196,7 @@ async fn run_loop(
                 handle_event(&wiki, event).await;
             }
             _ = tick.tick() => {
-                match reconcile(&wiki, &mut missing_streaks).await {
+                match reconcile(&wiki, &mut missing_streaks, &mut indexed_fingerprints).await {
                     Ok(_) => {
                         if consecutive_failures > 0 {
                             tracing::info!(
@@ -242,9 +260,23 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_git_internal(wiki.root(), raw_path) {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
-            // Likely a transient state (mv, atomic rename in flight).
-            continue;
+        let metadata = match std::fs::symlink_metadata(raw_path) {
+            Ok(metadata) => metadata,
+            // A rename away from a watched path arrives as
+            // `Modify(Name(RenameMode::From))`, not as a `Remove`, and its
+            // path is already gone. Unreported, the next path-scoped commit
+            // keeps the old blob in its tree, so a checkpoint taken in that
+            // window records a page that no longer exists. Reporting a path
+            // that was merely mid-rename is harmless: staging re-adds a file
+            // that still exists.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !is_tempfile(raw_path) {
+                    wiki.git().mark_written(raw_path);
+                }
+                continue;
+            }
+            // Likely a transient state (an atomic rename in flight).
+            Err(_) => continue,
         };
         let ft = metadata.file_type();
         if crate::confinement::is_link_like(&metadata) {
@@ -281,28 +313,11 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_reserved_page_file(raw_path, &page_path) {
             continue;
         }
-        // A tombstoned session's page must not come back from a file its
-        // purge could not remove (#701). The path shape decides whether the
-        // lookup is worth a round trip: only `sessions/<id>.md` can be that
-        // file, so an ordinary edit to `index.md` or a decision page never
-        // queries. The sweep paths amortise the same set over a whole
-        // directory instead; this one sees a single file per event.
-        if let Some(session) = crate::wiki::session_id_for_page(&page_path) {
-            match wiki.purged_sessions(ws, proj).await {
-                Ok(purged) if purged.contains(&session) => {
-                    debug!(path = %page_path, "ignoring event for a purged session page");
-                    continue;
-                }
-                Ok(_) => {}
-                // Fails open, deliberately: a transient lookup error must not
-                // stop the watcher from indexing edits. The cost of failing
-                // open here is bounded — the next reconcile pass loads the set
-                // again and skips the page then.
-                Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
-            }
-        }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
+            Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                debug!(path = %page_path, "ignoring event for a purged session page");
+            }
             Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
         }
     }
@@ -352,21 +367,12 @@ async fn reindex_project_dir(
         }
     };
 
-    // Fails open for the same reason the single-event path does: a lookup
-    // error must not stop a directory event from indexing. `Wiki::reindex_all`
-    // is the one caller that fails closed, because an operator-triggered
-    // reindex should report the failure rather than quietly skip the gate.
-    let purged = wiki.purged_sessions(ws, proj).await.unwrap_or_else(|e| {
-        warn!(error = %e, "purged-session lookup failed; not gating this pass");
-        std::collections::HashSet::new()
-    });
     for path in pages {
-        if crate::wiki::is_purged_session_page(&path, &purged) {
-            debug!(path = %path, "skipping a purged session page");
-            continue;
-        }
         match wiki.reindex_page(ws, proj, path.clone()).await {
             Ok(_) => debug!(path = %path, "reindexed via watcher directory event"),
+            Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                debug!(path = %path, "skipping a purged session page");
+            }
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
         }
     }
@@ -393,7 +399,78 @@ pub(crate) struct ReconcileStats {
     /// (design item #4) — too many candidates looked missing at once, so
     /// nothing in that scope was tombstoned or counted toward a streak.
     pub circuit_broken_scopes: usize,
+    /// Pages not reindexed because their file is unchanged since the pass
+    /// that last indexed it (#1975).
+    pub skipped_unchanged: usize,
 }
+
+/// What a file looked like when a reconcile pass last indexed it. Equal
+/// fingerprints mean the bytes on disk are the ones already in the store, so
+/// the pass can skip the read, parse and store round trips for that page.
+///
+/// The inode and change time catch what length and mtime alone can miss: an
+/// atomic tmp+rename save gets a new inode, and any content write or
+/// `touch -m` back to an old mtime moves the change time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileFingerprint {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileFingerprint {
+    /// `None` when the platform reports no mtime: such a file is reindexed
+    /// on every pass, as before, rather than skipped on weaker evidence.
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    /// True when the file's mtime (or, on unix, change time) is too close to
+    /// `pass_started`, or after it, for an equal fingerprint to prove the
+    /// file unchanged. See [`RACY_FINGERPRINT_WINDOW`].
+    fn is_racy(&self, pass_started: std::time::SystemTime) -> bool {
+        let Some(threshold) = pass_started.checked_sub(RACY_FINGERPRINT_WINDOW) else {
+            return true;
+        };
+        if self.modified >= threshold {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            let threshold_nanos = match threshold.duration_since(std::time::UNIX_EPOCH) {
+                Ok(since_epoch) => since_epoch.as_nanos() as i128,
+                Err(before_epoch) => -(before_epoch.duration().as_nanos() as i128),
+            };
+            let changed_nanos =
+                i128::from(self.changed.0) * 1_000_000_000 + i128::from(self.changed.1);
+            if changed_nanos >= threshold_nanos {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Per-`(workspace, project, path)` fingerprint of each file as of the
+/// reconcile pass that last indexed it successfully, owned by `run_loop`
+/// across ticks like [`MissingStreaks`]. Each pass rebuilds it from the files
+/// it walked, so a deleted file or an orphaned project drops out.
+type IndexedFingerprints = HashMap<(WorkspaceId, ProjectId, PagePath), FileFingerprint>;
+
+/// A page file found by [`walk_markdown_partial`], with its fingerprint.
+pub(crate) type WalkedPage = (PagePath, Option<FileFingerprint>);
 
 /// Per-`(workspace, project, path)` streak of consecutive reconcile passes a
 /// candidate page's file has looked missing, plus the [`PageId`] last
@@ -629,6 +706,24 @@ async fn reconcile_missing_pages(
 async fn reconcile(
     wiki: &Wiki,
     missing_streaks: &mut MissingStreaks,
+    indexed_fingerprints: &mut IndexedFingerprints,
+) -> WikiResult<ReconcileStats> {
+    reconcile_at(
+        wiki,
+        missing_streaks,
+        indexed_fingerprints,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`reconcile`] with the pass start time injected, so tests can age a
+/// file's timestamps past [`RACY_FINGERPRINT_WINDOW`] without sleeping.
+async fn reconcile_at(
+    wiki: &Wiki,
+    missing_streaks: &mut MissingStreaks,
+    indexed_fingerprints: &mut IndexedFingerprints,
+    pass_started: std::time::SystemTime,
 ) -> WikiResult<ReconcileStats> {
     let root = wiki.root().to_path_buf();
     // Walk all per-project subdirectories: <ws_uuid>/<proj_uuid>/
@@ -638,6 +733,7 @@ async fn reconcile(
 
     let tombstones_enabled = wiki.reconcile_tombstones_deleted_pages();
     let mut stats = ReconcileStats::default();
+    let mut next_fingerprints = IndexedFingerprints::with_capacity(indexed_fingerprints.len());
     for (ws, proj, proj_root) in project_dirs {
         // The directory name parses as a valid UUID pair, but that does not
         // mean the store knows the project. An orphan directory (e.g. a shell
@@ -693,25 +789,38 @@ async fn reconcile(
             tokio::task::spawn_blocking(move || walk_markdown_partial(&proj_root))
                 .await
                 .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
-        // Once per directory, not once per page: a project accumulates one
-        // tombstone per purge, and the set is only consulted for the
-        // `sessions/<id>.md` paths that a session purge could have left behind.
-        let purged = wiki.purged_sessions(ws, proj).await?;
         let mut walked: HashSet<PagePath> = HashSet::with_capacity(pages.len());
-        for path in pages {
+        for (path, fingerprint) in pages {
+            // Recorded before the unchanged-file skip: a skipped page was
+            // still found on disk, which the reconcile-delete check needs.
             walked.insert(path.clone());
-            if crate::wiki::is_purged_session_page(&path, &purged) {
-                debug!(
-                    path = %path,
-                    "skipping reconcile of a purged (tombstoned) session page",
-                );
-                stats.skipped_purged_sessions += 1;
+            let key = (ws, proj, path);
+            // A racily clean fingerprint is neither compared nor recorded,
+            // so the file is reread every pass until its timestamps age out
+            // of the window.
+            let fingerprint = fingerprint.filter(|f| !f.is_racy(pass_started));
+            if let Some(fingerprint) = fingerprint
+                && indexed_fingerprints.get(&key) == Some(&fingerprint)
+            {
+                next_fingerprints.insert(key, fingerprint);
+                stats.skipped_unchanged += 1;
                 continue;
             }
-            if let Err(e) = wiki.reindex_page(ws, proj, path.clone()).await {
-                warn!(path = %path, error = %e, "reconcile reindex failed");
-            } else {
-                stats.indexed += 1;
+            let path = key.2.clone();
+            match wiki.reindex_page(ws, proj, path.clone()).await {
+                Ok(_) => {
+                    stats.indexed += 1;
+                    // The fingerprint was taken by the walk, before the
+                    // reindex read the file, so a write racing that read
+                    // leaves a stale fingerprint and the next pass rereads.
+                    if let Some(fingerprint) = fingerprint {
+                        next_fingerprints.insert(key, fingerprint);
+                    }
+                }
+                Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                    stats.skipped_purged_sessions += 1;
+                }
+                Err(e) => warn!(path = %path, error = %e, "reconcile reindex failed"),
             }
         }
 
@@ -729,6 +838,7 @@ async fn reconcile(
             .await;
         }
     }
+    *indexed_fingerprints = next_fingerprints;
     // debug!, not info!: this fires every RECONCILE_INTERVAL regardless of
     // activity, so at info it is ~half the default server log (#894). Its
     // failure signals stay loud — the per-page `warn!` above, the
@@ -739,6 +849,7 @@ async fn reconcile(
         skipped_purged_sessions = stats.skipped_purged_sessions,
         tombstoned_missing = stats.tombstoned_missing,
         circuit_broken_scopes = stats.circuit_broken_scopes,
+        skipped_unchanged = stats.skipped_unchanged,
         "reconciliation pass complete",
     );
     Ok(stats)
@@ -852,7 +963,8 @@ fn extract_project_dir_ids(
 }
 
 pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
-    walk_markdown_partial(root).map(|(pages, _partial)| pages)
+    walk_markdown_partial(root)
+        .map(|(pages, _partial)| pages.into_iter().map(|(path, _)| path).collect())
 }
 
 /// Like [`walk_markdown`], but also reports whether any directory in the
@@ -866,7 +978,10 @@ pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
 /// #3) relies on this to tell those two situations apart — treating a
 /// partial walk's absent pages as deletion evidence would tombstone pages
 /// that are still there, just temporarily unreadable.
-pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<PagePath>, bool)> {
+///
+/// Each page comes with the [`FileFingerprint`] of the metadata the walk
+/// already read for it.
+pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<WalkedPage>, bool)> {
     let mut out = Vec::new();
     let mut partial = false;
     let mut stack = vec![root.to_path_buf()];
@@ -916,7 +1031,7 @@ pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<PagePath>, b
                 && !is_pending_path(&pp)
                 && !is_reserved_page_file(&path, &pp)
             {
-                out.push(pp);
+                out.push((pp, FileFingerprint::of(&metadata)));
             }
         }
     }
@@ -1048,6 +1163,102 @@ mod tests {
     /// reported, already-tested outcome, and after one the rows are gone while
     /// the markdown is still on disk. Reverting the tombstone gate fails this.
     #[tokio::test]
+    async fn manual_survivor_remains_reindexable_after_session_purge() {
+        let (_tmp, store, wiki, ws, proj) = setup().await;
+        let sid = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            format!("---\ntitle: Session\nsession_id: {sid}\n---\n\noriginalsummarytoken\n"),
+        )
+        .unwrap();
+        let id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(id)).await.unwrap();
+        // A manual replacement has no session_id; the store deliberately preserves it (#866).
+        std::fs::write(&abs, "---\ntitle: Manual\n---\n\nmanualbeforetoken\n").unwrap();
+        wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let outcome = wiki
+            .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(outcome.summary.pages_deleted, 1);
+        assert!(outcome.summary.removed_paths.is_empty());
+        assert!(abs.is_file());
+        assert_eq!(
+            store
+                .reader
+                .search_pages("manualbeforetoken".into(), 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for (indexer, token) in [
+            ("reconcile", "manualreconciletoken"),
+            ("file event", "manualfileeventtoken"),
+            ("directory event", "manualdirectorytoken"),
+            ("rebuild", "manualrebuildtoken"),
+        ] {
+            std::fs::write(&abs, format!("---\ntitle: Manual\n---\n\n{token}\n")).unwrap();
+            match indexer {
+                "reconcile" => {
+                    let stats = reconcile(
+                        &wiki,
+                        &mut MissingStreaks::new(),
+                        &mut IndexedFingerprints::new(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(stats.skipped_purged_sessions, 0);
+                }
+                "file event" => {
+                    let event = notify_debouncer_full::DebouncedEvent::new(
+                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(abs.clone()),
+                        std::time::Instant::now(),
+                    );
+                    handle_event(&wiki, event).await;
+                }
+                "directory event" => {
+                    assert!(
+                        reindex_project_dir(&wiki, ws, proj, wiki.project_root(ws, proj)).await
+                    );
+                }
+                "rebuild" => {
+                    let summary = wiki.reindex_all().await.unwrap();
+                    assert_eq!(summary.skipped_purged_sessions, 0);
+                }
+                _ => unreachable!(),
+            }
+            let hits = store
+                .reader
+                .search_pages(token.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{indexer} must keep the preserved manual page editable"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn purged_session_page_is_not_resurrected_by_a_reconcile_tick() {
         let (tmp, store, wiki, ws, proj) = setup().await;
         let sid = ai_memory_core::SessionId::new();
@@ -1134,7 +1345,13 @@ mod tests {
             "precondition: the purge made the page unsearchable",
         );
 
-        let stats = reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+        let stats = reconcile(
+            &wiki,
+            &mut MissingStreaks::new(),
+            &mut IndexedFingerprints::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             stats.skipped_orphans, 0,
             "a session purge leaves the project row, so the orphan guard passes",
@@ -1352,6 +1569,50 @@ mod tests {
         );
     }
 
+    /// A page renamed away with an external tool arrives as
+    /// `Modify(Name(RenameMode::From))`, never as a `Remove`; the next
+    /// commit must still drop it from the tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renamed_away_page_is_reported_and_dropped_from_the_tree() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let proj_dir = wiki.root().join(ws.to_string()).join(proj.to_string());
+        let notes = proj_dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let gone = notes.join("a.md");
+        let kept = notes.join("b.md");
+        std::fs::write(&gone, "renamed away\n").unwrap();
+        std::fs::write(&kept, "still here\n").unwrap();
+        let rel = |p: &Path| p.strip_prefix(wiki.root()).unwrap().to_path_buf();
+        wiki.git().mark_written(&gone);
+        wiki.git().mark_written(&kept);
+        wiki.commit_all("seed").unwrap().expect("seed commit");
+        // Control: the page is in the tree before the rename.
+        wiki.git().file_at_rev("HEAD", &rel(&gone)).unwrap();
+
+        // `mv notes/a.md /tmp/`: the path is gone before the event arrives.
+        std::fs::remove_file(&gone).unwrap();
+        let event = notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )))
+            .add_path(gone.clone()),
+            std::time::Instant::now(),
+        );
+        handle_event(&wiki, event).await;
+
+        let reported = wiki.git().written_paths();
+        assert!(reported.contains(&rel(&gone)), "{reported:?}");
+        wiki.commit_all("after the rename")
+            .unwrap()
+            .expect("a commit that drops the page");
+        assert!(wiki.git().file_at_rev("HEAD", &rel(&gone)).is_err());
+        // Control: the commit dropped only the page that vanished.
+        assert_eq!(
+            wiki.git().file_at_rev("HEAD", &rel(&kept)).unwrap(),
+            b"still here\n"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_picks_up_file_added_while_watcher_offline() {
         let (tmp, store, wiki, ws, proj) = setup().await;
@@ -1368,7 +1629,13 @@ mod tests {
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         // Hit reconcile manually instead of waiting 30s.
-        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+        reconcile(
+            &wiki,
+            &mut MissingStreaks::new(),
+            &mut IndexedFingerprints::new(),
+        )
+        .await
+        .unwrap();
 
         let hits = store
             .reader
@@ -1378,6 +1645,167 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "preexisting.md");
         handle.shutdown().await;
+    }
+
+    /// #1975: an idle reconcile tick must not reindex a page whose file has
+    /// not changed since the pass that indexed it. Reindexing every page
+    /// every 30s cost a 43k-page wiki 10-20s of store round trips per tick.
+    /// A rewritten file is still picked up on the next pass.
+    #[tokio::test]
+    async fn reconcile_skips_files_unchanged_since_they_were_indexed() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stable.md"), "firstversiontoken\n").unwrap();
+
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        // Passes run well after the writes, so no timestamp is racily clean.
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let first = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!((first.indexed, first.skipped_unchanged), (1, 0));
+
+        let idle = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!(
+            (idle.indexed, idle.skipped_unchanged),
+            (0, 1),
+            "an unchanged file must not be reindexed on an idle tick",
+        );
+
+        std::fs::write(dir.join("stable.md"), "secondversiontoken, longer\n").unwrap();
+        let changed = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!((changed.indexed, changed.skipped_unchanged), (1, 0));
+        let hits = store
+            .reader
+            .search_pages("secondversiontoken".into(), 5, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a rewritten file is reindexed on the next pass"
+        );
+
+        std::fs::remove_file(dir.join("stable.md")).unwrap();
+        reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert!(
+            fingerprints.is_empty(),
+            "a file that is gone leaves the fingerprint map",
+        );
+    }
+
+    /// Git's racily-clean rule for the #1975 skip: a fingerprint whose mtime
+    /// is not yet older than [`RACY_FINGERPRINT_WINDOW`] at the start of the
+    /// pass cannot prove the file unchanged, because a same-length edit
+    /// landing after the reindex read but in the same timestamp tick would
+    /// look identical. Such a file is reread on every pass until it ages out.
+    #[tokio::test]
+    async fn reconcile_rereads_a_racily_clean_file_until_its_mtime_ages_out() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fresh.md");
+        std::fs::write(&file, "racytoken\n").unwrap();
+        // The pass starts at the file's own mtime: the worst case, and
+        // independent of how long the test machine takes to get here.
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        for pass in 0..2 {
+            let stats = reconcile_at(&wiki, &mut streaks, &mut fingerprints, written)
+                .await
+                .unwrap();
+            assert_eq!(
+                (stats.indexed, stats.skipped_unchanged),
+                (1, 0),
+                "pass {pass}: a racily clean file must be reread",
+            );
+        }
+        assert!(
+            fingerprints.is_empty(),
+            "a racily clean fingerprint is never recorded",
+        );
+
+        let aged = written + RACY_FINGERPRINT_WINDOW + Duration::from_secs(1);
+        let first_trusted = reconcile_at(&wiki, &mut streaks, &mut fingerprints, aged)
+            .await
+            .unwrap();
+        assert_eq!(
+            (first_trusted.indexed, first_trusted.skipped_unchanged),
+            (1, 0)
+        );
+        let idle = reconcile_at(&wiki, &mut streaks, &mut fingerprints, aged)
+            .await
+            .unwrap();
+        assert_eq!(
+            (idle.indexed, idle.skipped_unchanged),
+            (0, 1),
+            "once its timestamps are older than the window the file is skipped",
+        );
+    }
+
+    #[test]
+    fn racy_fingerprint_window_brackets_the_pass_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.md");
+        std::fs::write(&file, "x").unwrap();
+        let fingerprint = FileFingerprint::of(&std::fs::metadata(&file).unwrap()).unwrap();
+        let mtime = fingerprint.modified;
+        assert!(fingerprint.is_racy(mtime), "mtime equal to the pass start");
+        assert!(
+            fingerprint.is_racy(mtime - Duration::from_secs(1)),
+            "mtime after the pass start (clock skew or a backwards step)",
+        );
+        assert!(fingerprint.is_racy(mtime + RACY_FINGERPRINT_WINDOW - Duration::from_millis(1)));
+        // Unix also checks the change time; give it the same slack, since the
+        // write above sets both to about the same instant.
+        assert!(!fingerprint.is_racy(mtime + RACY_FINGERPRINT_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// The unchanged-file skip must still count a skipped page as found on
+    /// disk. Otherwise the reconcile-delete safety net reads every stable
+    /// page as missing and attempts a tombstone after two idle passes, which
+    /// only the file-exists recheck inside the tombstone then refuses (#1975).
+    #[tokio::test]
+    async fn reconcile_delete_never_tombstones_a_page_skipped_as_unchanged() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let stable = PagePath::new("stable.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, stable.as_str(), "stays put").await;
+        let churn = proj_dir(&tmp, ws, proj).join("churn.md");
+
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        for pass in 0..4 {
+            // A page that changes every pass keeps the walk non-empty, so
+            // the empty-walk breaker cannot hide a wrongly "missing" page.
+            std::fs::write(&churn, "x".repeat(pass + 1)).unwrap();
+            let stats = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+                .await
+                .unwrap();
+            assert_eq!(stats.tombstoned_missing, 0, "pass {pass}");
+            assert!(
+                streaks.is_empty(),
+                "pass {pass}: a skipped page must not start a missing streak: {streaks:?}",
+            );
+        }
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, stable.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+        );
     }
 
     /// #613: a project directory the store has no row for must be skipped
@@ -1404,7 +1832,13 @@ mod tests {
         std::fs::write(orphan_dir.join("index.md"), "seeded shell\n").unwrap();
         std::fs::write(orphan_dir.join("stale.md"), "orphantoken content\n").unwrap();
 
-        let stats = reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+        let stats = reconcile(
+            &wiki,
+            &mut MissingStreaks::new(),
+            &mut IndexedFingerprints::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             stats.skipped_orphans, 1,
@@ -1557,7 +1991,13 @@ mod tests {
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         // Trigger the reconciliation pass directly.
-        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+        reconcile(
+            &wiki,
+            &mut MissingStreaks::new(),
+            &mut IndexedFingerprints::new(),
+        )
+        .await
+        .unwrap();
 
         // Only `real.md` should land in the index.
         let hits = store
@@ -1670,7 +2110,13 @@ mod tests {
         .unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
-        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+        reconcile(
+            &wiki,
+            &mut MissingStreaks::new(),
+            &mut IndexedFingerprints::new(),
+        )
+        .await
+        .unwrap();
 
         let page_hits = store
             .reader
@@ -1963,7 +2409,9 @@ mod tests {
 
         let mut streaks = MissingStreaks::new();
         for _ in 0..5 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(stats.tombstoned_missing, 0);
         }
         assert_eq!(
@@ -1991,12 +2439,16 @@ mod tests {
         write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
 
         let mut streaks = MissingStreaks::new();
-        let baseline = reconcile(&wiki, &mut streaks).await.unwrap();
+        let baseline = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(baseline.tombstoned_missing, 0);
 
         std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
 
-        let first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let first_miss = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(
             first_miss.tombstoned_missing, 0,
             "one missing pass must not be enough"
@@ -2011,7 +2463,9 @@ mod tests {
             "still latest after only one missing pass",
         );
 
-        let second_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let second_miss = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(
             second_miss.tombstoned_missing, 1,
             "two consecutive missing passes must tombstone"
@@ -2083,7 +2537,9 @@ mod tests {
 
         let mut streaks = MissingStreaks::new();
         for _ in 0..5 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(stats.tombstoned_missing, 0);
         }
         for (path, id) in ids {
@@ -2116,22 +2572,30 @@ mod tests {
         write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // Pass N: file momentarily missing (streak = 1).
         std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
-        let miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let miss = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(miss.tombstoned_missing, 0);
 
         // Recreated before the next pass — the "atomic save" completing.
         let id2 = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "v2").await;
         assert_ne!(id1, id2, "a content change mints a new version");
-        let recovered = reconcile(&wiki, &mut streaks).await.unwrap();
+        let recovered = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(recovered.tombstoned_missing, 0);
 
         // One more pass with the file still present must not retroactively
         // tombstone anything either — the streak was cleared, not merely paused.
-        let stable = reconcile(&wiki, &mut streaks).await.unwrap();
+        let stable = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(stable.tombstoned_missing, 0);
         assert_eq!(
             store
@@ -2164,11 +2628,15 @@ mod tests {
         write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // Miss #1.
         std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
-        let first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let first_miss = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(first_miss.tombstoned_missing, 0, "streak = 1, not enough");
 
         // Reappears with IDENTICAL content: `upsert_page`'s sha256
@@ -2180,13 +2648,18 @@ mod tests {
             same_id, id,
             "precondition: identical content must not mint a new id"
         );
-        let recovered = reconcile(&wiki, &mut streaks).await.unwrap();
+        let recovered = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(recovered.tombstoned_missing, 0);
 
         // Missing again: this must be a FRESH streak (= 1), not a
         // continuation (which would already be 2 and tombstone here).
         std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
-        let second_streak_first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let second_streak_first_miss =
+            reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
         assert_eq!(
             second_streak_first_miss.tombstoned_missing, 0,
             "the streak must have restarted at 1, not continued to 2"
@@ -2202,7 +2675,10 @@ mod tests {
         );
 
         // Still missing, second FRESH consecutive pass: now it tombstones.
-        let second_streak_second_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        let second_streak_second_miss =
+            reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
         assert_eq!(second_streak_second_miss.tombstoned_missing, 1);
         assert_eq!(
             store
@@ -2230,14 +2706,18 @@ mod tests {
         }
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // 60% vanish in one pass.
         for (path, _) in ids.iter().take(6) {
             std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
         }
         for pass in 0..3 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(
                 stats.tombstoned_missing, 0,
                 "pass {pass}: the breaker must block every one of the 6 missing pages"
@@ -2271,17 +2751,23 @@ mod tests {
         }
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // 10% vanish: well under the breaker threshold (max(3, 50%) = 5 of 10).
         let (missing_path, _missing_id) = ids[0].clone();
         std::fs::remove_file(proj_dir(&tmp, ws, proj).join(missing_path.as_str())).unwrap();
 
-        let first = reconcile(&wiki, &mut streaks).await.unwrap();
+        let first = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(first.circuit_broken_scopes, 0);
         assert_eq!(first.tombstoned_missing, 0, "first missing pass");
 
-        let second = reconcile(&wiki, &mut streaks).await.unwrap();
+        let second = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(second.circuit_broken_scopes, 0);
         assert_eq!(
             second.tombstoned_missing, 1,
@@ -2326,7 +2812,9 @@ mod tests {
         }
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // Both files vanish, but the directory itself stays put — an
         // ordinary (non-partial) walk that simply finds nothing.
@@ -2334,7 +2822,9 @@ mod tests {
             std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
         }
         for pass in 0..3 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(
                 stats.tombstoned_missing, 0,
                 "pass {pass}: an empty walk must never be treated as evidence, however small \
@@ -2367,13 +2857,17 @@ mod tests {
 
         let dir = proj_dir(&tmp, ws, proj);
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
 
         // Simulate the whole project directory vanishing mid-walk (walk_partial
         // becomes true because `walk_markdown_partial`'s own root read fails).
         std::fs::remove_dir_all(&dir).unwrap();
         for pass in 0..3 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(
                 stats.tombstoned_missing, 0,
                 "pass {pass}: a partial walk must never produce deletion evidence"
@@ -2393,7 +2887,9 @@ mod tests {
         // ordinary behavior instead of carrying over any partial-pass state.
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(path.as_str()), "still around").unwrap();
-        let restored = reconcile(&wiki, &mut streaks).await.unwrap();
+        let restored = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(restored.tombstoned_missing, 0);
         assert_eq!(
             store
@@ -2482,11 +2978,17 @@ mod tests {
         write_and_index(&wiki, &tmp, ws, proj_a, "control.md", "always here").await;
 
         let mut streaks = MissingStreaks::new();
-        reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         std::fs::remove_file(proj_dir(&tmp, ws, proj_a).join(path.as_str())).unwrap();
 
-        reconcile(&wiki, &mut streaks).await.unwrap();
-        let final_stats = reconcile(&wiki, &mut streaks).await.unwrap();
+        reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
+        let final_stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+            .await
+            .unwrap();
         assert_eq!(final_stats.tombstoned_missing, 1);
 
         assert_eq!(
@@ -2595,7 +3097,9 @@ mod tests {
 
         let mut streaks = MissingStreaks::new();
         for pass in 0..3 {
-            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            let stats = reconcile(&wiki, &mut streaks, &mut IndexedFingerprints::new())
+                .await
+                .unwrap();
             assert_eq!(
                 stats.tombstoned_missing, 0,
                 "pass {pass}: a session page must never be reconcile-delete candidate"

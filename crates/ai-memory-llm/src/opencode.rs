@@ -22,7 +22,7 @@ use crate::openai::{
 };
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use crate::types::{
     ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
 };
@@ -83,8 +83,7 @@ impl OpenCodeProvider {
         })
     }
 
-    #[cfg(test)]
-    fn with_strict(mut self, strict: bool) -> Self {
+    pub(crate) fn with_strict(mut self, strict: bool) -> Self {
         self.chat_completions = self.chat_completions.with_strict(strict);
         self
     }
@@ -319,6 +318,7 @@ const ANTHROPIC_MESSAGES_MODELS: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
     "claude-sonnet-4",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
     "qwen3.8-flash",
     "qwen3.7-max",
@@ -340,7 +340,9 @@ struct OpenCodeResponsesProvider {
 impl OpenCodeResponsesProvider {
     fn new(api_key: SecretString, model: String, base_url: String) -> LlmResult<Self> {
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: reqwest::Client::builder()
+                .redirect(crate::redirect::same_origin_redirects())
+                .build()?,
             api_key,
             base_url,
             model,
@@ -405,7 +407,15 @@ impl OpenCodeResponsesProvider {
         let response = self
             .post(&self.build_request(&request, Some(text)), operation_id)
             .await?;
-        let text = extract_output_text(&response).unwrap_or_default();
+        // No content at all is a distinct terminal failure, not a JSON parse
+        // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
+        // an empty string to serde, so the caller saw "EOF while parsing a value
+        // at line 1 column 0", which names neither the model nor the cause.
+        let Some(text) = extract_output_text(&response).filter(|t| !t.trim().is_empty()) else {
+            return Err(LlmError::EmptyContent {
+                model: self.model.clone(),
+            });
+        };
         serde_json::from_str(&text).map_err(LlmError::from)
     }
 
@@ -460,12 +470,8 @@ impl OpenCodeResponsesProvider {
             headers.set_default(name, value);
         }
         let response = headers.apply(builder).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: provider_error_body(response).await,
-            });
+        if !response.status().is_success() {
+            return Err(provider_error(response).await);
         }
         response_json_limited(response).await
     }
@@ -672,6 +678,11 @@ mod tests {
             ),
             ("gpt-6-luna", OpenCodeApi::Responses, OpenCodeApi::Responses),
             (
+                "claude-haiku-5-5",
+                OpenCodeApi::AnthropicMessages,
+                OpenCodeApi::AnthropicMessages,
+            ),
+            (
                 "qwen3.8-flash",
                 OpenCodeApi::AnthropicMessages,
                 OpenCodeApi::AnthropicMessages,
@@ -740,6 +751,7 @@ mod tests {
             "muse-spark-1.2-contributor",
             "gpt-6-luna",
             "gpt-5.6-luna",
+            "claude-haiku-5-5",
             "qwen3.8-flash",
             "deepseek-v4-flash",
         ] {
@@ -748,7 +760,7 @@ mod tests {
                 let base = format!("{}/{catalogue}/v1", server.uri());
                 let api = match (model, catalogue) {
                     ("minimax-m3" | "minimax-m2.7" | "qwen3.8-max", "zen/go")
-                    | ("qwen3.8-flash", _) => OpenCodeApi::AnthropicMessages,
+                    | ("qwen3.8-flash" | "claude-haiku-5-5", _) => OpenCodeApi::AnthropicMessages,
                     ("muse-spark-1.3-contributor" | "muse-spark-1.2-contributor", "zen/go")
                     | ("gpt-6-luna" | "gpt-5.6-luna", _) => OpenCodeApi::Responses,
                     _ => OpenCodeApi::ChatCompletions,
@@ -793,6 +805,7 @@ mod tests {
                     base_url: Some(base),
                     compat_strict: false,
                     compat_disable_thinking: false,
+                    compat_stream: None,
                     request_timeout_secs: 5,
                     reasoning_effort: Some(ReasoningEffort::High),
                     extra_headers: ExtraHeaders::parse(["x-test: routed"]).unwrap(),
@@ -833,6 +846,10 @@ mod tests {
                             );
                             assert!(header_value(request, "x-api-key").is_none());
                             assert_eq!(body["messages"][0]["content"], "hello");
+                            if index == 1 {
+                                assert_eq!(body["response_format"]["type"], "json_schema");
+                                assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+                            }
                             assert_eq!(body["reasoning_effort"], "high");
                             assert!(body.get("input").is_none());
                             assert!(body.get("tools").is_none());
@@ -1035,7 +1052,7 @@ mod tests {
                         .unwrap_err(),
                 ] {
                     assert!(
-                        matches!(error, LlmError::Provider { status: code, body } if code == status && body == "gateway error")
+                        matches!(error, LlmError::Provider { status: code, body, .. } if code == status && body == "gateway error")
                     );
                 }
                 assert_eq!(server.received_requests().await.unwrap().len(), 2);
@@ -1186,6 +1203,69 @@ mod tests {
         assert_eq!(body["model"], "mimo-v2.6-flash");
     }
 
+    /// A 200 with no usable `output_text` is a terminal empty answer, not a
+    /// JSON parse failure. `unwrap_or_default()` fed serde an empty string, so
+    /// the caller saw `serde: EOF while parsing a value at line 1 column 0`,
+    /// which names neither the model nor the cause. The OpenAI-wire structured
+    /// path already classifies this as `empty-content`.
+    #[tokio::test]
+    async fn an_empty_responses_body_is_empty_content_not_a_serde_error() {
+        for (label, body) in [
+            (
+                "no output items",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "output": [],
+                    "usage": { "input_tokens": 1, "output_tokens": 0 },
+                }),
+            ),
+            (
+                "an item with no content",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "output": [{ "type": "reasoning", "content": [] }],
+                    "usage": { "input_tokens": 1, "output_tokens": 4096 },
+                }),
+            ),
+            (
+                "whitespace-only text",
+                responses_response_with_content("  \n\t "),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let provider = OpenCodeProvider::new_with_base_url(
+                SecretString::from("sk-test"),
+                "gpt-5.6-luna",
+                server.uri(),
+            )
+            .unwrap();
+            let err = provider
+                .complete_structured_raw(
+                    ChatRequest::user_prompt("emit JSON"),
+                    json!({ "type": "object" }),
+                )
+                .await
+                .expect_err("an empty answer must surface a typed error");
+
+            assert_eq!(err.class(), "empty-content", "{label}: {err:?}");
+            assert!(!err.is_transient(), "{label} must not be retried");
+            match &err {
+                LlmError::EmptyContent { model } => {
+                    assert_eq!(model, "gpt-5.6-luna", "{label}");
+                }
+                other => panic!("{label}: expected EmptyContent, got {other:?}"),
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "{label}: exactly one upstream call");
+        }
+    }
+
     #[tokio::test]
     async fn luna_structured_completion_uses_responses_api() {
         let server = MockServer::start().await;
@@ -1209,8 +1289,12 @@ mod tests {
                 ChatRequest::user_prompt("emit JSON"),
                 json!({
                     "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "confidence": { "type": "number", "format": "float" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    },
+                    "required": ["ok", "confidence", "created_at"],
                 }),
             )
             .await
@@ -1221,6 +1305,15 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+        assert!(
+            body["text"]["format"]["schema"]["properties"]["confidence"]
+                .get("format")
+                .is_none()
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["created_at"]["format"],
+            "date-time"
+        );
     }
 
     #[tokio::test]
@@ -1283,14 +1376,16 @@ mod tests {
         .unwrap()
         .with_strict(true);
         let operation_id = LlmOperationId::new();
+        let schema = json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+        });
+        let schema_json = serde_json::to_string(&schema).unwrap();
         let value = provider
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
-                json!({
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                }),
+                schema,
                 operation_id,
             )
             .await
@@ -1299,6 +1394,15 @@ mod tests {
         assert_eq!(value, json!({"ok": true}));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
+        let fallback_body: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("request body is JSON");
+        assert_eq!(fallback_body["messages"][0]["role"], "system");
+        assert!(
+            fallback_body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&schema_json)
+        );
         let expected_id = operation_id.to_string();
         assert_eq!(
             header_value(&requests[0], "x-opencode-session"),

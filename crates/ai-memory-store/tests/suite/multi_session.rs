@@ -17,13 +17,14 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
-    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
-    owner_stamp,
+    ActorContext, AgentKind, FeedbackKind, HandoffAcceptance, HandoffState, IdentityKey,
+    NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier,
+    UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ConditionalUpsert, LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PagePrecondition,
-    PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
+    ClaudeSessionBoundary, ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession,
+    ManagedRunSessionLink, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
+    WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -67,6 +68,201 @@ async fn open_session(
         .await
         .unwrap();
     id
+}
+
+/// A SessionEnd digest takes a raw session id internally, but the reader must
+/// still require the admitted scope. Otherwise a future caller could render a
+/// foreign project's prompts merely by learning its id.
+#[tokio::test]
+async fn session_end_readers_refuse_foreign_session_ids() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: session,
+                workspace_id: ws,
+                project_id: home,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "private prompt".into(),
+                body: "foreign scopes must not read this".into(),
+                importance: 5,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .session_has_substantive_observation(ws, home, session)
+            .await
+            .unwrap(),
+        "the owning scope is the legitimate control"
+    );
+    let total = store
+        .reader
+        .read_session_observations(ws, home, session, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+
+    for (attempt_ws, attempt_project) in [(ws, sibling), (other_ws, home)] {
+        assert!(
+            !store
+                .reader
+                .session_has_substantive_observation(attempt_ws, attempt_project, session)
+                .await
+                .unwrap(),
+            "a foreign scope must not learn the session's substantive state"
+        );
+        let error = store
+            .reader
+            .read_session_observations(attempt_ws, attempt_project, session, |snapshot| {
+                Ok(snapshot.kind_summary()?.total)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionCollision));
+    }
+
+    let missing = SessionId::new();
+    let error = store
+        .reader
+        .read_session_observations(ws, home, missing, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::SessionCollision),
+        "missing and foreign ids deliberately expose the same refusal"
+    );
+}
+
+/// The point-fetch rowid API is scoped to the snapshot's session: a
+/// `rowid` belonging to another session is refused through a legitimate
+/// snapshot, while the session's own rowid is returned (the legitimate
+/// control). A constructor-only test cannot see the removal of the
+/// `session_id = ?1` predicate alone — this one hands a foreign rowid to a
+/// legitimate session and asserts the refusal.
+#[tokio::test]
+async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (session, tag) in [(session_a, "a"), (session_b, "b")] {
+        for i in 0..12u32 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::PostToolUse,
+                        extension: None,
+                        source_event: None,
+                        title: "routine".into(),
+                        body: format!("{tag} row {i}"),
+                        importance: 1,
+                        file_path: None,
+                    },
+                    &sanitizer,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    // Each session's first rowid: session B's rows landed after session
+    // A's, so the rowids are distinct.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let first_rowid = |session: SessionId| {
+        conn.query_row(
+            "SELECT rowid FROM observations WHERE session_id = ?1 ORDER BY rowid LIMIT 1",
+            rusqlite::params![session.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let rowid_a = first_rowid(session_a);
+    let rowid_b = first_rowid(session_b);
+    assert_ne!(rowid_a, rowid_b, "the attack needs distinct rowids");
+
+    // Legitimate control: a session reads its own rowid through its own
+    // legitimate snapshot.
+    let own = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        own.as_ref().map(|observation| observation.body.as_str()),
+        Some("a row 0"),
+        "the session's own rowid must be readable"
+    );
+
+    // The attack: session A's legitimate snapshot handed session B's rowid.
+    let foreign = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_b)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign.is_none(),
+        "a foreign session's rowid must be refused by the session-scoped fetch"
+    );
+
+    // And the mirror: session B's snapshot handed session A's rowid.
+    let foreign_mirror = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_b, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign_mirror.is_none(),
+        "the refusal must hold in both directions"
+    );
 }
 
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
@@ -735,6 +931,30 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
         .await
         .unwrap();
     assert!(found.is_empty());
+
+    // An expired page is never reported as live.
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired page");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let mut future_exp = page(ws, proj, "notes/future.md", "Future", "future page");
+    future_exp.expires_at = Some(jiff::Timestamp::from_second(4_102_444_800).unwrap());
+    store.writer.upsert_page(future_exp).await.unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/expired.md".to_string(),
+                "notes/future.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["notes/future.md"]);
 }
 
 /// The link guard's path probe is no existence oracle for a restricted
@@ -893,6 +1113,115 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
         accepted_session.as_deref(),
         Some(&winner.as_bytes()[..]),
         "and the winning session must not have been overwritten by the loser"
+    );
+}
+
+/// Two parallel sessions in separate Tokio worker threads concurrently race
+/// to claim the exact same open handoff baton via `tokio::join!`.
+///
+/// Invariant: Under genuine multi-threaded concurrency, the single-writer
+/// transaction guard (`WHERE state = 'open'`) must ensure that exactly one
+/// session claims the baton (`true`) and the loser receives `false`.
+/// The winning session's attribution is committed atomically and cannot be
+/// overwritten or corrupted by the losing task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_accept_race_on_single_handoff_yields_exactly_one_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "concurrent race for the baton".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |agent: AgentKind, session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::Codex, session_a)),
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::OpenCode, session_b)),
+    );
+    let outcome_a = res_a.unwrap();
+    let outcome_b = res_b.unwrap();
+
+    // Invariant: Exactly one must succeed, and the other must be refused.
+    assert!(
+        (outcome_a && !outcome_b) || (!outcome_a && outcome_b),
+        "exactly one session must win the claim; got outcome_a={outcome_a}, outcome_b={outcome_b}"
+    );
+
+    let (winner_agent, winner_session, loser_agent, loser_session) = if outcome_a {
+        ("codex", session_a, AgentKind::OpenCode, session_b)
+    } else {
+        ("opencode", session_b, AgentKind::Codex, session_a)
+    };
+
+    let handoff_bytes = id.as_bytes().to_vec();
+    let (state, accepted_by, accepted_session): (String, Option<String>, Option<Vec<u8>>) = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state, accepted_by, accepted_by_session FROM handoffs WHERE id = ?1",
+                rusqlite::params![handoff_bytes],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state, "accepted",
+        "the baton state must be transitioned to accepted"
+    );
+    assert_eq!(
+        accepted_by.as_deref(),
+        Some(winner_agent),
+        "the winner agent must be recorded as accepted_by"
+    );
+    assert_eq!(
+        accepted_session.as_deref(),
+        Some(&winner_session.as_bytes()[..]),
+        "the winning session id must be recorded in accepted_by_session"
+    );
+
+    // Subsequent retry by the loser must be cleanly rejected without modifying anything.
+    let retry = store
+        .writer
+        .accept_handoff(accept(loser_agent, loser_session))
+        .await
+        .unwrap();
+    assert!(
+        !retry,
+        "subsequent retry by the losing session must return false"
     );
 }
 
@@ -1472,6 +1801,7 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
                     importance: 5,
 
                     occurred_at: None,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -1580,6 +1910,7 @@ async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
     let store = Store::open(tmp.path()).unwrap();
     let (ws, proj) = scope(&store).await;
     let prepare = |name: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
         workspace_id: ws,
         project_id: proj,
         repo_fingerprint: "repo".into(),
@@ -1638,6 +1969,379 @@ async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
     );
 }
 
+/// The clear transition rechecks authority in its writer transaction, even
+/// when the caller has already passed a read-side scope check.
+#[tokio::test]
+async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let run = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: ws,
+                project_id: proj,
+                repo_fingerprint: "clear-repo".into(),
+                worktree_fingerprint: "clear-tree".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "clear-test".into(),
+            },
+            Some(alice.clone()),
+        )
+        .await
+        .unwrap();
+    let input = |native: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run.run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(alice.clone()),
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input("original"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    for case in [
+        "workspace",
+        "project",
+        "owner",
+        "shared",
+        "cwd",
+        "agent",
+        "dirty-id",
+    ] {
+        let mut rejected = input(case);
+        match case {
+            "workspace" => rejected.workspace_id = other_ws,
+            "project" => rejected.project_id = other_proj,
+            "owner" => rejected.owner_user = Some(operator("bob")),
+            "shared" => rejected.owner_user = None,
+            "cwd" => rejected.cwd = "/other-checkout".into(),
+            "agent" => rejected.agent = AgentKind::Codex,
+            "dirty-id" => rejected.native_session_id = "sk-abcdefghijklmnopqrstuvwx".into(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store
+                .writer
+                .relink_managed_claude_session(rejected, ClaudeSessionBoundary::Clear)
+                .await
+                .unwrap(),
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("original"),
+            "{case}"
+        );
+    }
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("expired"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("cleared"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    let history: Vec<(String, bool)> = conn.prepare("SELECT native_session_id, is_current FROM workstream_native_sessions WHERE workstream_id = ?1 ORDER BY native_session_id").unwrap()
+        .query_map([run.workstream_id.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        history,
+        vec![("cleared".into(), true), ("original".into(), false)]
+    );
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("original"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store.writer.cancel_managed_run(run.run_id).await.unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("terminal"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+}
+
+/// An in-session `/resume` after `/clear` returns the run to a conversation
+/// its workstream already held (#1944 follow-up): SessionStart `resume` may
+/// relink to such an id, and capture continues. It never reaches further: a
+/// never-held id, another operator, another checkout, a lapsed lease, an id
+/// only another workstream held, and an id a parallel live run currently
+/// holds are all refused, and a `clear` still never rewinds to a known id.
+#[tokio::test]
+async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let prepare = |tree: &str, lease: &str, owner: String| {
+        let store = &store;
+        let tree = tree.to_owned();
+        let lease = lease.to_owned();
+        async move {
+            store
+                .writer
+                .prepare_workstream_run_owned(
+                    PrepareWorkstreamRun {
+                        scope_by_id: true,
+                        workspace_id: ws,
+                        project_id: proj,
+                        repo_fingerprint: "resume-repo".into(),
+                        worktree_fingerprint: tree,
+                        cwd: "/repo".into(),
+                        agent: AgentKind::ClaudeCode,
+                        automatic_harness: false,
+                        available_agents: Vec::new(),
+                        selection: WorkstreamSelection::Current,
+                        lease_owner: lease,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let run = prepare("resume-tree", "resume-a", alice.clone()).await;
+    let input = |run_id, native: &str, owner: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(owner.to_owned()),
+    };
+    let link = |i: LinkOrAdoptManagedRunSession, boundary| {
+        let store = &store;
+        async move {
+            store
+                .writer
+                .relink_managed_claude_session(i, boundary)
+                .await
+                .unwrap()
+        }
+    };
+    let current = |run_id| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+        }
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "original", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+
+    // Adversarial: none of these may move the run off `cleared`.
+    for (case, i) in [
+        ("never-held", input(run.run_id, "never-held", &alice)),
+        (
+            "other-operator",
+            input(run.run_id, "original", &operator("bob")),
+        ),
+        ("other-checkout", {
+            let mut i = input(run.run_id, "original", &alice);
+            i.cwd = "/other-checkout".into();
+            i
+        }),
+    ] {
+        assert_eq!(
+            link(i, ClaudeSessionBoundary::Resume).await,
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            current(run.run_id).await.as_deref(),
+            Some("cleared"),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "a clear (or its delayed replay) never rewinds to a known id"
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "lapsed lease"
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+
+    // Control: the run's own operator resumes the pre-clear conversation.
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+
+    // A run in another workstream cannot resume into this one's history.
+    let other = prepare("other-tree", "resume-b", alice.clone()).await;
+    assert_ne!(other.workstream_id, run.workstream_id);
+    store
+        .writer
+        .link_or_adopt_managed_run_session(input(other.run_id, "other-native", &alice))
+        .await
+        .unwrap();
+    store
+        .writer
+        .accept_managed_run_context(other.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(other.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id only another workstream held"
+    );
+    assert_eq!(current(other.run_id).await.as_deref(), Some("other-native"));
+
+    // A parallel live run that holds one of this workstream's earlier ids
+    // keeps it: a resume never takes a session another live run captures.
+    let parallel = prepare("parallel-tree", "resume-c", alice.clone()).await;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(parallel.run_id, "cleared", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(parallel.run_id)
+    );
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id a parallel live run holds"
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+    store
+        .writer
+        .cancel_managed_run(parallel.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id),
+        "once the parallel run ends, the held id resumes again"
+    );
+}
+
 /// Stale-run recovery is a scoped, owned, single-candidate operation. The
 /// controls prove that the same candidate is usable once every boundary
 /// matches, while foreign owners/projects and a second linker cannot take it.
@@ -1654,6 +2358,7 @@ async fn stale_codex_run_recovery_cannot_cross_project_owner_or_session_boundari
     let alice = operator("alice");
     let bob = operator("bob");
     let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
         workspace_id: ws,
         project_id,
         repo_fingerprint: format!("repo-{project_id}"),
@@ -1760,6 +2465,7 @@ async fn force_unlock_replaces_only_the_same_operators_active_run() {
     let alice = operator("alice");
     let bob = operator("bob");
     let prepare = |lease_owner: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
         workspace_id: ws,
         project_id: proj,
         repo_fingerprint: "repo".into(),
@@ -1819,6 +2525,7 @@ async fn force_unlock_replaces_only_the_same_operators_active_run() {
         .writer
         .prepare_workstream_run_owned(
             PrepareWorkstreamRun {
+                scope_by_id: false,
                 selection: WorkstreamSelection::New("solo".into()),
                 ..prepare("solo:1")
             },
@@ -1830,6 +2537,7 @@ async fn force_unlock_replaces_only_the_same_operators_active_run() {
         .writer
         .prepare_workstream_run_owned_with_unlock(
             PrepareWorkstreamRun {
+                scope_by_id: false,
                 selection: WorkstreamSelection::Named("solo".into()),
                 ..prepare("solo:2")
             },
@@ -1856,6 +2564,7 @@ async fn stale_codex_run_recovery_fails_closed_on_ambiguity_and_active_mismatch(
         .unwrap();
     let owner = operator("alice");
     let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
         workspace_id: ws,
         project_id,
         repo_fingerprint: format!("repo-{project_id}"),
@@ -2089,6 +2798,7 @@ impl FinishFixture {
             .writer
             .prepare_workstream_run_owned(
                 PrepareWorkstreamRun {
+                    scope_by_id: false,
                     workspace_id: self.ws,
                     project_id: self.project,
                     repo_fingerprint: "repo-finish".into(),
@@ -2522,6 +3232,7 @@ async fn owner_finish_store_raw_ids_use_the_actual_project_and_workspace() {
             .writer
             .prepare_workstream_run_owned(
                 PrepareWorkstreamRun {
+                    scope_by_id: false,
                     workspace_id: ws,
                     project_id: project,
                     repo_fingerprint: "foreign".into(),
@@ -2579,6 +3290,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
     let run = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: project,
             repo_fingerprint: "reload".into(),
@@ -2704,6 +3416,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         .writer
         .prepare_workstream_run_owned(
             PrepareWorkstreamRun {
+                scope_by_id: false,
                 workspace_id: ws,
                 project_id: project,
                 repo_fingerprint: "recoverable".into(),
@@ -2780,6 +3493,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         let old = store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 workspace_id: ws,
                 project_id: project,
                 repo_fingerprint: "reload".into(),
@@ -2802,6 +3516,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
             let replacement = store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     workspace_id: ws,
                     project_id: project,
                     repo_fingerprint: "reload".into(),
@@ -2936,16 +3651,16 @@ async fn owner_finish_store_strict_resolution_refuses_pairing_missing_and_sql_fa
     conn.execute_batch("ALTER TABLE project_grants RENAME TO unavailable_grants;")
         .unwrap();
     f.refused_unchanged(run.run_id, f.alice()).await;
-    // The legacy resolution remains fail-open; it is insufficient for finish.
-    let legacy = ai_memory_store::resolve_project_authz(
+    // The common resolver also refuses when its authorization data is
+    // unreadable; a store fault must not open a restricted project.
+    let common = ai_memory_store::resolve_project_authz(
         &conn,
         f.ws,
         f.project,
         &ai_memory_store::ProjectPrincipal::user(f.alice),
         true,
-    )
-    .unwrap();
-    assert_eq!(legacy.access_mode, ai_memory_store::AccessMode::Open);
+    );
+    assert!(common.is_err());
     conn.execute_batch("ALTER TABLE unavailable_grants RENAME TO project_grants;")
         .unwrap();
     conn.execute(
@@ -3294,7 +4009,7 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
     .expect("the other harness finds the same profile");
     let entries = store
         .reader
-        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id, 10)
+        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id)
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -3550,6 +4265,7 @@ async fn explained_search_as(
                 include_superseded: false,
                 explain: true,
                 owner,
+                filter: ai_memory_store::PageFilter::default(),
             },
         )
         .await
@@ -3664,4 +4380,1332 @@ async fn observation_excerpts_follow_the_session_owner_while_the_vote_stays_shar
         .find(|(hit, _)| hit.path.as_str() == a_path)
         .unwrap();
     assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+}
+
+/// The self-service purge checks exact ownership in the writer transaction,
+/// including previews; shared legacy rows are readable but never user-deletable.
+#[tokio::test]
+async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
+    use ai_memory_core::IdentityKey;
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "purge-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for owner in [Some("user:purge-alice"), Some("user:purge-bob"), None] {
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: owner.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        sessions.push(sid);
+    }
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        for (project, sid) in [
+            (proj, sessions[1]),
+            (proj, sessions[2]),
+            (other, sessions[0]),
+        ] {
+            let result = store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    project,
+                    sid,
+                    IdentityKey::User("purge-alice".into()),
+                    Some(user),
+                    mode,
+                )
+                .await;
+            assert!(matches!(result, Err(StoreError::NotFound(_))));
+            assert!(
+                store
+                    .reader
+                    .session_summary_scoped(ws, proj, sid, OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Simulate a grant revoked after the HTTP preflight: the writer must refuse.
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .writer
+            .purge_owned_session(
+                ws,
+                proj,
+                sessions[0],
+                IdentityKey::User("purge-alice".into()),
+                Some(user),
+                PurgeMode::Commit
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Admin control remains able to purge an ownerless legacy session.
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sessions[2],
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control() {
+    use ai_memory_core::{IdentityKey, NewObservation, ObservationKind, Sanitized, Sanitizer};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "cascade-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some("user:cascade-alice".into()),
+        })
+        .await
+        .unwrap();
+    let observation = NewObservation {
+        session_id: sid,
+        workspace_id: ws,
+        project_id: foreign,
+        kind: ObservationKind::UserPrompt,
+        extension: None,
+        source_event: None,
+        title: "foreign record".into(),
+        body: "must survive a self-service purge".into(),
+        importance: 5,
+        occurred_at: None,
+        file_path: None,
+    };
+    store
+        .writer
+        .insert_observation(Sanitized::new(observation, &Sanitizer::default()))
+        .await
+        .unwrap();
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        assert!(matches!(
+            store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    proj,
+                    sid,
+                    IdentityKey::User("cascade-alice".into()),
+                    Some(user),
+                    mode
+                )
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let preview = store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.collateral_observations_deleted, 1);
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Open feedback findings ignore feedback attached to expired pages.
+#[tokio::test]
+async fn open_feedback_findings_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let live = page(ws, proj, "notes/live.md", "Live", "active content");
+    store.writer.upsert_page(live).await.unwrap();
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/live.md").unwrap(),
+            FeedbackKind::Stale,
+            Some("live page is stale".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/expired.md").unwrap(),
+            FeedbackKind::Wrong,
+            Some("expired page was wrong".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    let findings = store.reader.open_feedback_findings(ws, proj).await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].path, "notes/live.md");
+    assert_eq!(findings[0].kind, "stale");
+    assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
+}
+
+/// A link authored by a superseded page version is not a reference.
+/// `replace_links_in_tx` deletes rows only for the new version's id, so v1's
+/// row survives an edit, and `refresh_incoming_links_for_path` repoints it at
+/// the new latest id without filtering on `is_latest` — so without a join to a
+/// live source page, a link the author removed still answers for its target.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/b.md", "B", "target"))
+        .await
+        .unwrap();
+
+    // a.md v1 links b.md.
+    let mut a_v1 = page(ws, proj, "notes/a.md", "A", "see b");
+    a_v1.links = vec![ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new("notes/b.md").unwrap(),
+        relation: None,
+    }];
+    store.writer.upsert_page(a_v1).await.unwrap();
+
+    // Control: while the link is live, b.md is not an orphan.
+    let (_, _, linked_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        linked_orphans, 0,
+        "with a live inbound link neither page is an orphan"
+    );
+
+    // a.md v2 drops the link; v1's row survives, repointed at b.md's latest id.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/a.md", "A", "no link now"))
+        .await
+        .unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 2,
+        "both pages are orphans once the only link is gone from the latest version"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"notes/b.md"),
+        "b.md lost its only inbound link and must be listed: {orphan_paths:?}"
+    );
+}
+
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
+/// Memory health counts and detail lists ignore TTL-expired pages.
+#[tokio::test]
+async fn memory_health_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let past_time = jiff::Timestamp::from_second(1).unwrap();
+
+    // 1. Live episodic page and expired episodic page.
+    let mut live_stale = page(ws, proj, "notes/live_stale.md", "LiveStale", "content");
+    live_stale.tier = Tier::Episodic;
+    store.writer.upsert_page(live_stale).await.unwrap();
+
+    let mut expired_stale = page(
+        ws,
+        proj,
+        "notes/expired_stale.md",
+        "ExpiredStale",
+        "content",
+    );
+    expired_stale.tier = Tier::Episodic;
+    expired_stale.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_stale).await.unwrap();
+
+    // 2. Duplicate titles: one live page and one expired page sharing title "SameTitle".
+    let live_dup = page(ws, proj, "notes/live_dup.md", "SameTitle", "content");
+    store.writer.upsert_page(live_dup).await.unwrap();
+
+    let mut expired_dup = page(ws, proj, "notes/expired_dup.md", "SameTitle", "content");
+    expired_dup.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_dup).await.unwrap();
+
+    // 3. Orphans: live_stale and live_dup have no links.
+    // An expired orphan page should not be counted or listed as an orphan.
+    let mut expired_orphan = page(
+        ws,
+        proj,
+        "notes/expired_orphan.md",
+        "ExpiredOrphan",
+        "content",
+    );
+    expired_orphan.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_orphan).await.unwrap();
+
+    // Set updated_at on the episodic pages to 60 days ago so they qualify as stale (< 30 days).
+    let sixty_days_ago_us = jiff::Timestamp::now().as_microsecond() - 60 * 86_400 * 1_000_000;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = ?1 WHERE path IN ('notes/live_stale.md', 'notes/expired_stale.md')",
+        rusqlite::params![sixty_days_ago_us],
+    )
+    .unwrap();
+
+    // Workspace-level health counts and detail:
+    let (stale, dups, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "only live_stale is counted, expired_stale is ignored"
+    );
+    assert_eq!(
+        dups, 0,
+        "SameTitle has only one live page, expired_dup is ignored"
+    );
+    assert_eq!(
+        orphans, 2,
+        "only live_stale and live_dup are orphans; expired_orphan is ignored"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(detail.stale.len(), 1);
+    assert_eq!(detail.stale[0].path, "notes/live_stale.md");
+    assert!(detail.duplicates.is_empty());
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(
+        orphan_paths,
+        vec!["notes/live_dup.md", "notes/live_stale.md"]
+    );
+
+    // Project-level health counts and detail:
+    let (p_stale, p_dups, p_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(p_stale, 1);
+    assert_eq!(p_dups, 0);
+    assert_eq!(p_orphans, 2);
+
+    let p_detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    assert_eq!(p_detail.stale.len(), 1);
+    assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
+    assert!(p_detail.duplicates.is_empty());
+    assert_eq!(p_detail.orphans.len(), 2);
+}
+
+/// The briefing's `pages_latest` must agree with the page lists in the same
+/// snapshot: an expired page is hidden from every one of them, so counting it
+/// in the headline makes the brief advertise a page the agent cannot reach.
+#[tokio::test]
+async fn briefing_pages_latest_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let live_pages = store
+        .reader
+        .list_unexpired_pages("acme", "shared-app")
+        .await
+        .unwrap();
+    assert_eq!(live_pages.len(), 1, "one of the two pages is expired");
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        project.counts.pages_latest,
+        live_pages.len() as u64,
+        "project pages_latest counts only the unexpired latest page"
+    );
+    assert_eq!(
+        project.recent_pages.len(),
+        1,
+        "control: the list the count is supposed to agree with holds one page"
+    );
+    // Control: the all-versions total is deliberately TTL-blind, so a fix that
+    // merely broke both counts the same way cannot satisfy this test.
+    assert_eq!(
+        project.counts.pages_all, 2,
+        "control: pages_all stays the raw all-versions total"
+    );
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.counts.pages_latest, 1);
+    assert_eq!(workspace.counts.pages_all, 2);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.counts.pages_latest, 1);
+    assert_eq!(global.counts.pages_all, 2);
+}
+
+/// The briefing's activity windows are what an agent calibrates verbosity
+/// against, and `recent_pages` in the same snapshot already hides TTL-expired
+/// pages. A page written today with an expiry an hour ago must not make the
+/// project look active.
+#[tokio::test]
+async fn briefing_activity_windows_ignore_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert!(
+        project.recent_pages.is_empty(),
+        "control: the only page in the window is already hidden from the list"
+    );
+    assert_eq!(
+        project.activity_7d.pages_updated, 0,
+        "the expired page does not count as 7-day project activity"
+    );
+    assert_eq!(project.activity_30d.pages_updated, 0);
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 0);
+    assert_eq!(workspace.activity_30d.pages_updated, 0);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 0);
+    assert_eq!(global.activity_30d.pages_updated, 0);
+
+    // Control: a live page written in the same window still counts, so the
+    // guard cannot pass by zeroing the counter outright.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(project.activity_7d.pages_updated, 1);
+    assert_eq!(project.activity_30d.pages_updated, 1);
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 1);
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 1);
+}
+
+/// Multiple concurrent sessions of the same human operator under
+/// `ActiveProjectMode::PerActor` must isolate active project pointers
+/// per `(user, session_id)` tuple.
+///
+/// Mappings must not leak across session IDs:
+/// 1. Unscoped read resolution resolves each session to its own project with
+///    `ScopeSource::Session`.
+/// 2. An unbound session of the same operator fails closed on write with
+///    `AmbiguousUnscopedWrite` and falls back on read with `ScopeSource::DefaultAfterMismatch`
+///    (invariant: never silently guess or leak another session's project).
+/// 3. Updating the active project in Session 1 leaves Session 2's pointer intact.
+/// 4. Concurrent unscoped writes and reads land in the respective projects without
+///    cross-scope contamination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_operator_multiple_sessions_isolate_active_project_pointers_and_resolution() {
+    use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorKey};
+    use ai_memory_store::{ProjectPrincipal, ScopeResolutionError, ScopeResolver, ScopeSource};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("acme".to_string())
+        .await
+        .unwrap();
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+
+    let proj_alpha = store
+        .writer
+        .get_or_create_project(ws, "project-alpha".to_string(), None)
+        .await
+        .unwrap();
+    let proj_beta = store
+        .writer
+        .get_or_create_project(ws, "project-beta".to_string(), None)
+        .await
+        .unwrap();
+    let proj_gamma = store
+        .writer
+        .get_or_create_project(ws, "project-gamma".to_string(), None)
+        .await
+        .unwrap();
+
+    let alice = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice-multisession".into(),
+                name: Some("Alice".into()),
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    for proj in [proj_alpha, proj_beta, proj_gamma] {
+        store
+            .writer
+            .grant_memory(alice, proj, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+    }
+
+    let active = ActiveProject::with_config(
+        ActiveProjectMode::PerActor,
+        Duration::from_secs(60),
+        ai_memory_core::DEFAULT_MAX_ENTRIES,
+    );
+
+    let alice_session_1 = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-alpha".into()),
+    };
+    let alice_session_2 = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-beta".into()),
+    };
+    let alice_session_unbound = ActorKey {
+        user: Some(operator("alice-multisession")),
+        session_id: Some("session-fresh".into()),
+    };
+
+    active.set_for(&alice_session_1, ws, proj_alpha, false);
+    active.set_for(&alice_session_2, ws, proj_beta, false);
+
+    assert_eq!(active.get_for(&alice_session_1), Some((ws, proj_alpha)));
+    assert_eq!(active.get_for(&alice_session_2), Some((ws, proj_beta)));
+
+    let resolve_read = |actor: ActorKey| {
+        let reader = store.reader.clone();
+        let active = active.clone();
+        async move {
+            ScopeResolver::new(&reader, ws, proj_alpha)
+                .with_active_project(&active)
+                .with_project_authz(ProjectPrincipal::user(alice), true)
+                .resolve_read_args_traced(None, None, &actor)
+                .await
+        }
+    };
+
+    let resolve_write = |actor: ActorKey| {
+        let reader = store.reader.clone();
+        let writer = store.writer.clone();
+        let active = active.clone();
+        async move {
+            ScopeResolver::new(&reader, ws, proj_alpha)
+                .with_writer(&writer)
+                .with_active_project(&active)
+                .with_project_authz(ProjectPrincipal::user(alice), true)
+                .resolve_write_args(None, None, &actor)
+                .await
+        }
+    };
+
+    let (res_1, res_2) = tokio::join!(
+        resolve_read(alice_session_1.clone()),
+        resolve_read(alice_session_2.clone()),
+    );
+    let (scope_1, source_1) = res_1.unwrap();
+    let (scope_2, source_2) = res_2.unwrap();
+
+    assert_eq!(scope_1.project_id, proj_alpha);
+    assert_eq!(source_1, ScopeSource::Session);
+    assert_eq!(scope_2.project_id, proj_beta);
+    assert_eq!(source_2, ScopeSource::Session);
+
+    let write_unbound = resolve_write(alice_session_unbound.clone()).await;
+    assert!(
+        matches!(
+            write_unbound,
+            Err(ScopeResolutionError::AmbiguousUnscopedWrite)
+        ),
+        "an unbound session of an operator with active sessions must fail closed with AmbiguousUnscopedWrite: {write_unbound:?}"
+    );
+    let (read_unbound_scope, read_unbound_source) =
+        resolve_read(alice_session_unbound.clone()).await.unwrap();
+    assert_eq!(read_unbound_scope.project_id, proj_alpha);
+    assert_eq!(
+        read_unbound_source,
+        ScopeSource::DefaultAfterMismatch,
+        "an unbound session on read must fall back to the default scope with DefaultAfterMismatch rather than leaking another session's project"
+    );
+
+    active.set_for(&alice_session_1, ws, proj_gamma, false);
+    assert_eq!(active.get_for(&alice_session_1), Some((ws, proj_gamma)));
+    assert_eq!(
+        active.get_for(&alice_session_2),
+        Some((ws, proj_beta)),
+        "session 1 pointer mutation must not move session 2's pointer"
+    );
+
+    let (scope_1_shifted, _) = resolve_read(alice_session_1.clone()).await.unwrap();
+    let (scope_2_steady, _) = resolve_read(alice_session_2.clone()).await.unwrap();
+    assert_eq!(scope_1_shifted.project_id, proj_gamma);
+    assert_eq!(scope_2_steady.project_id, proj_beta);
+
+    let (write_1, write_2) = tokio::join!(
+        resolve_write(alice_session_1.clone()),
+        resolve_write(alice_session_2.clone()),
+    );
+    let write_1 = write_1.unwrap();
+    let write_2 = write_2.unwrap();
+
+    assert_eq!(write_1.scope.project_id, proj_gamma);
+    assert_eq!(write_2.scope.project_id, proj_beta);
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            write_1.scope.project_id,
+            "notes/session.md",
+            "Gamma Session",
+            "written from session 1",
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            write_2.scope.project_id,
+            "notes/session.md",
+            "Beta Session",
+            "written from session 2",
+        ))
+        .await
+        .unwrap();
+
+    let body_gamma = store
+        .reader
+        .page_body_by_ids(ws, proj_gamma, "notes/session.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body_gamma.body.contains("written from session 1"));
+
+    let body_beta = store
+        .reader
+        .page_body_by_ids(ws, proj_beta, "notes/session.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body_beta.body.contains("written from session 2"));
+}
+
+#[tokio::test]
+async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_controls() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (workspace, project) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(workspace, "sibling", None)
+        .await
+        .unwrap();
+    let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+    let other_project = store
+        .writer
+        .get_or_create_project(other_workspace, "shared-app", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for (index, (ws, proj, owner)) in [
+        (workspace, project, "alice"),
+        (workspace, sibling, "alice"),
+        (other_workspace, other_project, "alice"),
+        (workspace, project, "bob"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = SessionId::new();
+        let occurred = 1_790_812_800_000_i64 + i64::try_from(index).unwrap() * 1_000;
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(occurred),
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: Some(operator(owner)),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(occurred),
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("{owner} unfinished task"),
+                    body: format!("private evidence {index}"),
+                    importance: 5,
+                    file_path: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        sessions.push(session);
+    }
+
+    let alice = OwnerFilter::User(operator("alice"));
+    let own = store
+        .reader
+        .latest_interrupted_session_candidate(workspace, project, alice.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        own.session_id, sessions[0],
+        "newer foreign scope and owner rows must not replace the legitimate candidate"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(workspace, project, alice, Some(sessions[0]))
+            .await
+            .unwrap()
+            .is_none(),
+        "the receiver cannot recover its own observations"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(other_workspace, project, OwnerFilter::Any, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "a project id under a foreign workspace must fail closed"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(
+                workspace,
+                project,
+                OwnerFilter::Unattributed,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "an unattributed caller cannot read owned recovery evidence"
+    );
+    let root = store
+        .reader
+        .latest_interrupted_session_candidate(workspace, project, OwnerFilter::Any, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        root.session_id, sessions[3],
+        "an authorized unfiltered caller can read the newer home session"
+    );
+    let foreign_control = store
+        .reader
+        .latest_interrupted_session_candidate(
+            other_workspace,
+            other_project,
+            OwnerFilter::User(operator("alice")),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(foreign_control.session_id, sessions[2]);
+}
+
+/// One session id can carry work and handoffs in several scopes. Neither may
+/// decide recovery in another scope: foreign work must not reopen an ended
+/// session here, and a foreign baton must not hide unfinished work here.
+#[tokio::test]
+async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_controls() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (workspace, project) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(workspace, "sibling", None)
+        .await
+        .unwrap();
+    // Prompts land before or after the wall-clock end and baton timestamps.
+    let (before, after) = (1_790_812_800_000_i64, 4_102_444_800_000_000_i64);
+    let prompt = |session: SessionId, proj: ProjectId, occurred: i64| {
+        Sanitized::new(
+            NewObservation {
+                occurred_at: Some(occurred),
+                session_id: session,
+                workspace_id: workspace,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "unfinished task".into(),
+                body: "private evidence".into(),
+                importance: 5,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let baton = |session: SessionId, proj: ProjectId| NewHandoff {
+        workspace_id: workspace,
+        project_id: proj,
+        from_agent: AgentKind::Codex,
+        to_agent: None,
+        from_session_id: Some(session),
+        summary: "baton".into(),
+        next_steps: Vec::new(),
+        open_questions: Vec::new(),
+        files_touched: Vec::new(),
+        cwd: None,
+        owner_user: None,
+    };
+    let candidate = || async {
+        store
+            .reader
+            .latest_interrupted_session_candidate(workspace, project, OwnerFilter::Any, None)
+            .await
+            .unwrap()
+            .map(|candidate| candidate.session_id)
+    };
+
+    let unfinished = open_session(&store, workspace, project, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(prompt(unfinished, project, before))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(baton(unfinished, sibling))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        Some(unfinished),
+        "a baton from another scope must not hide unfinished work here"
+    );
+    store
+        .writer
+        .insert_handoff(baton(unfinished, project))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        None,
+        "control: a baton from this scope covers the work"
+    );
+
+    let ended = open_session(&store, workspace, project, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(prompt(ended, project, before))
+        .await
+        .unwrap();
+    store.writer.end_session(ended, None).await.unwrap();
+    store
+        .writer
+        .insert_observation(prompt(ended, sibling, after))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        None,
+        "work in another scope must not reopen a session ended here"
+    );
+    store
+        .writer
+        .insert_observation(prompt(ended, project, after))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        Some(ended),
+        "control: work resumed in this scope reopens it"
+    );
+}
+
+/// Store one PostToolUse naming `file_path`, at `occurred_at` microseconds.
+async fn file_observation(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session: SessionId,
+    file_path: Option<&str>,
+    occurred_at: i64,
+) -> ai_memory_core::ObservationId {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: Some(occurred_at),
+                session_id: session,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: "tool_family: file\noutcome: ok".into(),
+                importance: 5,
+                file_path: file_path.map(str::to_owned),
+            },
+            &Sanitizer::default(),
+        ))
+        .await
+        .unwrap()
+}
+
+/// #1843: a file path query never crosses a project or a workspace. The same
+/// path in a sibling project and in another workspace stays there. Control:
+/// the home project returns its own session. Fails with the scope predicate
+/// removed from `observations_for_file`.
+#[tokio::test]
+async fn observations_for_file_never_crosses_a_project_or_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, home) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other".to_string())
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+    let mine = open_session(&store, ws, home, AgentKind::Codex).await;
+    file_observation(&store, ws, home, mine, Some("src/lib.rs"), 1_000).await;
+    for (w, p) in [(ws, sibling), (other_ws, foreign)] {
+        let theirs = open_session(&store, w, p, AgentKind::Codex).await;
+        file_observation(&store, w, p, theirs, Some("src/lib.rs"), 2_000).await;
+    }
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, home, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, mine);
+}
+
+/// #1843: "this session touched this file" comes from the observation, so it
+/// follows the observation's owner, and the owner rule runs before the limit.
+/// With `limit = 1`, operator B's newer owned session neither appears for A
+/// nor takes A's slot; a shared session is visible to both. Controls: B sees
+/// its own session, and `OwnerFilter::Any` sees all three. Fails with the
+/// owner clause removed, or applied after the limit.
+#[tokio::test]
+async fn observations_for_file_follows_the_session_owner_before_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = owned_session(&store, ws, proj, Some(operator("alice"))).await;
+    let bob = owned_session(&store, ws, proj, Some(operator("bob"))).await;
+    let shared = owned_session(&store, ws, proj, None).await;
+    file_observation(&store, ws, proj, alice, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, shared, Some("src/lib.rs"), 2_000).await;
+    file_observation(&store, ws, proj, bob, Some("src/lib.rs"), 3_000).await;
+    let sessions = |owner: OwnerFilter, limit: usize| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .observations_for_file(ws, proj, owner, "src/lib.rs".into(), limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session_id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let as_alice = OwnerFilter::User(operator("alice"));
+    assert_eq!(sessions(as_alice.clone(), 1).await, vec![shared]);
+    assert_eq!(sessions(as_alice, 10).await, vec![shared, alice]);
+    assert_eq!(sessions(OwnerFilter::Unattributed, 10).await, vec![shared]);
+    assert_eq!(
+        sessions(OwnerFilter::User(operator("bob")), 1).await,
+        vec![bob]
+    );
+    assert_eq!(
+        sessions(OwnerFilter::Any, 10).await,
+        vec![bob, shared, alice]
+    );
+}
+
+/// #1843: every entry points at a target an agent can read. A session with
+/// a `sessions/<id>.md` page carries it; an open session, or one whose page
+/// expired, carries none and is read by `session_id` at `last_offset`,
+/// which lands on the newest observation naming the file.
+#[tokio::test]
+async fn observations_for_file_maps_sessions_to_readable_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let paged = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let open = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let expired = open_session(&store, ws, proj, AgentKind::Codex).await;
+    file_observation(&store, ws, proj, paged, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, open, None, 2_000).await;
+    file_observation(&store, ws, proj, open, Some("src/lib.rs"), 3_000).await;
+    file_observation(&store, ws, proj, open, None, 4_000).await;
+    let newest = file_observation(&store, ws, proj, open, Some("src/lib.rs"), 5_000).await;
+    file_observation(&store, ws, proj, open, Some("other.rs"), 6_000).await;
+    file_observation(&store, ws, proj, expired, Some("src/lib.rs"), 7_000).await;
+    let session_page = |session: SessionId| format!("sessions/{session}.md");
+    store
+        .writer
+        .upsert_page(page(ws, proj, &session_page(paged), "Session", "summary"))
+        .await
+        .unwrap();
+    let mut gone = page(ws, proj, &session_page(expired), "Session", "summary");
+    gone.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(gone).await.unwrap();
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, proj, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    let by_session =
+        |session: SessionId| hits.iter().find(|hit| hit.session_id == session).unwrap();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(
+        by_session(paged).page.as_ref().map(PagePath::as_str),
+        Some(session_page(paged).as_str())
+    );
+    assert_eq!(
+        by_session(expired).page,
+        None,
+        "an expired page counts as none"
+    );
+    let open_hit = by_session(open);
+    assert_eq!((open_hit.page.as_ref(), open_hit.hits), (None, 2));
+    assert_eq!(open_hit.last_seen.as_microsecond(), 5_000);
+
+    let read = store
+        .reader
+        .session_observations_scoped(
+            ws,
+            proj,
+            open,
+            ai_memory_store::ObservationPage {
+                limit: 1,
+                offset: usize::try_from(open_hit.last_offset).unwrap(),
+                order: ai_memory_store::ObservationOrder::Asc,
+                kinds: None,
+                query: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.records[0].id, newest);
 }

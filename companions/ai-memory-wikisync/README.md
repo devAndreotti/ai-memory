@@ -26,6 +26,10 @@ cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
 cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
 ```
 
+The [Windows workflow](../../.github/workflows/windows.yml) checks this
+companion separately when its files or that workflow change, when a PR has
+the `windows` or `full-ci` label, and on nightly or manual runs.
+
 ## Usage
 
 ```bash
@@ -48,13 +52,18 @@ ai-memory-wikisync sync ... --apply --prefer repo   # or --prefer server
 ai-memory-wikisync sync ... --apply --propagate-deletes
 ```
 
+- The state file records the server, workspace and project it came from. If
+  you point the same `--dest` at a different scope, the run refuses before
+  writing (a foreign baseline would make that project's pages look deleted);
+  pass `--adopt-scope` to discard the baseline and export fresh.
 - `plan` never writes, not even the state file.
 - `export --apply` writes/updates markdown files under `--dest` and prints
   the `git add` / `git commit` / `git push` commands you may run yourself.
   The tool never runs git, never commits, and never pushes.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
-  directories (`_rules`, `decisions`, …). At least one is required and a
-  bare `*` is refused: only what you name is exported.
+  families: a directory (`_rules`, `decisions`, …) or a top-level Markdown
+  page with that stem (`roadmap` selects `roadmap.md`). At least one is
+  required and a bare `*` is refused: only what you name is exported.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` (plus
   `AI_MEMORY_SERVER_URL` for the server origin). Tokens are never logged
   and never written to disk.
@@ -86,6 +95,14 @@ each successful write batch): per page, the SHA-256 of the bytes last
 written plus the server `ETag` and version id observed at that write.
 Nothing else is stored: no tokens and no server credentials.
 
+Mutating `export --apply` and `sync --apply` runs take an exclusive OS lock
+for the destination before loading this state and hold it through planning,
+writes, and the final state save. A second mutating run fails promptly with a
+busy-destination error; a crash releases the lock automatically. Read-only
+`plan`, dry-run export/sync, and `sync --check` do not create or take the lock,
+so they remain strictly non-mutating; when run alongside an apply, their report
+may describe the state before that apply finishes.
+
 The state is per clone. The state directory carries a `.gitignore` of `*`,
 so committing the destination never commits the state: two clones that
 shared one would conflict on every merge and trust each other's baselines.
@@ -109,12 +126,25 @@ This section describes `plan` and `export`; `sync` adds the rules under
   names, `.md` leaf, bounded depth/length) before it is joined onto
   `--dest`; case-fold collisions are refused; symlinked destinations,
   symlinked components and symlinked state directories are refused; files
-  are replaced atomically (tmp + rename + fsync).
+  are replaced atomically through an unpredictably named, exclusively
+  created staging file (tmp + rename + fsync), so a symlink planted in a
+  shared destination can be neither followed nor raced
+  (GHSA-jr85-7366-xrm2).
+  On Windows, ordinary absolute and relative destinations are accepted;
+  directory junctions and paths through them are still refused.
 - **Local edits win until forced.** Each page is compared three ways:
   destination file, last exported state, server body. A file that
-  diverged from both is reported with a diff summary and refused; the
+  diverged from both is reported with a diff summary and refused. The summary
+  identifies the first differing line, including appended or removed lines;
+  a missing line is shown as `<end of file>`. The
   whole batch is then refused and nothing is written. `--force` overwrites the
   divergent files with server content.
+- **Edits during export are preserved.** Before each replacement, `export
+  --apply` rechecks the file against the bytes the plan read. A file edited,
+  created or removed during the server requests is left alone, even with
+  `--force`, and the run exits non-zero. Earlier files may already have been
+  exported; the state stays at the previous successful batch so the next run
+  compares those files again.
 - **Never deletes.** `plan` and `export` never delete local files or server
   pages, including brand-new local files inside an allowlisted family.
   Only `sync --propagate-deletes` deletes (see below).
@@ -154,7 +184,10 @@ Safety rules:
   import; the refusal names the keys. Such pages still export.
 - **Every write is conditional.** Each import carries the page version the
   plan classified (`expected_page_id`), or `create_only` for a new page, and
-  each delete carries the version too. A page that changes on the server
+  each delete carries the version too. An edited repository file triggers a
+  full page read, so classification and the write precondition use the same
+  server version. Unchanged files still use ETag revalidation. A page that
+  changes on the server
   after it was classified is refused by the server, reported as "changed
   during this run", and left with its old state for the next run; the other
   pages still sync, and the run exits non-zero. A server without these
@@ -177,9 +210,12 @@ Safety rules:
   the whole run. A pinned server page is never deleted unless `--prefer repo`
   is given. A file is deleted only through the same path checks as a write
   (no symlinked file or directory, nothing outside `--dest`) and only if it
-  still holds the bytes the plan classified. The tool never runs git: it
-  prints the `git rm` to stage the deletes. Apply order is imports, exports,
-  server deletes, file deletes.
+  still holds the bytes the plan classified. Before deleting a server page,
+  the tool rechecks that its repository file is still absent. A file restored
+  during planning keeps the server page and baseline, even with `--prefer repo`;
+  the run reports the change and exits non-zero so the next sync can reconsider
+  it. The tool never runs git: it prints the `git rm` to stage the deletes.
+  Apply order is imports, exports, server deletes, file deletes.
 
 ## CI and post-merge
 
@@ -227,8 +263,9 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
   manager.
 - No token is ever written (`--token` is refused; the hook reads
   `AI_MEMORY_AUTH_TOKEN` when it runs), every argument is single-quoted, and
-  newlines or NUL are refused. The file is replaced atomically with mode
-  0755; a symlinked hook is refused, and an existing hook without the block
+  newlines or NUL are refused. The file is replaced atomically, with mode
+  0755, through an unpredictably named, exclusively created staging file;
+  a symlinked hook is refused, and an existing hook without the block
   is refused unless `--append` is given and its shebang is a POSIX shell.
   The companion never runs git.
 

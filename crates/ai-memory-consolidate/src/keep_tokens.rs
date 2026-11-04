@@ -32,6 +32,8 @@ struct Pattern {
     re: Regex,
     /// Capture group whose text is the token (0 = the whole match).
     group: usize,
+    /// Diagnostic-line matches are clipped, not discarded, when long.
+    line: bool,
 }
 
 /// The mined token classes, in the order they are appended (higher-signal
@@ -65,6 +67,48 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
         .map(|(p, group)| Pattern {
             re: Regex::new(p).expect("keep-token pattern must compile"),
             group: *group,
+            line: false,
+        })
+        .collect()
+});
+
+/// Literal classes useful when an observation was omitted from an LLM prompt.
+///
+/// Unlike [`PATTERNS`], this intentionally excludes code spans and generic
+/// identifiers: source reads otherwise consume the bounded residue with names
+/// that carry little diagnostic value.
+static RESIDUE_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    let raw: &[(&str, usize, bool)] = &[
+        (
+            r"(?m)((?:\berror(?:\[E\d{2,4}\])?: |\bERROR: |\bERRO: |\bErro: |\bERR! |\b\w*(?:Error|Exception): |\bpanicked at |\bFAILED\b|\bfatal: |\bFATAL: |Traceback \(most recent call last\))[^\n\r\u{2028}\u{2029}]*)",
+            1,
+            true,
+        ),
+        (r#"https?://[^\s<>()\[\]\"'`]+"#, 0, false),
+        (
+            r"(?:/|\b)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+\b",
+            0,
+            false,
+        ),
+        (
+            r"\b[A-Za-z0-9_.-]+\.(?:rs|md|toml|sql|json|ya?ml|sh|py|js|ts|tsx|jsx|rb|go|c|h|cc|cpp|hpp|txt|lock|cfg|ini|env|xml|html|css|proto)\b",
+            0,
+            false,
+        ),
+        (r"\bE\d{2,4}\b", 0, false),
+        (r"\bHTTP\s?\d{3}\b", 0, false),
+        (
+            r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\bv?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b",
+            0,
+            false,
+        ),
+        (r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b", 0, false),
+    ];
+    raw.iter()
+        .map(|(pattern, group, line)| Pattern {
+            re: Regex::new(pattern).expect("residue-token pattern must compile"),
+            group: *group,
+            line: *line,
         })
         .collect()
 });
@@ -77,26 +121,100 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 /// safe to drop.
 #[must_use]
 pub fn mine_keep_tokens(body: &str) -> Vec<String> {
+    mine(&PATTERNS, body, MAX_TOKENS)
+}
+
+/// Extract bounded literal diagnostics from observation text omitted or
+/// truncated by prompt projection.
+///
+/// The result is deterministic, pattern-major, deduplicated, and capped by
+/// `max_tokens`. Callers remain responsible for the aggregate character
+/// budget across observations.
+#[must_use]
+pub fn mine_residue_tokens(body: &str, max_tokens: usize) -> Vec<String> {
+    mine(&RESIDUE_PATTERNS, body, max_tokens)
+}
+
+/// Keep-tokens mined from `sources` that `rewrite` no longer contains.
+///
+/// Presence is a search of the rewrite, not a second mine: [`mine_keep_tokens`]
+/// caps its output, so a long rewrite that keeps a token past the cap must not
+/// count it as dropped. The search needs a word boundary wherever the token
+/// starts or ends with a word character, so `ops.rs` is not kept by `myops.rs`
+/// nor `retry` by `retry_budget`.
+#[must_use]
+pub(crate) fn dropped_keep_tokens<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    rewrite: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sources
+        .into_iter()
+        .flat_map(mine_keep_tokens)
+        .filter(|token| !contains_token(rewrite, token) && seen.insert(token.clone()))
+        .collect()
+}
+
+/// Whether `token` occurs in `text` as a whole token: an occurrence counts only
+/// when no word character (`[A-Za-z0-9_]`) touches a word-character edge of it.
+fn contains_token(text: &str, token: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let (Some(first), Some(last)) = (token.chars().next(), token.chars().next_back()) else {
+        return false;
+    };
+    text.match_indices(token).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + token.len()..].chars().next();
+        let glued_before = is_word(first) && before.is_some_and(is_word);
+        let glued_after = is_word(last) && after.is_some_and(is_word);
+        !(glued_before || glued_after)
+    })
+}
+
+pub(crate) fn has_residue_error_line(body: &str) -> bool {
+    RESIDUE_PATTERNS[0].re.is_match(body)
+}
+
+fn mine(patterns: &[Pattern], body: &str, max_tokens: usize) -> Vec<String> {
+    if max_tokens == 0 {
+        return Vec::new();
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for pattern in PATTERNS.iter() {
+    for pattern in patterns {
         for caps in pattern.re.captures_iter(body) {
             let Some(m) = caps.get(pattern.group) else {
                 continue;
             };
-            let token = trim_token(m.as_str());
+            let token = if pattern.line {
+                clip_diagnostic_line(m.as_str())
+            } else {
+                trim_token(m.as_str())
+            };
             if token.len() < MIN_TOKEN_LEN || token.len() > MAX_TOKEN_LEN {
                 continue;
             }
             if seen.insert(token.to_string()) {
                 out.push(token.to_string());
-                if out.len() >= MAX_TOKENS {
+                if out.len() >= max_tokens {
                     return out;
                 }
             }
         }
     }
     out
+}
+
+fn clip_diagnostic_line(raw: &str) -> &str {
+    let raw = raw.trim();
+    if raw.len() <= MAX_TOKEN_LEN {
+        return raw;
+    }
+    let mut end = MAX_TOKEN_LEN;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].trim_end()
 }
 
 /// Trim wrapping punctuation a regex greedily swallowed at a token's edges — a
@@ -114,6 +232,34 @@ fn trim_token(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_keep_tokens_names_source_facts_missing_from_the_rewrite() {
+        let a = "Fixed in crates/store/src/ops.rs with `retry_budget`.";
+        let b = "Same flake, culprit crates/store/src/reader.rs (E0433).";
+        let faithful = "ops.rs fix at crates/store/src/ops.rs and \
+             crates/store/src/reader.rs, `retry_budget`, E0433.";
+        assert!(dropped_keep_tokens([a, b], faithful).is_empty());
+        assert_eq!(
+            dropped_keep_tokens([a, b], "Fixed crates/store/src/ops.rs via retry_budget."),
+            ["crates/store/src/reader.rs", "reader.rs", "E0433"]
+        );
+    }
+
+    /// A token survives only as a whole token: one that appears in the rewrite
+    /// only inside a longer word is dropped, while punctuation or a path
+    /// separator next to it still counts as kept.
+    #[test]
+    fn dropped_keep_tokens_needs_a_whole_token_in_the_rewrite() {
+        let source = "Touched ops.rs and `retry` for E0433.";
+        assert_eq!(
+            dropped_keep_tokens([source], "Touched myops.rs, retry_budget, E04331."),
+            ["ops.rs", "E0433", "retry"]
+        );
+        assert!(
+            dropped_keep_tokens([source], "See src/ops.rs; (`retry`) E0433: fixed.").is_empty()
+        );
+    }
 
     #[test]
     fn fix_note_keeps_paths_error_codes_and_urls() {
@@ -195,5 +341,65 @@ mod tests {
         }
         let tokens = mine_keep_tokens(&body);
         assert!(tokens.len() <= MAX_TOKENS, "count capped: {}", tokens.len());
+    }
+
+    #[test]
+    fn residue_miner_keeps_diagnostics_versions_and_paths_without_source_noise() {
+        let body = "error[E0433]: failed to resolve: use of undeclared crate `bar`\n\
+            TypeError: Cannot read properties of undefined\n\
+            thread 'main' panicked at src/x.rs:1:1:\n\
+            FAILED. 3 passed; 1 failed\n\
+            ERROR:  cannot execute UPDATE in a read-only transaction\n\
+            ERRO:  valor duplicado\n\
+            release v2.6.3-rc1 on 192.0.2.11 from crates/x/src/net.rs and /var/lib/app/state.done\n\
+            Result<Config, ConfigError> use std::error::Error; #[error(\"io\")] \
+            throw new AppError( errors error_handling stderr";
+        let tokens = mine_residue_tokens(body, 64);
+
+        for expected in [
+            "error[E0433]: failed to resolve: use of undeclared crate `bar`",
+            "TypeError: Cannot read properties of undefined",
+            "panicked at src/x.rs:1:1:",
+            "FAILED. 3 passed; 1 failed",
+            "ERROR:  cannot execute UPDATE in a read-only transaction",
+            "ERRO:  valor duplicado",
+            "v2.6.3-rc1",
+            "192.0.2.11",
+            "crates/x/src/net.rs",
+            "/var/lib/app/state.done",
+        ] {
+            assert!(
+                tokens.iter().any(|token| token == expected),
+                "{expected}: {tokens:?}"
+            );
+        }
+        for noise in ["ConfigError", "AppError", "error_handling", "stderr"] {
+            assert!(
+                !tokens.iter().any(|token| token == noise),
+                "{noise}: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn residue_error_lines_cut_on_a_character_boundary_and_keep_closing_punctuation() {
+        let accented = format!("ERRO: {} `fim`", "ação ".repeat(40));
+        let tokens = mine_residue_tokens(&accented, 8);
+        let error = tokens.first().expect("diagnostic line");
+        assert!(error.len() <= MAX_TOKEN_LEN);
+        assert!(std::str::from_utf8(error.as_bytes()).is_ok());
+
+        let tokens = mine_residue_tokens("error: short diagnostic `bar`", 8);
+        assert_eq!(tokens[0], "error: short diagnostic `bar`");
+    }
+
+    #[test]
+    fn residue_version_pattern_does_not_widen_to_two_components_or_prefixed_text() {
+        let tokens = mine_residue_tokens("1.95 python3.12.4 20.20.0 v2.6.3 1.2.3.4", 16);
+        assert!(tokens.iter().any(|token| token == "20.20.0"));
+        assert!(tokens.iter().any(|token| token == "v2.6.3"));
+        assert!(tokens.iter().any(|token| token == "1.2.3.4"));
+        assert!(!tokens.iter().any(|token| token == "1.95"));
+        assert!(!tokens.iter().any(|token| token == "3.12.4"));
     }
 }

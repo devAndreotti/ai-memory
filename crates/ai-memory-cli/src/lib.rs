@@ -25,10 +25,14 @@ mod config;
 mod http_client;
 mod install_layout;
 mod local_auth;
+mod localization;
 mod logging;
 mod marker;
 mod process_guard;
+mod proxy_env;
+pub mod runtime_flavor;
 mod server_profiles;
+mod terminal;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -39,11 +43,39 @@ use config::Config;
 /// exit code call [`std::process::exit`] directly rather than encoding it in
 /// the return type.
 pub async fn run() -> Result<()> {
+    let runtime_env = config::RuntimeEnv::from_process();
+    let cli = cli::parse_process(&runtime_env);
+    let mut active_language = cli
+        .language
+        .or_else(|| {
+            runtime_env
+                .var_os("AI_MEMORY_LANGUAGE")
+                .as_deref()
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_default();
+    dispatch(cli, runtime_env, &mut active_language)
+        .await
+        .map_err(|error| localization::localize_failure(error, active_language))
+}
+
+/// The text to print for an error [`run`] returned.
+pub fn failure_report(error: &anyhow::Error) -> String {
+    localization::failure_report(error)
+}
+
+async fn dispatch(
+    cli: Cli,
+    runtime_env: config::RuntimeEnv,
+    active_language: &mut ai_memory_core::i18n::Language,
+) -> Result<()> {
     let Cli {
+        language,
         data_dir,
         config: config_path,
         command,
-    } = cli::parse_process();
+    } = cli;
 
     // Hooks fire on every tool call: they must be cheap and must emit ONLY
     // their JSON object to stdout. Short-circuit before config load and
@@ -65,7 +97,24 @@ pub async fn run() -> Result<()> {
         other => other,
     };
 
-    let config = Arc::new(Config::load(config_path.as_deref(), data_dir)?);
+    let startup_language = *active_language;
+    let mut config = Config::load_with_runtime_env(config_path.as_deref(), data_dir, runtime_env)
+        .map_err(|error| {
+        if startup_language == ai_memory_core::i18n::Language::English {
+            error
+        } else {
+            error.context(
+                ai_memory_core::i18n::Localizer::new(startup_language)
+                    .text("cli-config-load-failed"),
+            )
+        }
+    })?;
+    if let Some(language) = language {
+        config.language = language;
+        config.i18n = ai_memory_core::i18n::Localizer::new(language);
+    }
+    *active_language = config.language;
+    let config = Arc::new(config);
     // Only the long-running server warns when file logging degrades (an
     // operator wants to know persistent logs moved); one-shot client
     // commands degrade silently: their file logs are irrelevant and the
@@ -79,15 +128,23 @@ pub async fn run() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        server_url = %config.server_url,
-        data_dir = %config.data_dir.display(),
+        server_url = %http_client::display_url(&config.server_url),
+        data_dir = %commands::path_util::display_path(&config.data_dir),
         bind = %config.bind,
         "ai-memory starting",
     );
+    // The bridge only talks to the local server with proxies disabled, and an
+    // MCP client would surface the warning on every session start.
+    if !matches!(command, Command::McpBridge(_)) {
+        proxy_env::warn_unusable(&config.runtime_env);
+    }
 
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Setup(args) => commands::setup::run(&config, args, config_path.as_deref()).await,
+        Command::ServiceHost(args) => {
+            commands::service_host::run(&config, args, config_path.as_deref()).await
+        }
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
@@ -132,6 +189,7 @@ pub async fn run() -> Result<()> {
             commands::audit_contamination::run(&config, args).await
         }
         Command::Search(args) => commands::search::run(&config, args).await,
+        Command::Recent(args) => commands::recent::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
@@ -144,7 +202,7 @@ pub async fn run() -> Result<()> {
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::BackupAgents(args) => commands::backup_agents::run(&config, args),
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
-        Command::Restore(args) => commands::restore::run(&config, args),
+        Command::Restore(args) => commands::restore::run(&config, args).await,
         Command::RestoreAgents(args) => commands::restore_agents::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
@@ -183,9 +241,13 @@ pub async fn run() -> Result<()> {
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
+        Command::MergeProject(args) => commands::merge_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
-        Command::Upgrade(args) => commands::upgrade::run(&config, args).await,
+        Command::Upgrade(args) => {
+            commands::upgrade::run(&config, config_path.as_deref(), args).await
+        }
+        Command::UpgradeRefreshHooks => commands::upgrade::refresh_after_replace(&config),
         Command::Auth(args) => commands::auth::run(&config, args, config_path.as_deref()).await,
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,

@@ -19,7 +19,7 @@ use ai_memory_hooks::{
     CaptureDecision, CaptureDisposition, CapturePolicy, PolicyState, ToolFamily, tool_call_payload,
     valid_call_id,
 };
-use ai_memory_workstream::RECORD_CWD_KEY;
+use ai_memory_workstream::{RECORD_CWD_KEY, SKIPPED_RECORD_KEY};
 use serde_json::Value;
 
 use super::hook::{
@@ -37,8 +37,8 @@ pub(crate) enum EventCapture {
     Drop,
     /// A tool the capture policy does not recognize: record that it ran,
     /// never its arguments or output. The live server stores only the family
-    /// for an unknown-family tool, whatever the policy, so an import must not
-    /// store more.
+    /// for an unknown-family tool, plus an MCP tool's validated server and
+    /// tool names, whatever the policy, so an import must not store more.
     Unrecognized,
     /// Record that the tool ran, never its arguments or output.
     MetadataOnly(CaptureDecision),
@@ -120,9 +120,17 @@ impl TranscriptCapture {
     /// decision of a public one. A result whose id matches no recorded call,
     /// or with no call at all, is an orphan: dropped under a policy, since
     /// nothing proves it missed every ignored path, and content-free without
-    /// one.
+    /// one. A record the exporter skipped as oversized could have been one of
+    /// the turn's calls, so its marker counts as an orphan call there and an
+    /// id-less result of that turn fails closed with it.
     pub(crate) fn decide(&self, events: &[NewWorkstreamEvent]) -> Vec<EventCapture> {
         if !self.admitted {
+            return vec![EventCapture::Drop; events.len()];
+        }
+        // Codex's own memory-writing agent is dropped by the live hook (#1674)
+        // on checkout cwd, an event's recorded cwd, or the prompt header. An
+        // import of the same run must not reintroduce those events.
+        if self.drops_codex_memory_agent(events) {
             return vec![EventCapture::Drop; events.len()];
         }
         let mut elsewhere = HashMap::new();
@@ -170,6 +178,9 @@ impl TranscriptCapture {
                 WorkstreamEventKind::Compaction
                 | WorkstreamEventKind::Checkpoint
                 | WorkstreamEventKind::Annotation => {
+                    if skipped_record(event) {
+                        turn.push(self.orphan_result());
+                    }
                     if admitted {
                         EventCapture::Keep
                     } else {
@@ -232,6 +243,28 @@ impl TranscriptCapture {
             checkout_admits_capture(&self.data_dir, cwd)
                 && delivers_to_same_server(&self.data_dir, &self.cwd, cwd)
                 && routes_to_same_project(&self.cwd, cwd)
+        })
+    }
+
+    /// Whether this import is Codex's background memory-writing agent (#1674).
+    ///
+    /// The live hook's primary signal is cwd (every event of the run carries
+    /// it, SessionStart included). The header catches a `CODEX_HOME` whose
+    /// last component is not `.codex`. `backfill` and `run` pass the project
+    /// checkout as this capture's cwd, so an event's recorded cwd is checked
+    /// too.
+    fn drops_codex_memory_agent(&self, events: &[NewWorkstreamEvent]) -> bool {
+        if ai_memory_core::is_codex_memory_agent_cwd(&self.cwd) {
+            return true;
+        }
+        events.iter().any(|event| {
+            if event.agent != AgentKind::Codex {
+                return false;
+            }
+            record_cwd(event).is_some_and(ai_memory_core::is_codex_memory_agent_cwd)
+                || (matches!(event.kind, WorkstreamEventKind::Message)
+                    && matches!(event.role.as_deref(), Some("user" | "human"))
+                    && ai_memory_core::looks_like_codex_memory_agent_prompt(&event.content))
         })
     }
 
@@ -345,6 +378,17 @@ fn shell_mode_output(event: &NewWorkstreamEvent) -> bool {
         && TAGS
             .iter()
             .any(|tag| event.content.trim_start().starts_with(tag))
+}
+
+/// Whether the event is the exporter's marker for a record it skipped as
+/// oversized.
+fn skipped_record(event: &NewWorkstreamEvent) -> bool {
+    event.kind == WorkstreamEventKind::Annotation
+        && event
+            .metadata
+            .get(SKIPPED_RECORD_KEY)
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 /// The native id linking a tool call and its result, when the adapter kept one.
@@ -519,6 +563,58 @@ mod tests {
         );
     }
 
+    /// A record the exporter skipped as oversized may have been an excluded
+    /// call (a large write under an ignored path) whose result follows with
+    /// no id. Its marker makes that result an orphan instead of letting a
+    /// public sibling call lend it a keep; the next user turn starts clean.
+    /// Control: the same turn without the marker keeps the result.
+    #[test]
+    fn a_skipped_record_makes_the_id_less_results_of_its_turn_orphans() {
+        let skipped = || {
+            event(
+                WorkstreamEventKind::Annotation,
+                "assistant",
+                "a transcript record over the per-record size cap was skipped",
+                json!({ SKIPPED_RECORD_KEY: true }),
+            )
+        };
+        for (marker, orphan) in [(Some("secrets/**"), "drop"), (None, "unrecognized")] {
+            let repo = checkout(marker);
+            let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+            let turn = |gap: Option<NewWorkstreamEvent>| {
+                let mut events = vec![
+                    event(WorkstreamEventKind::Message, "user", "do it", json!({})),
+                    read_call(&repo.path().join("src/lib.rs"), None),
+                    result("public code", None),
+                ];
+                events.extend(gap);
+                events.push(result("SKIPPEDSENTINEL wrote secrets/dump.json", None));
+                events.extend([
+                    event(WorkstreamEventKind::Message, "user", "next", json!({})),
+                    read_call(&repo.path().join("src/lib.rs"), None),
+                    result("public code again", None),
+                ]);
+                events
+            };
+            let events = turn(Some(skipped()));
+            assert_eq!(
+                kinds(&capture.decide(&events)),
+                [
+                    "keep", "keep", "keep", "keep", orphan, "keep", "keep", "keep"
+                ],
+                "{marker:?}"
+            );
+            let uploaded = serde_json::to_string(&capture.filter_ledger_events(events)).unwrap();
+            assert!(!uploaded.contains("SKIPPEDSENTINEL"), "{uploaded}");
+            assert!(uploaded.contains("public code again"), "{uploaded}");
+            assert_eq!(
+                kinds(&capture.decide(&turn(None))),
+                ["keep", "keep", "keep", "keep", "keep", "keep", "keep"],
+                "{marker:?}: without a gap the turn's public call decides"
+            );
+        }
+    }
+
     #[test]
     fn unrecoverable_arguments_and_orphan_results_fail_closed_under_a_policy() {
         let repo = checkout(Some("docs/adr/**"));
@@ -561,6 +657,115 @@ mod tests {
             kinds(&capture.decide(&events)),
             ["keep", "keep", "unrecognized"]
         );
+    }
+
+    /// Codex's memory-writing agent runs from `$CODEX_HOME/memories`, and the
+    /// live hook drops every event of that run (#1674). An import must not
+    /// reintroduce what the hook refused: all events drop, prompts included,
+    /// while an ordinary checkout in the same import keeps them.
+    #[test]
+    fn an_import_of_codex_memory_agent_runs_captures_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let memories = home.path().join(".codex").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        let capture = TranscriptCapture::for_checkout(home.path(), &memories);
+        let events = [
+            event(
+                WorkstreamEventKind::Message,
+                "user",
+                "consolidate",
+                json!({}),
+            ),
+            read_call(&memories.join("notes.md"), None),
+            result("notes", None),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
+
+        let repo = checkout(None);
+        let control = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [event(
+            WorkstreamEventKind::Message,
+            "user",
+            "please fix the test",
+            json!({}),
+        )];
+        assert_eq!(kinds(&control.decide(&events)), ["keep"]);
+    }
+
+    /// The live hook's second signal is the agent's prompt header, for a
+    /// `CODEX_HOME` whose last component is not `.codex`. An import of that
+    /// run from a project checkout must drop every event, not only the prompt.
+    #[test]
+    fn an_import_drops_a_codex_memory_agent_run_by_prompt_header() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [
+            as_codex(event(
+                WorkstreamEventKind::Message,
+                "user",
+                "## Memory Writing Agent: Phase 2 (Consolidation)\n\nnotes",
+                json!({}),
+            )),
+            as_codex(read_call(&repo.path().join("notes.md"), None)),
+            as_codex(result("notes", None)),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
+    }
+
+    /// A Codex user prompt that is not the memory-writing header stays. The
+    /// header matcher is prefix-based on `## Memory Writing Agent`; ordinary
+    /// work that names the agent in prose must not drop the session.
+    #[test]
+    fn a_codex_run_with_an_ordinary_prompt_is_kept() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [as_codex(event(
+            WorkstreamEventKind::Message,
+            "user",
+            "Please update the memory writing agent docs",
+            json!({}),
+        ))];
+        assert_eq!(kinds(&capture.decide(&events)), ["keep"]);
+    }
+
+    /// The header is a Codex signal. A Claude user message that opens with
+    /// the same words is kept, matching the live hook's agent gate.
+    #[test]
+    fn a_claude_prompt_with_the_memory_agent_header_is_kept() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [event(
+            WorkstreamEventKind::Message,
+            "user",
+            "## Memory Writing Agent: Phase 2 (Consolidation)\n\nnotes",
+            json!({}),
+        )];
+        assert_eq!(kinds(&capture.decide(&events)), ["keep"]);
+    }
+
+    /// `backfill` and `run` pass the project checkout as the capture cwd. An
+    /// event whose recorded cwd is `$CODEX_HOME/memories` is still the
+    /// memory-writing agent and must drop the whole import.
+    #[test]
+    fn an_import_drops_a_codex_memory_agent_run_by_recorded_cwd() {
+        let repo = checkout(None);
+        let memories = repo.path().join(".codex").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [
+            as_codex(at(
+                event(
+                    WorkstreamEventKind::Message,
+                    "user",
+                    "consolidate",
+                    json!({}),
+                ),
+                &memories,
+            )),
+            as_codex(at(read_call(&memories.join("notes.md"), None), &memories)),
+            as_codex(at(result("notes", None), &memories)),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
     }
 
     /// A result carrying an id that matches no recorded call follows the
@@ -745,6 +950,11 @@ mod tests {
 
     fn at(mut event: NewWorkstreamEvent, cwd: &Path) -> NewWorkstreamEvent {
         event.metadata[RECORD_CWD_KEY] = cwd.to_string_lossy().into_owned().into();
+        event
+    }
+
+    fn as_codex(mut event: NewWorkstreamEvent) -> NewWorkstreamEvent {
+        event.agent = AgentKind::Codex;
         event
     }
 

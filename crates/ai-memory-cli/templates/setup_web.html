@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="{{ i18n.tag() }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{ i18n.text("setup-web-ai-memory-setup") }}</title>
+<style nonce="{{ nonce }}">
+:root {
+  --bg: #fafaf9; --fg: #1c1917; --muted: #57534e; --line: #e7e5e4;
+  --card: #ffffff; --accent: #0f766e; --accent-fg: #ffffff; --bad: #b91c1c; --good: #15803d;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --line: #44403c;
+    --card: #292524; --accent: #2dd4bf; --accent-fg: #042f2e; --bad: #f87171; --good: #4ade80;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+p.lead { color: var(--muted); margin: 0 0 24px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+code, pre { font-family: var(--mono); font-size: 13px; }
+code { overflow-wrap: anywhere; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+label.agent { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
+label.agent:first-of-type { border-top: 0; }
+label.agent small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
+.others { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; }
+.others label { display: inline-flex; gap: 6px; align-items: center; }
+button { font: inherit; border: 0; border-radius: 8px; padding: 10px 18px; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+button[disabled] { opacity: .5; cursor: default; }
+button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+.actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.note { color: var(--muted); font-size: 13px; }
+pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 12px 0 0; }
+.result { font-weight: 600; margin-top: 12px; }
+.result.ok { color: var(--good); }
+.result.bad { color: var(--bad); }
+.question { font-family: var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; display: inline-block; margin-top: 6px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{ i18n.text("setup-web-ai-memory-setup") }}</h1>
+  <p class="lead">{{ i18n.text("setup-web-check-the-plan-choose-your-agents-and-apply-nothing-changes-until-you-press-apply") }}</p>
+  <p id="loading" class="note">{{ i18n.text("setup-web-loading-the-plan") }}</p>
+  <p id="failed" class="result bad" hidden></p>
+
+  <div id="plan" hidden>
+    <section>
+      <h2>{{ i18n.text("setup-web-install") }}</h2>
+      <dl>
+        <dt>{{ i18n.text("setup-web-data-dir") }}</dt><dd><code id="data-dir"></code></dd>
+        <dt>{{ i18n.text("setup-web-config") }}</dt><dd><code id="config-path"></code></dd>
+        <dt>{{ i18n.text("setup-web-state") }}</dt><dd id="fresh"></dd>
+        <dt>{{ i18n.text("setup-web-service") }}</dt><dd id="service"></dd>
+      </dl>
+    </section>
+
+    <section>
+      <h2>{{ i18n.text("setup-web-agents") }}</h2>
+      <div id="agents"></div>
+      <p id="no-agents" class="note" hidden>{{ i18n.text("setup-web-no-agent-was-detected-pick-one-below") }}</p>
+      <details id="others-box">
+        <summary>{{ i18n.text("setup-web-other-supported-agents") }}</summary>
+        <div class="others" id="others"></div>
+      </details>
+    </section>
+
+    <section>
+      <div class="actions">
+        <button id="apply" type="button">{{ i18n.text("setup-web-apply") }}</button>
+        <span class="note">{{ i18n.text("setup-web-runs") }} <code>ai-memory setup --yes</code> {{ i18n.text("setup-web-with-the-agents-you-picked-then-checks-the-result") }}</span>
+      </div>
+      <pre id="log" hidden></pre>
+      <div id="outcome" hidden>
+        <p id="result" class="result"></p>
+        <p id="next" hidden>{{ i18n.text("setup-web-restart") }} <span id="restart"></span>{{ i18n.text("setup-web-then-ask-it") }}<br><span class="question" id="question"></span></p>
+      </div>
+      <div class="actions" id="finish-row" hidden>
+        <button id="finish" class="secondary" type="button">{{ i18n.text("setup-web-finish-and-close-the-setup-server") }}</button>
+      </div>
+    </section>
+  </div>
+  <p id="closed" class="note" hidden>{{ i18n.text("setup-web-the-setup-server-has-stopped-you-can-close-this-tab") }}</p>
+</main>
+<script nonce="{{ nonce }}">
+(function () {
+  "use strict";
+  var base = location.pathname.replace(/\/?$/, "/");
+  var csrf = "";
+  var $ = function (id) { return document.getElementById(id); };
+  var text = function (id, value) { $(id).textContent = value; };
+
+  function describeFound(found) {
+    if (!found) return {{ i18n.js("setup-web-named-on-the-command-line")|safe }};
+    var what = { session_store: {{ i18n.js("setup-web-session-store")|safe }}, mcp_config: {{ i18n.js("setup-web-mcp-config")|safe }}, config_dir: {{ i18n.js("setup-web-directory")|safe }} }[found.kind] || found.kind;
+    return {{ i18n.js_two("setup-web-resource-found", "{resource}", "{path}")|safe }}.replace("{resource}",what).replace("{path}",function(){return found.path;});
+  }
+
+  function wiring(value) {
+    return { plugin: {{ i18n.js("setup-web-left-to-its-enabled-ai-memory-plugin")|safe }}, "mcp+hooks+skills": "MCP + hooks + skills", "hooks+skills": "hooks + skills" }[value] || value;
+  }
+
+  function checkbox(name, checked) {
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.name = "agent";
+    box.value = name;
+    box.checked = checked;
+    return box;
+  }
+
+  function render(doc) {
+    var plan = doc.plan;
+    csrf = doc.csrf;
+    text("data-dir", plan.data_dir);
+    text("config-path", plan.config_path);
+    text("fresh", plan.fresh ? {{ i18n.js("setup-web-new-install-creates-the-data-dir-the-config-and-a-root-bearer-token")|safe }} : {{ i18n.js("setup-web-existing-install-kept-as-it-is")|safe }});
+    text("service", plan.service.action === "install"
+      ? {{ i18n.js_two("setup-web-install-service", "{manager}", "{path}")|safe }}.replace("{manager}",plan.service.manager).replace("{path}",function(){return plan.service.path;})
+      : plan.service.reason);
+    var agents = $("agents");
+    plan.agents.forEach(function (agent) {
+      var label = document.createElement("label");
+      label.className = "agent";
+      var body = document.createElement("span");
+      var name = document.createElement("strong");
+      name.textContent = agent.agent;
+      var detail = document.createElement("small");
+      detail.textContent = wiring(agent.wiring) + "; " + describeFound(agent.found);
+      body.appendChild(name);
+      body.appendChild(detail);
+      label.appendChild(checkbox(agent.agent, true));
+      label.appendChild(body);
+      agents.appendChild(label);
+    });
+    $("no-agents").hidden = plan.agents.length > 0;
+    if (plan.agents.length === 0) $("others-box").open = true;
+    var others = $("others");
+    plan.other_agents.forEach(function (name) {
+      var label = document.createElement("label");
+      label.appendChild(checkbox(name, false));
+      label.appendChild(document.createTextNode(name));
+      others.appendChild(label);
+    });
+    text("question", {{ i18n.js("setup-web-first-question")|safe }});
+    $("loading").hidden = true;
+    $("plan").hidden = false;
+  }
+
+  function fail(message) {
+    $("failed").textContent = message;
+    $("failed").hidden = false;
+  }
+
+  function post(path, body) {
+    return fetch(base + path, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ai-memory-setup": csrf },
+      body: JSON.stringify(body || {})
+    });
+  }
+
+  function chosen() {
+    return Array.prototype.slice.call(document.querySelectorAll("input[name=agent]:checked"))
+      .map(function (box) { return box.value; });
+  }
+
+  function poll(from) {
+    fetch(base + "progress?from=" + from).then(function (r) { return r.json(); }).then(function (p) {
+      var log = $("log");
+      if (p.lines.length) {
+        log.textContent += p.lines.join("\n") + "\n";
+        log.scrollTop = log.scrollHeight;
+      }
+      if (!p.done) { setTimeout(function () { poll(p.next); }, 500); return; }
+      $("outcome").hidden = false;
+      var result = $("result");
+      if (p.ok) {
+        result.className = "result ok";
+        result.textContent = {{ i18n.js("setup-web-ai-memory-is-set-up")|safe }};
+        text("restart", p.agents.join(", "));
+        $("next").hidden = p.agents.length === 0;
+      } else {
+        result.className = "result bad";
+        result.textContent = {{ i18n.js("setup-web-setup-finished-with-problems-see-the-lines-starting-with-problem-above-fix-them-and-a")|safe }};
+        $("apply").disabled = false;
+      }
+      $("finish-row").hidden = false;
+    }).catch(function () { setTimeout(function () { poll(from); }, 1000); });
+  }
+
+  $("apply").addEventListener("click", function () {
+    var agents = chosen();
+    if (agents.length === 0) { fail({{ i18n.js("setup-web-pick-at-least-one-agent")|safe }}); return; }
+    $("failed").hidden = true;
+    $("apply").disabled = true;
+    $("log").hidden = false;
+    $("log").textContent = "";
+    $("outcome").hidden = true;
+    post("apply", { agents: agents }).then(function (r) {
+      if (r.status === 202) { poll(0); return; }
+      return r.text().then(function (body) { fail(body || ({{ i18n.js("setup-web-the-server-answered")|safe }} + r.status)); $("apply").disabled = false; });
+    }).catch(function () { fail({{ i18n.js("setup-web-the-setup-server-did-not-answer")|safe }}); $("apply").disabled = false; });
+  });
+
+  $("finish").addEventListener("click", function () {
+    post("finish").finally(function () {
+      $("plan").hidden = true;
+      $("closed").hidden = false;
+    });
+  });
+
+  fetch(base + "plan").then(function (r) {
+    if (!r.ok) throw new Error("status " + r.status);
+    return r.json();
+  }).then(render).catch(function (error) {
+    $("loading").hidden = true;
+    fail({{ i18n.js("setup-web-could-not-load-the-plan")|safe }} + error.message + {{ i18n.js("setup-web-is-ai-memory-setup-setup-web-still-running")|safe }});
+  });
+})();
+</script>
+</body>
+</html>
