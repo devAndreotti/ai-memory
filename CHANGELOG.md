@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- The in-project link graph page (`/web/w/{workspace}/{project}/graph`) now
+  lays pages out with a force-directed simulation, so linked pages cluster,
+  and each node links to its page. The server-drawn circular layout stays as
+  the fallback when JavaScript is off. Node and edge data are embedded in the
+  page, and the cross-project graph keeps its existing layout.
+
 ## [3.4.0] - 2026-11-04
 
 ### Added

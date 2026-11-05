@@ -143,6 +143,31 @@ async fn graph_pages_render_svg_and_edge_table() {
     );
     assert!(html.contains("w/default/app/p/notes/a.md"), "{html}");
 
+    // The progressive force layout reads the same in-project graph from an
+    // inline JSON block; the no-JS SVG above stays as the fallback.
+    assert!(html.contains(r#"id="graph-svg""#), "{html}");
+    let force_json = html
+        .split(r#"<script type="application/json" id="graph-data">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</script>").next())
+        .expect("force graph data block");
+    let force: serde_json::Value = serde_json::from_str(force_json).unwrap();
+    let ids: Vec<&str> = force["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"notes/a.md") && ids.contains(&"notes/b.md"),
+        "{ids:?}"
+    );
+    assert!(
+        !ids.contains(&"notes/x.md"),
+        "cross-project target leaked: {ids:?}"
+    );
+    assert_eq!(force["edges"].as_array().unwrap().len(), 1, "{force_json}");
+
     let (status, body) = get(api.clone(), "/graph").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("notes/x.md"), "{body}");

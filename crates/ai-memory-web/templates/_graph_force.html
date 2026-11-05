@@ -1,0 +1,112 @@
+(function () {
+  var holder = document.getElementById("graph-data");
+  var svg = document.getElementById("graph-svg");
+  if (!holder || !svg) { return; }
+  var data;
+  try { data = JSON.parse(holder.textContent); } catch (e) { return; }
+  var n = data.nodes.length;
+  if (!n) { return; }
+
+  var NS = "http://www.w3.org/2000/svg";
+  var W = 800, H = 800, ITER = 320;
+  var k = Math.sqrt((W * H) / n) * 0.9;
+
+  // Start on a golden-angle spiral so the first frame is already spread out.
+  var nodes = data.nodes.map(function (d, i) {
+    var a = i * 2.39996323, r = 40 + 14 * Math.sqrt(i);
+    var deg = Math.min(d.degree || 0, 8);
+    return {
+      id: d.id, label: d.label, href: d.href,
+      r: 7 + deg * 1.2,
+      x: W / 2 + r * Math.cos(a), y: H / 2 + r * Math.sin(a),
+      dx: 0, dy: 0
+    };
+  });
+  var at = Object.create(null);
+  nodes.forEach(function (node, i) { at[node.id] = i; });
+  var links = [];
+  data.edges.forEach(function (e) {
+    var s = at[e.source], t = at[e.target];
+    if (s !== undefined && t !== undefined && s !== t) { links.push([s, t]); }
+  });
+
+  // Fruchterman-Reingold: all pairs repel, linked pages attract, and a
+  // displacement cap that cools over time. Bounded by the server's node cap.
+  for (var it = 0; it < ITER; it++) {
+    var temp = k * 0.6 * (1 - it / ITER) + 0.5;
+    nodes.forEach(function (v) { v.dx = 0; v.dy = 0; });
+    for (var i = 0; i < n; i++) {
+      for (var j = i + 1; j < n; j++) {
+        var a = nodes[i], b = nodes[j];
+        var x = a.x - b.x, y = a.y - b.y;
+        var d = Math.sqrt(x * x + y * y) || 0.01;
+        var rep = (k * k) / (d * d);
+        a.dx += x * rep; a.dy += y * rep;
+        b.dx -= x * rep; b.dy -= y * rep;
+      }
+    }
+    links.forEach(function (l) {
+      var a = nodes[l[0]], b = nodes[l[1]];
+      var x = a.x - b.x, y = a.y - b.y;
+      var d = Math.sqrt(x * x + y * y) || 0.01;
+      var att = d / k;
+      a.dx -= x * att; a.dy -= y * att;
+      b.dx += x * att; b.dy += y * att;
+    });
+    nodes.forEach(function (v) {
+      // A weak pull to the centre keeps disconnected groups on screen.
+      v.dx += (W / 2 - v.x) * 0.01;
+      v.dy += (H / 2 - v.y) * 0.01;
+      var m = Math.sqrt(v.dx * v.dx + v.dy * v.dy) || 0.01;
+      var c = Math.min(m, temp) / m;
+      // Side margin leaves room for a centred label (about 28 characters).
+      v.x = Math.min(W - 90, Math.max(90, v.x + v.dx * c));
+      v.y = Math.min(H - 36, Math.max(36, v.y + v.dy * c));
+    });
+  }
+
+  // Replace the server-drawn circle layout, keeping the accessible <title>.
+  Array.prototype.slice.call(svg.children).forEach(function (child) {
+    if (child.tagName.toLowerCase() !== "title") { svg.removeChild(child); }
+  });
+
+  var edgeGroup = document.createElementNS(NS, "g");
+  links.forEach(function (l) {
+    var a = nodes[l[0]], b = nodes[l[1]];
+    var line = document.createElementNS(NS, "line");
+    line.setAttribute("x1", a.x.toFixed(1));
+    line.setAttribute("y1", a.y.toFixed(1));
+    line.setAttribute("x2", b.x.toFixed(1));
+    line.setAttribute("y2", b.y.toFixed(1));
+    line.setAttribute("stroke", "currentColor");
+    line.setAttribute("stroke-opacity", "0.35");
+    line.setAttribute("stroke-width", "1.5");
+    edgeGroup.appendChild(line);
+  });
+  svg.appendChild(edgeGroup);
+
+  nodes.forEach(function (v) {
+    var link = document.createElementNS(NS, "a");
+    link.setAttribute("href", v.href);
+    var g = document.createElementNS(NS, "g");
+    var title = document.createElementNS(NS, "title");
+    title.textContent = v.label;
+    g.appendChild(title);
+    var circle = document.createElementNS(NS, "circle");
+    circle.setAttribute("cx", v.x.toFixed(1));
+    circle.setAttribute("cy", v.y.toFixed(1));
+    circle.setAttribute("r", v.r.toFixed(1));
+    circle.setAttribute("fill", "#2563eb");
+    g.appendChild(circle);
+    var text = document.createElementNS(NS, "text");
+    text.setAttribute("x", v.x.toFixed(1));
+    text.setAttribute("y", (v.y + v.r + 12).toFixed(1));
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("font-size", "11");
+    text.setAttribute("fill", "currentColor");
+    text.textContent = v.label.length > 28 ? v.label.slice(0, 27) + "…" : v.label;
+    g.appendChild(text);
+    link.appendChild(g);
+    svg.appendChild(link);
+  });
+})();

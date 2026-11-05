@@ -49,7 +49,7 @@
 {% if svg_nodes.is_empty() %}
 <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.label(empty_message) }}</p>
 {% else %}
-<svg viewBox="0 0 800 800" class="w-full max-w-3xl mx-auto mb-10 text-slate-700 dark:text-slate-200" role="img" aria-labelledby="graph-heading">
+<svg id="graph-svg" viewBox="0 0 800 800" class="w-full max-w-3xl mx-auto mb-10 text-slate-700 dark:text-slate-200" role="img" aria-labelledby="graph-heading">
   <title id="graph-heading">{{ i18n.label(heading) }}</title>
   {% for edge in svg_edges %}
   <line x1="{{ edge.x1 }}" y1="{{ edge.y1 }}" x2="{{ edge.x2 }}" y2="{{ edge.y2 }}" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.5" />
@@ -64,6 +64,10 @@
   </a>
   {% endfor %}
 </svg>
+{% if !graph_data.is_empty() %}
+<script type="application/json" id="graph-data">{{ graph_data|safe }}</script>
+<script>{% include "_graph_force.html" %}</script>
+{% endif %}
 {% endif %}
 
 <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-edges") }}</h2>

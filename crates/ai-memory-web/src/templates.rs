@@ -1103,6 +1103,9 @@ pub(crate) struct GraphView {
     pub svg_edges: Vec<GraphSvgEdge>,
     /// Accessible edge table.
     pub rows: Vec<GraphEdgeRow>,
+    /// JSON `{nodes, edges}` for the progressive force layout. Empty on the
+    /// global graph, which keeps the server-side circular layout.
+    pub graph_data: String,
 }
 
 /// View-model for the root-only `GET /health`.

@@ -96,10 +96,61 @@ async fn render_global(
         svg_nodes,
         svg_edges,
         rows,
+        graph_data: String::new(),
     }
     .render()
     .map(Html)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Node in the progressive force layout embedded in the project graph page.
+#[derive(serde::Serialize)]
+struct ForceNode {
+    id: String,
+    label: String,
+    href: String,
+    degree: u64,
+}
+
+/// Edge in the progressive force layout; both ends are node ids (page paths).
+#[derive(serde::Serialize)]
+struct ForceEdge {
+    source: String,
+    target: String,
+}
+
+#[derive(serde::Serialize)]
+struct ForceGraph {
+    nodes: Vec<ForceNode>,
+    edges: Vec<ForceEdge>,
+}
+
+/// Serialises the project graph for an inline `<script type="application/json">`.
+/// `<` is escaped so no page title can close the script element early.
+fn force_graph_json(workspace: &str, project: &str, graph: &LinkGraph) -> String {
+    let data = ForceGraph {
+        nodes: graph
+            .nodes
+            .iter()
+            .map(|node| ForceNode {
+                id: node.path.clone(),
+                label: node.title.clone(),
+                href: page_href(workspace, project, &node.path),
+                degree: node.degree,
+            })
+            .collect(),
+        edges: graph
+            .edges
+            .iter()
+            .map(|edge| ForceEdge {
+                source: edge.from_path.clone(),
+                target: edge.to_path.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&data)
+        .unwrap_or_else(|_| "{\"nodes\":[],\"edges\":[]}".to_owned())
+        .replace('<', "\\u003c")
 }
 
 fn render_project(
@@ -109,6 +160,7 @@ fn render_project(
     graph: LinkGraph,
 ) -> Result<Html<String>, StatusCode> {
     let (svg_nodes, svg_edges) = layout_pages(workspace, project, &graph);
+    let graph_data = force_graph_json(workspace, project, &graph);
     let rows = graph
         .edges
         .iter()
@@ -134,6 +186,7 @@ fn render_project(
         svg_nodes,
         svg_edges,
         rows,
+        graph_data,
     }
     .render()
     .map(Html)
