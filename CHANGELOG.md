@@ -19,6 +19,12 @@ version in [`docs/changelog/`](docs/changelog/):
   the fallback when JavaScript is off. Node and edge data are embedded in the
   page, and the cross-project graph keeps its existing layout.
 
+### Changed
+
+- The web UI's dark theme now uses a deeper palette: near-black background,
+  warm off-white text, cyan accent and amber alerts. Only the theme tokens
+  changed, so the layout and the light theme are the same as before.
+
 ## [3.4.0] - 2026-11-04
 
 ### Added

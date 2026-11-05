@@ -25,7 +25,8 @@
 
 /* Operational workspace: shared tokens keep both themes readable. */
 :root { --dash-bg:#f5f7fa; --dash-surface:#fff; --dash-soft:#f0f4f8; --dash-line:#dfe6ee; --dash-text:#1c2b3c; --dash-muted:#617186; --dash-accent:#0c786a; --dash-accent-soft:#e8f6f1; --dash-alert:#926015; --dash-alert-bg:#fff5df; --dash-sidebar:#fbfcfe; --dash-shadow:0 4px 24px -16px #173c5730; }
-:root.dark { --dash-bg:#101720; --dash-surface:#182231; --dash-soft:#202d3e; --dash-line:#304054; --dash-text:#edf3fa; --dash-muted:#a6b6ca; --dash-accent:#7be2ca; --dash-accent-soft:#183d3b; --dash-alert:#f7d18b; --dash-alert-bg:#3c301f; --dash-sidebar:#141d29; --dash-shadow:0 4px 24px -16px #0009; }
+/* Dark palette: the ai-memory cockpit's colours (bg, panel, line, text, muted, cyan, amber). */
+:root.dark { --dash-bg:#0d0f0e; --dash-surface:#171b18; --dash-soft:#1d231f; --dash-line:#303931; --dash-text:#f3efe5; --dash-muted:#9ba99f; --dash-accent:#22c7c5; --dash-accent-soft:#12302f; --dash-alert:#e0aa3e; --dash-alert-bg:#2e2412; --dash-sidebar:#121512; --dash-shadow:0 18px 60px -24px #000c; }
 body.dashboard-shell { margin:0; min-height:100vh; background:var(--dash-bg); color:var(--dash-text); font-family:"Management Sans",system-ui,sans-serif; font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased; }
 .dashboard-shell h1,.dashboard-shell h2,.app-brand { font-family:"Management Display",system-ui,sans-serif; letter-spacing:-.035em; }
 .dashboard-shell a,.dashboard-shell button,.dashboard-shell input,.dashboard-shell select,.dashboard-shell textarea { -webkit-tap-highlight-color:transparent; }
