@@ -13,6 +13,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Each project now has an Audit page (`/w/{workspace}/{project}/audit`) that lists
+  missing, broken-link, orphan, duplicate and stale pages, with a filter by issue type.
+- The project overview shows a "Where we left off" card (its latest open handoff),
+  memory-quality counts, the five most recent pages and a status strip with pages by
+  kind, versions, sessions and 7-day activity.
+- The memory reader has an agent view (`?mode=agent`) that groups linked pages by kind,
+  with a retrieval hint and unresolved link targets, a frontmatter panel with a copy-path
+  button, and per-link resolved or missing status. A page indexed but missing on disk
+  renders an explicit state instead of a 404.
+- A command palette opens with Ctrl+K or Cmd+K and lists projects and navigation items.
+- Projects can be pinned from the home page; pinned projects appear in the sidebar.
+- Search results are grouped into Projects, Paths and Text matches.
+
 - The in-project link graph page (`/web/w/{workspace}/{project}/graph`) now
   lays pages out with a force-directed simulation, so linked pages cluster,
   and each node links to its page. The server-drawn circular layout stays as
@@ -21,6 +34,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- Blue action colours in the web UI are now the teal brand accent.
+- The login page has a theme switch, a show/hide password button, autofocus,
+  and no application header.
 - The web UI's dark theme now uses a deeper palette: near-black background,
   warm off-white text, cyan accent and amber alerts. Only the theme tokens
   changed, so the layout and the light theme are the same as before.

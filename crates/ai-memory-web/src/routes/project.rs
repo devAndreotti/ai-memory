@@ -60,9 +60,20 @@ pub(crate) async fn handler(
         Ok(authorized) => authorized,
         Err(refusal) => return super::page::localized_refusal_response(&i18n, &refusal),
     };
+    // Handoffs follow the same actor scoping as the project overview JSON
+    // (`project_overview_handler`): the caller's own baton plus shared ones.
+    let handoff_owner = super::api::owner_filter_for(actor.clone());
     let owner = super::api::session_owner_filter_for(actor, auth);
     render(
-        &i18n, &state, workspace, project, viewer_id, authorized, owner, query,
+        &i18n,
+        &state,
+        workspace,
+        project,
+        viewer_id,
+        authorized,
+        owner,
+        handoff_owner,
+        query,
     )
     .await
     .into_response()
@@ -77,6 +88,7 @@ async fn render(
     viewer: Option<ai_memory_core::UserId>,
     authorized: Option<ResolvedScope>,
     owner: ai_memory_core::OwnerFilter,
+    handoff_owner: ai_memory_core::OwnerFilter,
     query: crate::operations::UsageQuery,
 ) -> Result<Html<String>, StatusCode> {
     let calls_query = query.store_query()?;
@@ -297,8 +309,75 @@ async fn render(
             .collect(),
         None => Vec::new(),
     };
+    // Per-project overview panels. Decorative next to the page tree, so a
+    // failed lookup renders an empty card rather than a broken page — same
+    // posture as `by_agent` above. Every read is confined to this project.
+    let (handoff, quality, briefing) = match &scope {
+        Some(scope) => {
+            let (handoff, quality, briefing) = tokio::join!(
+                state.reader.latest_open_handoff(
+                    scope.workspace_id,
+                    scope.project_id,
+                    None,
+                    handoff_owner.clone(),
+                ),
+                state
+                    .reader
+                    .memory_health_for_project(scope.workspace_id, scope.project_id),
+                state.reader.briefing_for_project(
+                    scope.workspace_id,
+                    scope.project_id,
+                    1,
+                    handoff_owner,
+                    false,
+                ),
+            );
+            (
+                handoff.ok().flatten(),
+                quality.unwrap_or_default(),
+                briefing.unwrap_or_default(),
+            )
+        }
+        None => (None, (0, 0, 0), ai_memory_store::BriefingSnapshot::default()),
+    };
+    let (quality_stale, quality_duplicates, quality_orphans) = quality;
+    let handoff_meta = handoff
+        .as_ref()
+        .map(|h| {
+            format!(
+                "{} · {}",
+                agent_label(h.origin.from_agent),
+                i18n.relative(&h.lifecycle.created_at.to_string())
+            )
+        })
+        .unwrap_or_default();
+    let (handoff_summary, handoff_next_steps, handoff_open_questions) = match handoff {
+        Some(h) => (
+            Some(h.content.summary),
+            h.content.next_steps,
+            h.content.open_questions,
+        ),
+        None => (None, Vec::new(), Vec::new()),
+    };
+    let kind_bars = kind_bars(&pages);
+    let audit_href = format!("{}/audit", project_href(&workspace, &project));
+
     let html = ProjectView {
         i18n: i18n.clone(),
+        handoff_summary,
+        handoff_meta,
+        handoff_next_steps,
+        handoff_open_questions,
+        quality_stale,
+        quality_duplicates,
+        quality_orphans,
+        audit_href,
+        kind_bars,
+        pages_all: briefing.counts.pages_all,
+        sessions_total: briefing.counts.sessions,
+        sessions_7d: briefing.activity_7d.sessions,
+        observations_7d: briefing.activity_7d.observations,
+        pages_updated_7d: briefing.activity_7d.pages_updated,
         agents,
         inbox_href: format!(
             "inbox?workspace={}&project={}",
@@ -323,6 +402,36 @@ async fn render(
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// Kinds the overview status strip breaks out; everything else is "other".
+const OVERVIEW_KINDS: [&str; 4] = ["rule", "decision", "gotcha", "fact"];
+
+/// Knowledge pages by kind for the overview status strip, as
+/// `(label i18n key, count, bar width percent of the largest bucket)`.
+/// Machinery pages are left out, as in Recent Activity, so session captures
+/// and logs do not swamp "other".
+fn kind_bars(pages: &[ai_memory_store::PageSummary]) -> Vec<(&'static str, u64, u64)> {
+    let mut counts = [0_u64; OVERVIEW_KINDS.len() + 1];
+    for page in pages.iter().filter(|p| !is_system_page(&p.path)) {
+        let slot = OVERVIEW_KINDS
+            .iter()
+            .position(|kind| *kind == page.kind)
+            .unwrap_or(OVERVIEW_KINDS.len());
+        counts[slot] += 1;
+    }
+    let max = counts.iter().copied().max().unwrap_or(0).max(1);
+    let keys = [
+        "web-project-overview-kind-rule",
+        "web-project-overview-kind-decision",
+        "web-project-overview-kind-gotcha",
+        "web-project-overview-kind-fact",
+        "web-project-overview-kind-other",
+    ];
+    keys.into_iter()
+        .zip(counts)
+        .map(|(key, count)| (key, count, count * 100 / max))
+        .collect()
 }
 
 /// Turn grouped pages into sidebar folders: newest first, capped at

@@ -750,3 +750,122 @@ web-search-unknown-kind = `{ $value0 }` is not a standard page kind; check the s
 web-search-first-results = Showing the first { $value0 } results. Refine your search to narrow them.
 web-session-all-agent-sessions = ← All { $value0 } sessions
 web-range-of-total = { $value0 }–{ $value1 } of { $value2 }
+
+web-theme = Theme
+web-show-password = Show
+web-hide-password = Hide
+web-login-help = Need help signing in? Ask the administrator of this ai-memory server for your username or a temporary password.
+
+web-search-group-projects = Projects
+web-search-group-paths = Paths
+web-search-group-content = Content hits
+
+web-audit = audit
+web-audit-title-suffix = audit — ai-memory
+web-audit-heading = Memory audit
+web-audit-blurb = Quality issues in this project's memory: pages whose file is gone, pages nothing links to, unresolved links, duplicate titles and stale notes.
+web-audit-issue-types = Issue types
+web-audit-issues = Issues
+web-audit-show-all = Show all issues
+web-audit-empty = No issues found in this project.
+web-audit-empty-filtered = No issues of this type in this project.
+web-audit-col-title = Title
+web-audit-col-path = Path
+web-audit-col-issue = Issue
+web-audit-col-detail = Detail
+web-audit-type-missing = Missing page
+web-audit-type-missing-help = Indexed pages whose markdown file no longer exists on disk.
+web-audit-type-broken = Broken link
+web-audit-type-broken-help = Pages with at least one outgoing link that resolves to no page. Some may be intentional forward references.
+web-audit-type-duplicate = Duplicate
+web-audit-type-duplicate-help = Pages that share a title with another page in this project.
+web-audit-type-orphan = Orphan
+web-audit-type-orphan-help = Pages with no incoming or outgoing links.
+web-audit-type-stale = Stale
+web-audit-type-stale-help = Episodic pages not updated in over 30 days.
+web-audit-detail-missing = File missing from the wiki
+web-audit-detail-broken = Has an unresolved outgoing link
+web-audit-detail-duplicate = Title shared with another page
+web-audit-detail-orphan = No links in or out
+web-audit-detail-stale = Untouched for over 30 days
+web-project-overview-audit-tab = Audit
+web-project-overview-handoff-title = Where we left off
+web-project-overview-handoff-next-steps = Next steps
+web-project-overview-handoff-open-questions = Open questions
+web-project-overview-handoff-empty = No open handoff for this project.
+web-project-overview-quality-title = Memory quality
+web-project-overview-quality-stale = Stale
+web-project-overview-quality-duplicates = Duplicates
+web-project-overview-quality-orphans = Orphans
+web-project-overview-quality-clean = No stale, duplicate or orphan pages.
+web-project-overview-recent-title = Recent memory
+web-project-overview-recent-empty = No compiled pages yet.
+web-project-overview-status-title = Status
+web-project-overview-status-by-kind = Pages by kind
+web-project-overview-kind-rule = Rules
+web-project-overview-kind-decision = Decisions
+web-project-overview-kind-gotcha = Gotchas
+web-project-overview-kind-fact = Facts
+web-project-overview-kind-other = Other
+web-project-overview-status-all-versions = All versions
+web-project-overview-status-sessions = Sessions
+web-project-overview-status-sessions-7d = Sessions (7 days)
+web-project-overview-status-events-7d = Events (7 days)
+web-project-overview-status-pages-7d = Pages updated (7 days)
+web-palette-title = Command palette
+web-palette-input-label = Filter projects and pages
+web-palette-placeholder = Jump to a project or page…
+web-palette-results = Results
+web-palette-kind-project = Project
+web-palette-kind-page = Page
+web-palette-empty = Nothing matches.
+web-palette-loading = Loading projects…
+web-palette-local-only = Could not load the project list; showing only projects on this page and pinned projects.
+web-palette-search-for = Search memory for “{ $value0 }”
+web-palette-result-count = Results: { $value0 }
+web-palette-hint = ↑ ↓ to move · Enter to open · Esc to close
+web-pin-section = PINNED
+web-pin-toggle = Pin { $value0 }/{ $value1 } to the sidebar
+
+web-reader-mode-label = Reader view
+web-reader-mode-human = Human
+web-reader-mode-agent = Agent
+web-reader-when-used = When this is used
+web-reader-hint = { $kind ->
+        [rule] A project rule, retrieved as high-weight guidance when a task touches its subject
+        [decision] A decision, retrieved when a task revisits this choice
+        [gotcha] A gotcha, retrieved when a task enters this risk area
+        [procedure] A procedure, retrieved when a task repeats these steps
+        [session] A session summary, retrieved when catching up on past work
+       *[other] Retrieved by search when a query matches its content
+    }{ $tier ->
+        [working] , as current-session context
+        [episodic] , as episodic memory that cools over time
+        [procedural] , as a reusable pattern
+       *[other] {""}
+    }{ $pinned ->
+        [yes] ; pinned, so it never decays
+       *[other] {""}
+    }.
+web-reader-linked-pages = Linked pages
+web-reader-no-linked-pages = No linked pages yet.
+web-reader-group-rule = Rules
+web-reader-group-decision = Decisions
+web-reader-group-gotcha = Gotchas
+web-reader-group-fact = Facts
+web-reader-group-other = Other
+web-reader-unresolved = Unresolved link targets
+web-reader-not-found = not found
+web-reader-missing-on-disk = The page is indexed, but its file is gone from disk.
+web-reader-missing-on-disk-detail = The index still lists it; restore the file or reindex. Expected path:
+web-reader-frontmatter = Frontmatter
+web-reader-kind = Kind
+web-reader-tier = Tier
+web-reader-pinned = Pinned
+web-reader-yes = yes
+web-reader-no = no
+web-reader-created = Created
+web-reader-updated = Updated
+web-reader-author = Author
+web-reader-copy-path = copy path
+web-reader-copied = copied

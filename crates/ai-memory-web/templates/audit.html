@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ workspace }}/{{ project }} {{ i18n.text("web-audit-title-suffix") }}{% endblock %}
+
+{% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
+
+{% block content %}
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
+  <span aria-hidden="true">/</span>
+  <span class="text-slate-500 dark:text-slate-400">{{ workspace }}</span>
+  <span aria-hidden="true">/</span>
+  <a href="{{ project_href }}" class="hover:text-teal-600 dark:hover:text-teal-400">{{ project }}</a>
+  <span aria-hidden="true">/</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-audit") }}</span>
+</nav>
+
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-audit-heading") }}</h1>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-audit-blurb") }}</p>
+
+<section aria-labelledby="audit-types-heading" class="mb-10"
+  data-audit-total="{{ total }}"
+  data-audit-missing="{{ missing_count }}"
+  data-audit-broken="{{ broken_count }}"
+  data-audit-duplicate="{{ duplicate_count }}"
+  data-audit-orphan="{{ orphan_count }}"
+  data-audit-stale="{{ stale_count }}">
+  <h2 id="audit-types-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-audit-issue-types") }}</h2>
+  <ul class="divide-y divide-slate-100 dark:divide-slate-800 rounded-md border border-slate-200 dark:border-slate-800">
+    {% for t in types %}
+    <li data-audit-type="{{ t.kind }}" class="{% if t.active %}bg-teal-50 dark:bg-teal-950/30{% endif %}">
+      <a href="{{ t.href }}" {% if t.active %}aria-current="true"{% endif %} class="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-900">
+        <span class="w-14 shrink-0 text-right text-lg font-semibold tabular-nums {% if !t.has_issues %}text-slate-400 dark:text-slate-500{% else if t.severity == "high" %}text-rose-600 dark:text-rose-400{% else if t.severity == "medium" %}text-amber-600 dark:text-amber-400{% else %}text-slate-700 dark:text-slate-200{% endif %}">{{ t.count_label }}</span>
+        <span class="min-w-0">
+          <span class="block text-sm font-medium text-slate-900 dark:text-slate-100">{{ t.label }}</span>
+          <span class="block text-xs text-slate-500 dark:text-slate-400">{{ t.explanation }}</span>
+        </span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+
+<div class="mb-3 flex items-center justify-between gap-4">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-audit-issues") }}</h2>
+  {% if filter != "" %}
+  <a href="{{ audit_href }}" class="text-sm text-teal-600 dark:text-teal-400 hover:underline">{{ i18n.text("web-audit-show-all") }}</a>
+  {% endif %}
+</div>
+
+{% if issues.is_empty() %}
+<div class="flex items-center gap-3 rounded-md border border-slate-200 dark:border-slate-800 px-4 py-6 text-sm text-slate-500 dark:text-slate-400">
+  <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="shrink-0">
+    <path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z" />
+    <path d="M9 12l2 2 4-4" />
+  </svg>
+  <p>{% if filter != "" %}{{ i18n.text("web-audit-empty-filtered") }}{% else %}{{ i18n.text("web-audit-empty") }}{% endif %}</p>
+</div>
+{% else %}
+<div class="overflow-x-auto">
+  <table class="min-w-full text-sm">
+    <thead>
+      <tr class="text-left text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        <th class="py-2 pr-4 font-semibold">{{ i18n.text("web-audit-col-title") }}</th>
+        <th class="py-2 pr-4 font-semibold">{{ i18n.text("web-audit-col-path") }}</th>
+        <th class="py-2 pr-4 font-semibold">{{ i18n.text("web-audit-col-issue") }}</th>
+        <th class="py-2 font-semibold">{{ i18n.text("web-audit-col-detail") }}</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
+      {% for issue in issues %}
+      <tr data-severity="{{ issue.severity }}">
+        <td class="py-2 pr-4 text-slate-800 dark:text-slate-100">{{ issue.title }}</td>
+        <td class="py-2 pr-4"><a href="{{ issue.href }}" class="font-mono text-xs text-teal-600 dark:text-teal-400 hover:underline break-all">{{ issue.path }}</a></td>
+        <td class="py-2 pr-4 whitespace-nowrap {% if issue.severity == "high" %}text-rose-600 dark:text-rose-400{% else if issue.severity == "medium" %}text-amber-600 dark:text-amber-400{% else %}text-slate-600 dark:text-slate-300{% endif %}">{{ issue.kind_label }}</td>
+        <td class="py-2 text-slate-500 dark:text-slate-400">{{ issue.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

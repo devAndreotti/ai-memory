@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ai_memory_core::Tier;
+use ai_memory_core::{DEFAULT_WORKSPACE_NAME, Tier};
 use ai_memory_store::{PAGE_KINDS, PageFilter, SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
@@ -276,8 +276,26 @@ pub(crate) async fn handler(
     };
     // The reader returns projects newest first, which interleaves
     // workspaces; group and order by name instead.
+    // Project matches come from the same readable list, limited to the
+    // current workspace: the scoped one, else the default workspace.
+    let needle = query.to_lowercase();
+    let match_workspace = if workspace.is_empty() {
+        DEFAULT_WORKSPACE_NAME
+    } else {
+        workspace.as_str()
+    };
+    let mut project_matches: Vec<(String, String)> = Vec::new();
     let mut by_workspace: BTreeMap<String, Vec<ScopeOption>> = BTreeMap::new();
     for s in summaries {
+        if !needle.is_empty()
+            && s.workspace_name == match_workspace
+            && s.project_name.to_lowercase().contains(&needle)
+        {
+            project_matches.push((
+                project_href(&s.workspace_name, &s.project_name),
+                s.project_name.clone(),
+            ));
+        }
         let option = ScopeOption {
             value: format!("{}/{}", s.workspace_name, s.project_name),
             selected: s.workspace_name == workspace && s.project_name == project,
@@ -296,6 +314,20 @@ pub(crate) async fn handler(
                 workspace,
                 projects,
             }
+        })
+        .collect();
+    project_matches.sort_by(|a, b| a.1.cmp(&b.1));
+    let path_hits: Vec<SearchHit> = hits
+        .iter()
+        .filter(|hit| !needle.is_empty() && hit.path.to_lowercase().contains(&needle))
+        .map(|hit| SearchHit {
+            workspace: hit.workspace.clone(),
+            project: hit.project.clone(),
+            path: hit.path.clone(),
+            href: hit.href.clone(),
+            title: hit.title.clone(),
+            snippet: String::new(),
+            trace: None,
         })
         .collect();
     let hit_count = hits.len();
@@ -327,6 +359,8 @@ pub(crate) async fn handler(
         unknown_kind,
         kind_options,
         tier_options,
+        project_matches,
+        path_hits,
         workspace,
         project,
         explain,

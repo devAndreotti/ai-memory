@@ -6,11 +6,11 @@
 
 {% block content %}
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+  <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
-  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <a href="{{ project_href }}" class="hover:text-teal-600 dark:hover:text-teal-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
-  <a href="{{ page_href }}" class="hover:text-blue-600 dark:hover:text-blue-400 truncate max-w-xs">{{ path }}</a>
+  <a href="{{ page_href }}" class="hover:text-teal-600 dark:hover:text-teal-400 truncate max-w-xs">{{ path }}</a>
   <span aria-hidden="true">/</span>
   <span aria-current="page" class="text-slate-700 dark:text-slate-200">{{ i18n.text("web-history") }}</span>
 </nav>
@@ -66,23 +66,23 @@
             <td class="py-2 pr-4"><input type="radio" name="to" value="{{ version.id }}" aria-label="{{ i18n.one("web-diff-to-value0", version.short_id) }}"{% if version.is_to %} checked{% endif %}></td>
             <td class="py-2 pr-4 font-mono text-xs whitespace-nowrap">
               {{ version.short_id }}
-              {% if version.is_latest %}<span class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 font-sans font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">{{ i18n.text("web-latest") }}</span>{% endif %}
+              {% if version.is_latest %}<span class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 font-sans font-medium bg-teal-50 dark:bg-teal-950 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-800">{{ i18n.text("web-latest") }}</span>{% endif %}
               {% if version.supersedes_short != "" %}<span class="block text-slate-500 dark:text-slate-400">{{ i18n.text("web-replaced") }} {{ version.supersedes_short }}</span>{% endif %}
             </td>
             <td class="py-2 pr-4 whitespace-nowrap text-slate-500 dark:text-slate-400" title="{{ version.created_at }}">{{ version.created_relative }}</td>
             <td class="py-2 pr-4 text-slate-600 dark:text-slate-300">{% if version.author != "" %}{{ version.author }}{% else %}<span class="text-slate-500 dark:text-slate-400">—</span>{% endif %}</td>
             <td class="py-2 pr-4 text-slate-700 dark:text-slate-200">{{ version.title }}</td>
             <td class="py-2 pr-4 whitespace-nowrap text-slate-500 dark:text-slate-400">{{ version.body_chars }} {{ i18n.text("web-chars") }}</td>
-            <td class="py-2 whitespace-nowrap">{% if version.compare_href != "" %}<a href="{{ version.compare_href }}" class="text-blue-600 dark:text-blue-400 underline text-xs">{{ i18n.text("web-vs-previous") }}</a>{% endif %}</td>
+            <td class="py-2 whitespace-nowrap">{% if version.compare_href != "" %}<a href="{{ version.compare_href }}" class="text-teal-600 dark:text-teal-400 underline text-xs">{{ i18n.text("web-vs-previous") }}</a>{% endif %}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     <div class="mt-4 flex flex-wrap items-center gap-3">
-      <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-blue-500">{{ i18n.text("web-compare-selected") }}</button>
-      {% if newer_href != "" %}<a href="{{ newer_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-newer-versions") }}</a>{% endif %}
-      {% if older_href != "" %}<a href="{{ older_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-older-versions") }}</a>{% endif %}
+      <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-teal-500">{{ i18n.text("web-compare-selected") }}</button>
+      {% if newer_href != "" %}<a href="{{ newer_href }}" class="text-sm text-teal-600 dark:text-teal-400 underline">{{ i18n.text("web-newer-versions") }}</a>{% endif %}
+      {% if older_href != "" %}<a href="{{ older_href }}" class="text-sm text-teal-600 dark:text-teal-400 underline">{{ i18n.text("web-older-versions") }}</a>{% endif %}
     </div>
   </form>
 </section>

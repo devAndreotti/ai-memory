@@ -750,3 +750,122 @@ web-search-unknown-kind = `{ $value0 }` não é um tipo de página padrão; veri
 web-search-first-results = Exibindo os primeiros { $value0 } resultados. Refine sua busca para restringi-los.
 web-session-all-agent-sessions = ← Todas as sessões de { $value0 }
 web-range-of-total = { $value0 }–{ $value1 } de { $value2 }
+
+web-theme = Tema
+web-show-password = Mostrar
+web-hide-password = Ocultar
+web-login-help = Precisa de ajuda para entrar? Peça ao administrador deste servidor ai-memory seu usuário ou uma senha temporária.
+
+web-search-group-projects = Projetos
+web-search-group-paths = Caminhos
+web-search-group-content = Trechos
+
+web-audit = auditoria
+web-audit-title-suffix = auditoria — ai-memory
+web-audit-heading = Auditoria da memória
+web-audit-blurb = Problemas de qualidade na memória deste projeto: páginas cujo arquivo sumiu, páginas sem nenhum link, links não resolvidos, títulos duplicados e notas antigas.
+web-audit-issue-types = Tipos de problema
+web-audit-issues = Problemas
+web-audit-show-all = Mostrar todos os problemas
+web-audit-empty = Nenhum problema encontrado neste projeto.
+web-audit-empty-filtered = Nenhum problema deste tipo neste projeto.
+web-audit-col-title = Título
+web-audit-col-path = Caminho
+web-audit-col-issue = Problema
+web-audit-col-detail = Detalhe
+web-audit-type-missing = Página ausente
+web-audit-type-missing-help = Páginas indexadas cujo arquivo markdown não existe mais no disco.
+web-audit-type-broken = Link quebrado
+web-audit-type-broken-help = Páginas com pelo menos um link de saída que não aponta para nenhuma página. Alguns podem ser referências futuras intencionais.
+web-audit-type-duplicate = Duplicada
+web-audit-type-duplicate-help = Páginas que compartilham o título com outra página deste projeto.
+web-audit-type-orphan = Órfã
+web-audit-type-orphan-help = Páginas sem links de entrada nem de saída.
+web-audit-type-stale = Antiga
+web-audit-type-stale-help = Páginas episódicas sem atualização há mais de 30 dias.
+web-audit-detail-missing = Arquivo ausente na wiki
+web-audit-detail-broken = Tem um link de saída não resolvido
+web-audit-detail-duplicate = Título repetido em outra página
+web-audit-detail-orphan = Sem links de entrada ou saída
+web-audit-detail-stale = Sem alterações há mais de 30 dias
+web-project-overview-audit-tab = Auditoria
+web-project-overview-handoff-title = Onde paramos
+web-project-overview-handoff-next-steps = Próximos passos
+web-project-overview-handoff-open-questions = Perguntas em aberto
+web-project-overview-handoff-empty = Nenhum handoff aberto para este projeto.
+web-project-overview-quality-title = Qualidade da memória
+web-project-overview-quality-stale = Desatualizadas
+web-project-overview-quality-duplicates = Duplicadas
+web-project-overview-quality-orphans = Órfãs
+web-project-overview-quality-clean = Nenhuma página desatualizada, duplicada ou órfã.
+web-project-overview-recent-title = Memória recente
+web-project-overview-recent-empty = Nenhuma página compilada ainda.
+web-project-overview-status-title = Status
+web-project-overview-status-by-kind = Páginas por tipo
+web-project-overview-kind-rule = Regras
+web-project-overview-kind-decision = Decisões
+web-project-overview-kind-gotcha = Armadilhas
+web-project-overview-kind-fact = Fatos
+web-project-overview-kind-other = Outros
+web-project-overview-status-all-versions = Todas as versões
+web-project-overview-status-sessions = Sessões
+web-project-overview-status-sessions-7d = Sessões (7 dias)
+web-project-overview-status-events-7d = Eventos (7 dias)
+web-project-overview-status-pages-7d = Páginas atualizadas (7 dias)
+web-palette-title = Paleta de comandos
+web-palette-input-label = Filtrar projetos e páginas
+web-palette-placeholder = Ir para um projeto ou página…
+web-palette-results = Resultados
+web-palette-kind-project = Projeto
+web-palette-kind-page = Página
+web-palette-empty = Nada corresponde.
+web-palette-loading = Carregando projetos…
+web-palette-local-only = Não foi possível carregar a lista de projetos; mostrando só os projetos desta página e os fixados.
+web-palette-search-for = Pesquisar na memória por “{ $value0 }”
+web-palette-result-count = Resultados: { $value0 }
+web-palette-hint = ↑ ↓ para mover · Enter para abrir · Esc para fechar
+web-pin-section = FIXADOS
+web-pin-toggle = Fixar { $value0 }/{ $value1 } na barra lateral
+
+web-reader-mode-label = Modo de leitura
+web-reader-mode-human = Pessoa
+web-reader-mode-agent = Agente
+web-reader-when-used = Quando isto é usado
+web-reader-hint = { $kind ->
+        [rule] Regra do projeto, recuperada como orientação de maior peso quando a tarefa toca no assunto
+        [decision] Decisão, recuperada quando a tarefa revisita esta escolha
+        [gotcha] Armadilha, recuperada quando a tarefa entra nesta área de risco
+        [procedure] Procedimento, recuperado quando a tarefa repete estes passos
+        [session] Resumo de sessão, recuperado ao retomar trabalho anterior
+       *[other] Recuperada pela busca quando a consulta casa com o conteúdo
+    }{ $tier ->
+        [working] , como contexto da sessão atual
+        [episodic] , como memória episódica que esfria com o tempo
+        [procedural] , como padrão reutilizável
+       *[other] {""}
+    }{ $pinned ->
+        [yes] ; fixada, então não decai
+       *[other] {""}
+    }.
+web-reader-linked-pages = Páginas ligadas
+web-reader-no-linked-pages = Nenhuma página ligada ainda.
+web-reader-group-rule = Regras
+web-reader-group-decision = Decisões
+web-reader-group-gotcha = Armadilhas
+web-reader-group-fact = Fatos
+web-reader-group-other = Outras
+web-reader-unresolved = Alvos de link não resolvidos
+web-reader-not-found = não encontrada
+web-reader-missing-on-disk = A página está indexada, mas o arquivo sumiu do disco.
+web-reader-missing-on-disk-detail = O índice ainda a lista; restaure o arquivo ou reindexe. Caminho esperado:
+web-reader-frontmatter = Frontmatter
+web-reader-kind = Tipo
+web-reader-tier = Camada
+web-reader-pinned = Fixada
+web-reader-yes = sim
+web-reader-no = não
+web-reader-created = Criada
+web-reader-updated = Atualizada
+web-reader-author = Autor
+web-reader-copy-path = copiar caminho
+web-reader-copied = copiado

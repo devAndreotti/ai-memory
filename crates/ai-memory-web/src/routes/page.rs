@@ -14,8 +14,9 @@ use axum::response::{Html, IntoResponse, Response};
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    NamespaceView, NotFoundView, OutlineItem, PageRow, PageView, RELATED_LIMIT, RelatedRow,
-    encode_segment, history_href, page_href, project_href,
+    AgentLinkGroup, AgentLinkRow, LinkStatusRow, NamespaceView, NotFoundView, OutlineItem,
+    PageRow, PageView, RELATED_LIMIT, RelatedRow, encode_segment, history_href, page_href,
+    project_href,
 };
 
 /// Pages per namespace listing page.
@@ -29,6 +30,8 @@ pub(crate) struct NamespaceQuery {
     knowledge: crate::knowledge::KnowledgeQuery,
     sort: Option<String>,
     page: Option<String>,
+    /// Reader view: `agent`, or the human view for anything else.
+    mode: Option<String>,
 }
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
@@ -64,25 +67,56 @@ pub(crate) async fn handler(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    // An indexed page whose file is gone gets its own state, not a 404: the
+    // index still knows it, so "not found" would send the reader looking
+    // for a typo. Same check as the health API's missing-on-disk list.
     let markdown_doc = match state
         .wiki
         .read_page(meta.workspace_id, meta.project_id, &page_path)
     {
-        Ok(doc) => doc,
+        Ok(doc) => Some(doc),
+        Err(_)
+            if !state
+                .wiki
+                .project_root(meta.workspace_id, meta.project_id)
+                .join(&meta.path)
+                .is_file() =>
+        {
+            None
+        }
         Err(_) => return not_found_response(&i18n),
     };
+    let missing_on_disk = markdown_doc.is_none();
 
     // Drop a leading H1 that repeats the title — the template already
     // renders the title in its header, so leaving it in the body
     // duplicates it.
-    let rendered = markdown::render_document(
-        markdown::strip_leading_h1(&markdown_doc.body, &meta.title),
-        &workspace,
-        &project,
-    );
+    let (rendered, targets) = match &markdown_doc {
+        Some(doc) => {
+            let mut targets = ai_memory_wiki::extract_links(&doc.body, &page_path);
+            targets.extend(ai_memory_wiki::extract_relation_links(&doc.frontmatter));
+            (
+                markdown::render_document(
+                    markdown::strip_leading_h1(&doc.body, &meta.title),
+                    &workspace,
+                    &project,
+                ),
+                targets,
+            )
+        }
+        None => (
+            markdown::Rendered {
+                html: String::new(),
+                outline: Vec::new(),
+            },
+            Vec::new(),
+        ),
+    };
 
     // The far end of each link is filtered by what the viewer may read, so a
-    // backlink from a restricted project never reaches the sidebar.
+    // backlink from a restricted project never reaches the sidebar. Every
+    // outgoing link is loaded (bounded by the page's own link count) so each
+    // one can be marked resolved or missing.
     let links = match state
         .reader
         .page_links_preview(
@@ -90,16 +124,30 @@ pub(crate) async fn handler(
             meta.project_id,
             meta.path.clone(),
             viewer_id,
-            RELATED_LIMIT,
+            RELATED_LIMIT.max(targets.len()),
         )
         .await
     {
         Ok(l) => l,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let agent_groups = agent_groups(&links.links, &links.backlinks, &workspace, &project);
+    let backlinks: Vec<_> = links.backlinks.into_iter().take(RELATED_LIMIT).collect();
     let (cited_by, cited_by_more) =
-        related_rows(links.backlinks, links.backlinks_total, &workspace, &project);
-    let (cites, cites_more) = related_rows(links.links, links.links_total, &workspace, &project);
+        related_rows(backlinks, links.backlinks_total, &workspace, &project);
+    let link_status = link_status_rows(&targets, &links.links, &workspace, &project);
+    let unresolved: Vec<LinkStatusRow> = link_status
+        .iter()
+        .filter(|row| !row.resolved)
+        .map(|row| LinkStatusRow {
+            label: row.label.clone(),
+            href: String::new(),
+            resolved: false,
+            scope_hint: row.scope_hint.clone(),
+        })
+        .collect();
+    let cites_more = link_status.len().saturating_sub(RELATED_LIMIT);
+    let cites: Vec<LinkStatusRow> = link_status.into_iter().take(RELATED_LIMIT).collect();
 
     // `#id` alone would resolve against the injected `<base href>`.
     let own_href = page_href(&workspace, &project, &meta.path);
@@ -153,6 +201,16 @@ pub(crate) async fn handler(
     );
 
     let history_href = history_href(&workspace, &project, &path);
+    let agent_mode = query.mode.as_deref() == Some("agent");
+    let agent_href = format!("{own_href}?mode=agent");
+    let retrieval_hint = i18n.format(
+        "web-reader-hint",
+        &[
+            ("kind", meta.kind.clone()),
+            ("tier", meta.tier.clone()),
+            ("pinned", if meta.pinned { "yes" } else { "no" }.to_owned()),
+        ],
+    );
     match (PageView {
         i18n: i18n.clone(),
         knowledge,
@@ -181,6 +239,13 @@ pub(crate) async fn handler(
         author_username,
         author_name,
         author_email,
+        agent_mode,
+        human_href: own_href,
+        agent_href,
+        retrieval_hint,
+        agent_groups,
+        unresolved,
+        missing_on_disk,
     }
     .render())
     {
@@ -211,6 +276,118 @@ fn related_rows(
         })
         .collect();
     (rows, more)
+}
+
+/// Each distinct outgoing link target, in link order, marked resolved when
+/// it matches one of the page's resolved (and viewer-readable) links.
+/// A target with no readable match is shown as written, without a link.
+fn link_status_rows(
+    targets: &[ai_memory_core::LinkTarget],
+    resolved: &[ai_memory_store::RelatedPage],
+    workspace: &str,
+    project: &str,
+) -> Vec<LinkStatusRow> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for target in targets {
+        let ws = target.workspace.as_deref().unwrap_or(workspace);
+        let proj = target.project.as_deref().unwrap_or(project);
+        let path = target.path.as_str();
+        if !seen.insert((ws.to_owned(), proj.to_owned(), path.to_owned())) {
+            continue;
+        }
+        let scope_hint = if ws == workspace && proj == project {
+            String::new()
+        } else {
+            format!("{ws}/{proj}")
+        };
+        let hit = resolved
+            .iter()
+            .find(|r| r.workspace == ws && r.project == proj && r.path == path);
+        rows.push(match hit {
+            Some(r) => LinkStatusRow {
+                label: r.title.clone(),
+                href: page_href(&r.workspace, &r.project, &r.path),
+                resolved: true,
+                scope_hint,
+            },
+            None => LinkStatusRow {
+                label: path.to_owned(),
+                href: String::new(),
+                resolved: false,
+                scope_hint,
+            },
+        });
+    }
+    // Without a body to read targets from (the file is gone), the index's
+    // resolved links are all there is to show.
+    if targets.is_empty() {
+        rows = resolved
+            .iter()
+            .map(|r| LinkStatusRow {
+                label: r.title.clone(),
+                href: page_href(&r.workspace, &r.project, &r.path),
+                resolved: true,
+                scope_hint: if r.workspace == workspace && r.project == project {
+                    String::new()
+                } else {
+                    format!("{}/{}", r.workspace, r.project)
+                },
+            })
+            .collect();
+    }
+    rows
+}
+
+/// Outgoing links, then back-links, grouped by kind for the agent view:
+/// rules, decisions, gotchas, facts, then everything else. A page linked
+/// both ways appears once.
+fn agent_groups(
+    links: &[ai_memory_store::RelatedPage],
+    backlinks: &[ai_memory_store::RelatedPage],
+    workspace: &str,
+    project: &str,
+) -> Vec<AgentLinkGroup> {
+    const GROUPS: [(&str, &str); 4] = [
+        ("rule", "web-reader-group-rule"),
+        ("decision", "web-reader-group-decision"),
+        ("gotcha", "web-reader-group-gotcha"),
+        ("fact", "web-reader-group-fact"),
+    ];
+    let mut groups: Vec<AgentLinkGroup> = GROUPS
+        .iter()
+        .map(|&(_, label_id)| AgentLinkGroup {
+            label_id,
+            rows: Vec::new(),
+        })
+        .chain(std::iter::once(AgentLinkGroup {
+            label_id: "web-reader-group-other",
+            rows: Vec::new(),
+        }))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for r in links.iter().chain(backlinks) {
+        let href = page_href(&r.workspace, &r.project, &r.path);
+        if !seen.insert(href.clone()) {
+            continue;
+        }
+        let slot = GROUPS
+            .iter()
+            .position(|(kind, _)| *kind == r.kind)
+            .unwrap_or(GROUPS.len());
+        let path = if r.workspace == workspace && r.project == project {
+            r.path.clone()
+        } else {
+            format!("{}/{}:{}", r.workspace, r.project, r.path)
+        };
+        groups[slot].rows.push(AgentLinkRow {
+            href,
+            title: r.title.clone(),
+            path,
+        });
+    }
+    groups.retain(|g| !g.rows.is_empty());
+    groups
 }
 
 /// When a path is not a page, list the pages under it as a namespace

@@ -25,6 +25,7 @@
       <p class="nav-label">{{ i18n.text("web-observe-improve") }}</p>
       <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>{{ i18n.text("web-learning-review") }}</a>
       <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>{{ i18n.text("web-server-health") }}</a>
+      <div id="pinned-projects" hidden><p class="nav-label" id="pinned-projects-label">{{ i18n.text("web-pin-section") }}</p><div id="pinned-project-links" role="group" aria-labelledby="pinned-projects-label" class="app-nav"></div></div>
       <p class="nav-label">{{ i18n.text("web-resources") }}</p>
       <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>{{ i18n.text("web-documentation") }}</a>
       <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>{{ i18n.text("web-changelog") }}</a>
@@ -35,7 +36,7 @@
   <header class="app-topbar">
     <div class="app-topbar-content">
       <button class="menu-button" id="nav-toggle" aria-controls="app-navigation" aria-expanded="false" aria-label="{{ i18n.text("web-open-navigation") }}">☰</button>
-      <span class="topbar-caption">{{ i18n.text("web-workspace-base") }} <span aria-hidden="true">/</span> <strong>{{ i18n.text("web-agent-operations") }}</strong></span>
+      {% block topbar_caption %}<span class="topbar-caption">{{ i18n.text("web-workspace-base") }} <span aria-hidden="true">/</span> <strong>{{ i18n.text("web-agent-operations") }}</strong></span>{% endblock %}
       <div class="topbar-spacer"></div>
       {% block header_actions %}
       {% block header_search %}
@@ -78,5 +79,39 @@
   })();
   </script>
   {% include "_inbox_notifications.html" %}
+  <script>
+  (function(){
+    var KEY="ai-memory-pinned-projects",MAX=50;
+    function valid(v){return typeof v==="string"&&v.length<=512&&v.indexOf("/")>0&&v.indexOf("/")<v.length-1;}
+    function read(){
+      try{var raw=JSON.parse(localStorage.getItem(KEY)||"[]");if(!Array.isArray(raw))return [];var seen={};return raw.filter(function(v){if(!valid(v)||seen[v])return false;seen[v]=1;return true;}).slice(0,MAX);}catch(_){return [];}
+    }
+    function write(list){try{localStorage.setItem(KEY,JSON.stringify(list.slice(0,MAX)));}catch(_){}}
+    function render(){
+      var box=document.getElementById("pinned-projects"),links=document.getElementById("pinned-project-links");
+      if(!box||!links)return;
+      var pins=read(),current=location.pathname.replace(/\/$/,"");
+      links.textContent="";
+      pins.forEach(function(key){
+        var i=key.indexOf("/"),ws=key.slice(0,i),proj=key.slice(i+1);
+        var a=document.createElement("a");
+        a.href="w/"+encodeURIComponent(ws)+"/"+encodeURIComponent(proj);
+        a.title=key;
+        var icon=document.createElement("span");icon.setAttribute("aria-hidden","true");icon.textContent="★";
+        var label=document.createElement("span");label.className="truncate";label.textContent=proj;
+        a.appendChild(icon);a.appendChild(label);
+        var path=new URL(a.href).pathname.replace(/\/$/,"");
+        if(current===path||current.indexOf(path+"/")===0)a.setAttribute("aria-current","page");
+        links.appendChild(a);
+      });
+      box.hidden=pins.length===0;
+    }
+    window.aiMemoryPinnedProjects=read;
+    window.aiMemorySetPinnedProjects=function(list){write(list);render();document.dispatchEvent(new CustomEvent("ai-memory-pins-changed"));};
+    window.addEventListener("storage",function(e){if(e.key===KEY||e.key===null){render();document.dispatchEvent(new CustomEvent("ai-memory-pins-changed"));}});
+    render();
+  })();
+  </script>
+  {% include "_command_palette.html" %}
 </body>
 </html>

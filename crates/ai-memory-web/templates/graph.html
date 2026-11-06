@@ -14,7 +14,7 @@
     name="q"
     type="search"
     placeholder="{{ i18n.text("web-search-graph") }}"
-    class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500"
   >
 </form>
 {% endif %}
@@ -23,17 +23,17 @@
 {% block content %}
 {% if is_project %}
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+  <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <span class="text-slate-500 dark:text-slate-400">{{ workspace }}</span>
   <span aria-hidden="true">/</span>
-  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ project }}</a>
+  <a href="{{ project_href }}" class="hover:text-teal-600 dark:hover:text-teal-400">{{ project }}</a>
   <span aria-hidden="true">/</span>
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-graph") }}</span>
 </nav>
 {% else %}
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+  <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-graph") }}</span>
 </nav>
@@ -58,7 +58,7 @@
   <a href="{{ node.href }}">
     <g>
       <title>{{ node.tooltip }}</title>
-      <circle cx="{{ node.x }}" cy="{{ node.y }}" r="12" fill="#2563eb" />
+      <circle cx="{{ node.x }}" cy="{{ node.y }}" r="12" fill="#0c786a" />
       <text x="{{ node.x }}" y="{{ node.label_y }}" text-anchor="middle" font-size="11" fill="currentColor">{{ node.label }}</text>
     </g>
   </a>
@@ -85,8 +85,8 @@
     <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
       {% for row in rows %}
       <tr>
-        <td class="py-2 pr-4"><a href="{{ row.from_href }}" class="text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400">{{ row.from_label }}</a></td>
-        <td class="py-2"><a href="{{ row.to_href }}" class="text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400">{{ row.to_label }}</a></td>
+        <td class="py-2 pr-4"><a href="{{ row.from_href }}" class="text-slate-800 dark:text-slate-100 hover:text-teal-600 dark:hover:text-teal-400">{{ row.from_label }}</a></td>
+        <td class="py-2"><a href="{{ row.to_href }}" class="text-slate-800 dark:text-slate-100 hover:text-teal-600 dark:hover:text-teal-400">{{ row.to_label }}</a></td>
       </tr>
       {% endfor %}
     </tbody>

@@ -387,6 +387,35 @@ pub(crate) struct ProjectView {
     pub sessions: Vec<SessionRow>,
     /// Link to this project's link graph.
     pub graph_href: String,
+    /// Summary of this project's latest open handoff visible to the viewer;
+    /// `None` renders the "Where we left off" empty state.
+    pub handoff_summary: Option<String>,
+    /// `agent · relative time` of that handoff; empty without one.
+    pub handoff_meta: String,
+    /// Next steps recorded on that handoff.
+    pub handoff_next_steps: Vec<String>,
+    /// Open questions recorded on that handoff.
+    pub handoff_open_questions: Vec<String>,
+    /// Stale pages in this project.
+    pub quality_stale: u64,
+    /// Duplicate pages in this project.
+    pub quality_duplicates: u64,
+    /// Orphan pages in this project.
+    pub quality_orphans: u64,
+    /// Link to this project's audit page.
+    pub audit_href: String,
+    /// Knowledge pages by kind: `(label i18n key, count, bar width percent)`.
+    pub kind_bars: Vec<(&'static str, u64, u64)>,
+    /// Page versions in this project, superseded ones included.
+    pub pages_all: u64,
+    /// Sessions ever recorded for this project.
+    pub sessions_total: u64,
+    /// Sessions started in the last 7 days.
+    pub sessions_7d: u64,
+    /// Observations captured in the last 7 days.
+    pub observations_7d: u64,
+    /// Pages updated in the last 7 days.
+    pub pages_updated_7d: u64,
 }
 
 /// One recent session on the project page.
@@ -587,8 +616,9 @@ pub(crate) struct PageView {
     pub cited_by: Vec<RelatedRow>,
     /// Backlinks beyond [`RELATED_LIMIT`].
     pub cited_by_more: usize,
-    /// Pages this one links to, at most [`RELATED_LIMIT`].
-    pub cites: Vec<RelatedRow>,
+    /// This page's outgoing links with their resolution status, at most
+    /// [`RELATED_LIMIT`].
+    pub cites: Vec<LinkStatusRow>,
     /// Outgoing links beyond [`RELATED_LIMIT`].
     pub cites_more: usize,
     /// Username of the page's last author. Empty string when the page
@@ -603,6 +633,22 @@ pub(crate) struct PageView {
     /// Optional email rendered as a `mailto:` link after the username.
     /// Empty when not set on the user row.
     pub author_email: String,
+    /// `?mode=agent`: the agent-oriented view instead of the human one.
+    pub agent_mode: bool,
+    /// Link to the human view of this page.
+    pub human_href: String,
+    /// Link to the agent view of this page.
+    pub agent_href: String,
+    /// One sentence on when retrieval brings this page up, from its kind,
+    /// tier and pinned flag.
+    pub retrieval_hint: String,
+    /// Linked pages grouped by kind for the agent view; empty groups are
+    /// left out.
+    pub agent_groups: Vec<AgentLinkGroup>,
+    /// Every outgoing link target that resolves to no readable page.
+    pub unresolved: Vec<LinkStatusRow>,
+    /// The page is indexed but its markdown file is gone from disk.
+    pub missing_on_disk: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +954,12 @@ pub(crate) struct SearchView {
     pub kind_options: Vec<FilterOption>,
     /// Tiers the filter offers.
     pub tier_options: Vec<FilterOption>,
+    /// `(href, name)` of readable projects in the current workspace whose
+    /// name contains the query, ignoring case.
+    pub project_matches: Vec<(String, String)>,
+    /// Hits whose page path contains the query, ignoring case; a subset of
+    /// `hits` without snippet or trace.
+    pub path_hits: Vec<SearchHit>,
 }
 
 impl SearchView {
@@ -1276,4 +1328,108 @@ mod tests {
             "w/default%20space/proj%23one/graph"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// /w/:workspace/:project/audit
+// ---------------------------------------------------------------------------
+
+/// One issue-type summary card on the project audit page.
+pub(crate) struct AuditTypeRow {
+    /// Stable issue key (`missing`, `broken`, `duplicate`, `orphan`, `stale`).
+    pub kind: String,
+    /// Localized issue name.
+    pub label: String,
+    /// Localized one-line explanation.
+    pub explanation: String,
+    /// Count as shown, with a trailing `+` when the list hit its cap.
+    pub count_label: String,
+    /// The count is non-zero.
+    pub has_issues: bool,
+    /// `high`, `medium` or `low`.
+    pub severity: String,
+    /// Link that filters the table to this issue type.
+    pub href: String,
+    /// This type is the active filter.
+    pub active: bool,
+}
+
+/// One flagged page in the project audit table.
+pub(crate) struct AuditIssueRow {
+    /// Page title (falls back to the path).
+    pub title: String,
+    /// Relative wiki path.
+    pub path: String,
+    /// Link to the page.
+    pub href: String,
+    /// Localized issue name.
+    pub kind_label: String,
+    /// Localized reason plus the page kind.
+    pub detail: String,
+    /// `high`, `medium` or `low`.
+    pub severity: String,
+}
+
+/// View-model for `GET /w/:workspace/:project/audit`.
+#[derive(Template)]
+#[template(path = "audit.html")]
+pub(crate) struct AuditView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link back to the project overview.
+    pub project_href: String,
+    /// Unfiltered audit page URL.
+    pub audit_href: String,
+    /// Active `?type=` filter; empty shows every issue type.
+    pub filter: String,
+    /// Sum of the per-type counts.
+    pub total: u64,
+    /// Indexed pages whose markdown file is gone.
+    pub missing_count: u64,
+    /// Pages with at least one unresolved outgoing link.
+    pub broken_count: u64,
+    /// Pages sharing a title with another page.
+    pub duplicate_count: u64,
+    /// Pages with no inbound or outbound links.
+    pub orphan_count: u64,
+    /// Episodic pages untouched for over 30 days.
+    pub stale_count: u64,
+    /// Per-type summary cards, most severe first.
+    pub types: Vec<AuditTypeRow>,
+    /// Flagged pages (filtered by `filter` when set).
+    pub issues: Vec<AuditIssueRow>,
+}
+
+/// One outgoing link of a page, resolved or not, for the reader.
+pub(crate) struct LinkStatusRow {
+    /// Title of the resolved page, or the link target as written.
+    pub label: String,
+    /// Link to the resolved page; empty when the target is missing.
+    pub href: String,
+    /// Whether the target resolves to a page the viewer may read.
+    pub resolved: bool,
+    /// `workspace/project` when the target lives in another project.
+    pub scope_hint: String,
+}
+
+/// Linked pages of one kind, for the reader's agent view.
+pub(crate) struct AgentLinkGroup {
+    /// Fluent id of the group heading.
+    pub label_id: &'static str,
+    /// The pages in this group.
+    pub rows: Vec<AgentLinkRow>,
+}
+
+/// One linked page in the reader's agent view.
+pub(crate) struct AgentLinkRow {
+    /// Link to the page.
+    pub href: String,
+    /// Page title.
+    pub title: String,
+    /// Relative wiki path, prefixed with `workspace/project:` when the
+    /// page lives in another project.
+    pub path: String,
 }

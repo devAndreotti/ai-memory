@@ -130,7 +130,7 @@
 <div class="project-cards-grid" id="project-cards">
 {% for card in projects %}
 <article class="project-card" data-project-search="{{ card.workspace }} {{ card.project }} {{ card.agent_summary }}" data-open="{{ card.open_session_count }}" data-inbox="{{ card.pending_inbox }}" {% if project_state == "open" && card.open_session_count == 0 %}hidden{% endif %}>
-  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="{{ i18n.two("web-open-value0-value1", card.workspace, card.project) }}" href="{{ card.href }}">{{ card.project }}</a></h3></div>{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="{{ i18n.text("web-messages-waiting-for-an-agent") }}">{{ card.pending_inbox }} {{ i18n.text("web-inbox-projects") }}</a>{% endif %}</div>
+  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="{{ i18n.two("web-open-value0-value1", card.workspace, card.project) }}" href="{{ card.href }}">{{ card.project }}</a></h3></div><div class="ml-auto flex shrink-0 items-center gap-2">{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="{{ i18n.text("web-messages-waiting-for-an-agent") }}">{{ card.pending_inbox }} {{ i18n.text("web-inbox-projects") }}</a>{% endif %}<button type="button" class="project-pin grid h-8 w-8 place-items-center rounded-md border border-slate-200 text-base text-slate-400 hover:border-teal-500 hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal-600 dark:border-slate-700 dark:text-slate-500 dark:hover:text-teal-300" data-pin-key="{{ card.workspace }}/{{ card.project }}" aria-pressed="false" aria-label="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}" title="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}"><span aria-hidden="true">☆</span></button></div></div>
   <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}{{ i18n.text("web-no-agent-sessions-yet") }}{% endif %}</p>
   <div class="project-card-metrics"><div class="project-card-metric"><span>{{ i18n.text("web-sessions-agent") }}</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-captured-events") }}</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-compiled-pages") }}</span><strong>{{ card.page_count }} <small>{{ i18n.count("web-count-page", card.page_count) }}</small></strong></div><div class="project-card-metric"><span>{{ i18n.text("web-open-sessions") }}</span><strong>{{ card.open_session_count }}</strong></div></div>
   <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}{{ i18n.one("web-last-capture-value", card.last_updated_relative) }}{% else %}{{ i18n.text("web-no-capture-yet") }}{% endif %}</span><a href="{{ card.href }}?tab=agents">{{ i18n.text("web-explore-agents") }}</a></div>
@@ -140,6 +140,36 @@
 <p class="project-result-count" id="project-result-count" role="status" aria-live="polite"></p><div id="project-filter-empty" class="empty-state" hidden><h3>{{ i18n.text("web-no-projects-match-these-filters") }}</h3><p>{{ i18n.text("web-try-another-name-or-switch-back-to-all-projects") }}</p></div>
 <script>
 (function(){var input=document.getElementById("project-filter"),state=document.getElementById("project-state"),cards=Array.from(document.querySelectorAll("article[data-project-search]"));function filter(){var term=input.value.trim().toLocaleLowerCase(),count=0;cards.forEach(function(card){var match=card.dataset.projectSearch.toLocaleLowerCase().includes(term)&&(state.value==="all"||(state.value==="open"&&Number(card.dataset.open)>0)||(state.value==="inbox"&&Number(card.dataset.inbox)>0));card.hidden=!match;if(match)count++;});document.getElementById("project-filter-empty").hidden=count!==0;document.getElementById("project-result-count").textContent=term||state.value!=="all"?{{ i18n.js_two("web-project-filter-summary", "{shown}", "{total}")|safe }}.replace("{shown}",count).replace("{total}",cards.length):"";}input.addEventListener("input",filter);state.addEventListener("change",filter);filter();})();
+(function(){
+  var KEY="ai-memory-pinned-projects",buttons=Array.from(document.querySelectorAll("button.project-pin[data-pin-key]"));
+  if(!buttons.length)return;
+  function read(){
+    if(window.aiMemoryPinnedProjects)return window.aiMemoryPinnedProjects();
+    try{var raw=JSON.parse(localStorage.getItem(KEY)||"[]");return Array.isArray(raw)?raw.filter(function(v){return typeof v==="string";}):[];}catch(_){return [];}
+  }
+  function write(list){
+    if(window.aiMemorySetPinnedProjects){window.aiMemorySetPinnedProjects(list);return;}
+    try{localStorage.setItem(KEY,JSON.stringify(list));}catch(_){}
+  }
+  function sync(){
+    var pins=read();
+    buttons.forEach(function(button){
+      var on=pins.indexOf(button.dataset.pinKey)>=0;
+      button.setAttribute("aria-pressed",String(on));
+      button.firstElementChild.textContent=on?"★":"☆";
+      button.classList.toggle("text-teal-700",on);button.classList.toggle("dark:text-teal-300",on);
+      button.classList.toggle("text-slate-400",!on);button.classList.toggle("dark:text-slate-500",!on);
+    });
+  }
+  buttons.forEach(function(button){button.addEventListener("click",function(){
+    var pins=read(),key=button.dataset.pinKey,at=pins.indexOf(key);
+    if(at>=0)pins.splice(at,1);else pins.push(key);
+    write(pins);sync();
+  });});
+  document.addEventListener("ai-memory-pins-changed",sync);
+  // base.html defines the shared pin helpers after this page's content.
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",sync);else sync();
+})();
 </script>{% endif %}
 <details class="section-note section-block"><summary>{{ i18n.text("web-about-compiled-memory") }}</summary><p>{{ i18n.text("web-pages-are-compiled-from-captured-observations-for-agent-retrieval-use-project-details") }}</p></details>
 {% endblock %}

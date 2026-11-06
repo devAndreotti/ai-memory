@@ -10,6 +10,7 @@ use crate::state::WebState;
 
 mod agents;
 mod api;
+mod audit;
 mod documentation;
 mod graph;
 mod health;
@@ -138,6 +139,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route(
                 "/w/{workspace}/{project}/graph",
                 get(graph::project_handler),
+            )
+            .route(
+                "/w/{workspace}/{project}/audit",
+                get(audit::handler),
             )
             .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
             .route("/w/{workspace}/{project}/h/{*path}", get(history::handler))

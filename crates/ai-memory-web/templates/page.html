@@ -6,20 +6,24 @@
 
 {% block content %}
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+  <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
-  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <a href="{{ project_href }}" class="hover:text-teal-600 dark:hover:text-teal-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 truncate max-w-xs">{{ path }}</span>
 </nav>
 
 <div class="lg:flex lg:items-start lg:gap-10">
 <article class="max-w-3xl min-w-0 lg:flex-1">
+  <nav class="project-tabs mb-4" role="tablist" aria-label="{{ i18n.text("web-reader-mode-label") }}">
+    <a href="{{ human_href }}" role="tab" aria-selected="{% if agent_mode %}false{% else %}true{% endif %}" data-reader-mode="human">{{ i18n.text("web-reader-mode-human") }}</a>
+    <a href="{{ agent_href }}" role="tab" aria-selected="{% if agent_mode %}true{% else %}false{% endif %}" data-reader-mode="agent">{{ i18n.text("web-reader-mode-agent") }}</a>
+  </nav>
   <h1 class="text-3xl font-bold text-slate-900 dark:text-slate-100 mb-3">{{ title }}</h1>
 
   <!-- Metadata row -->
   <div class="flex flex-wrap items-center gap-2 mb-6 text-xs text-slate-500 dark:text-slate-400">
-    <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+    <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-teal-50 dark:bg-teal-950 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-800">
       {{ tier }}
     </span>
     <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
@@ -37,12 +41,12 @@
     {% endif %}
     <span class="ml-1">{{ i18n.text("web-updated") }} <time datetime="{{ updated_at }}" title="{{ updated_at }}">{{ updated_relative }}</time></span>
     <span>·</span>
-    <a href="{{ history_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-history-page") }}</a>
+    <a href="{{ history_href }}" class="text-teal-600 dark:text-teal-400 underline">{{ i18n.text("web-history-page") }}</a>
     <span>·</span>
     <span>{{ i18n.text("web-created") }} <time datetime="{{ created_at }}" title="{{ created_at }}">{{ created_relative }}</time></span>
     {% if supersedes_path != "" %}
     <span>·</span>
-    <span>{{ i18n.text("web-supersedes") }} <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
+    <span>{{ i18n.text("web-supersedes") }} <a href="{{ supersedes_href }}" class="text-teal-600 dark:text-teal-400 underline">{{ supersedes_path }}</a></span>
     {% endif %}
     {% if author_username != "" %}
     <span>·</span>
@@ -50,12 +54,52 @@
       {{ i18n.text("web-last-edited-by") }}
       <span class="font-medium text-slate-700 dark:text-slate-300">{{ author_username }}</span>
       {% if author_name != "" %}<span class="text-slate-500 dark:text-slate-400">({{ author_name }})</span>{% endif %}
-      {% if author_email != "" %}<a href="mailto:{{ author_email }}" class="text-blue-600 dark:text-blue-400 underline">{{ author_email }}</a>{% endif %}
+      {% if author_email != "" %}<a href="mailto:{{ author_email }}" class="text-teal-600 dark:text-teal-400 underline">{{ author_email }}</a>{% endif %}
     </span>
     {% endif %}
   </div>
 
   {% include "_knowledge.html" %}
+  {% if agent_mode %}
+  <!-- Agent view: retrieval hint, linked pages by kind, unresolved targets -->
+  <section data-reader-agent class="mb-6 space-y-4 rounded border border-slate-200 dark:border-slate-800 p-4 text-sm">
+    <div>
+      <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-when-used") }}</h2>
+      <p class="mt-1 text-slate-700 dark:text-slate-300">{{ retrieval_hint }}</p>
+    </div>
+    <div>
+      <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-linked-pages") }}</h2>
+      {% if agent_groups.is_empty() %}
+      <p class="mt-1 text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-no-linked-pages") }}</p>
+      {% else %}
+      {% for group in agent_groups %}
+      <h3 class="mt-3 font-semibold text-slate-700 dark:text-slate-300">{{ i18n.text(group.label_id) }}</h3>
+      <ul class="mt-1 space-y-1">
+        {% for row in group.rows %}
+        <li><a href="{{ row.href }}" class="text-teal-600 dark:text-teal-400 hover:underline">{{ row.title }}</a> <code class="text-xs text-slate-500 dark:text-slate-400">{{ row.path }}</code></li>
+        {% endfor %}
+      </ul>
+      {% endfor %}
+      {% endif %}
+    </div>
+    {% if !unresolved.is_empty() %}
+    <div>
+      <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-unresolved") }}</h2>
+      <ul class="mt-1 space-y-1">
+        {% for row in unresolved %}
+        <li><code class="text-xs">{% if row.scope_hint != "" %}{{ row.scope_hint }}:{% endif %}{{ row.label }}</code></li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if missing_on_disk %}
+  <div role="status" data-reader-missing-on-disk class="rounded border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950 p-4 text-sm text-amber-800 dark:text-amber-200">
+    <p class="font-semibold">{{ i18n.text("web-reader-missing-on-disk") }}</p>
+    <p class="mt-1">{{ i18n.text("web-reader-missing-on-disk-detail") }} <code>{{ path }}</code></p>
+  </div>
+  {% else %}
   <!-- Rendered markdown body -->
   <div class="
     [&_h1]:text-3xl [&_h1]:font-bold [&_h1]:mt-6 [&_h1]:mb-3
@@ -70,7 +114,7 @@
     [&_code]:bg-slate-100 [&_code]:dark:bg-slate-800 [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-sm [&_code]:font-mono
     [&_pre]:p-3 [&_pre]:rounded [&_pre]:bg-slate-100 [&_pre]:dark:bg-slate-800 [&_pre]:overflow-x-auto [&_pre]:my-3
     [&_pre_code]:bg-transparent [&_pre_code]:p-0
-    [&_a]:text-blue-600 [&_a]:dark:text-blue-400 [&_a]:underline
+    [&_a]:text-teal-600 [&_a]:dark:text-teal-400 [&_a]:underline
     [&_table]:w-full [&_table]:my-3 [&_table]:border-collapse
     [&_th]:border [&_th]:border-slate-300 [&_th]:dark:border-slate-700 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:bg-slate-50 [&_th]:dark:bg-slate-800
     [&_td]:border [&_td]:border-slate-300 [&_td]:dark:border-slate-700 [&_td]:px-3 [&_td]:py-2
@@ -80,16 +124,51 @@
   ">
     {{ body_html|safe }}
   </div>
+  {% endif %}
 </article>
 
 <aside aria-label="{{ i18n.text("web-page-navigation") }}" class="mt-8 space-y-6 text-sm lg:mt-0 lg:w-64 lg:shrink-0 lg:sticky lg:top-4 lg:max-h-screen lg:overflow-y-auto">
+  <details open data-reader-frontmatter>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">{{ i18n.text("web-reader-frontmatter") }}</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-frontmatter") }}</h2>
+    <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-slate-700 dark:text-slate-300">
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-kind") }}</dt><dd>{{ kind }}</dd>
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-tier") }}</dt><dd>{{ tier }}</dd>
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-pinned") }}</dt><dd>{% if pinned %}{{ i18n.text("web-reader-yes") }}{% else %}{{ i18n.text("web-reader-no") }}{% endif %}</dd>
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-created") }}</dt><dd><time datetime="{{ created_at }}" title="{{ created_at }}">{{ created_relative }}</time></dd>
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-updated") }}</dt><dd><time datetime="{{ updated_at }}" title="{{ updated_at }}">{{ updated_relative }}</time></dd>
+      {% if author_username != "" %}
+      <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-reader-author") }}</dt><dd class="break-all">{{ author_username }}</dd>
+      {% endif %}
+    </dl>
+    <div class="mt-2 flex items-center gap-2">
+      <code class="min-w-0 truncate text-xs text-slate-500 dark:text-slate-400" title="{{ path }}">{{ path }}</code>
+      <button type="button" data-copy-path="{{ path }}" data-copied-label="{{ i18n.text("web-reader-copied") }}" class="shrink-0 rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-600 dark:text-slate-300 hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-reader-copy-path") }}</button>
+    </div>
+    <script>
+      (function () {
+        var button = document.currentScript.parentElement.querySelector("[data-copy-path]");
+        if (!button || !navigator.clipboard) { return; }
+        var label = button.textContent;
+        var timer = null;
+        button.addEventListener("click", function () {
+          navigator.clipboard.writeText(button.dataset.copyPath).then(function () {
+            button.textContent = button.dataset.copiedLabel;
+            clearTimeout(timer);
+            timer = setTimeout(function () { button.textContent = label; }, 1500);
+          });
+        });
+      })();
+    </script>
+  </details>
+
   {% if !outline.is_empty() %}
   <details open>
     <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">{{ i18n.text("web-on-this-page") }}</summary>
     <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-on-this-page") }}</h2>
     <ul class="mt-2 space-y-1">
       {% for item in outline %}
-      <li{% if item.nested %} class="pl-3"{% endif %}><a href="{{ item.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ item.text }}</a></li>
+      <li{% if item.nested %} class="pl-3"{% endif %}><a href="{{ item.href }}" class="text-teal-600 dark:text-teal-400 hover:underline">{{ item.text }}</a></li>
       {% endfor %}
     </ul>
   </details>
@@ -103,7 +182,7 @@
     {% else %}
     <ul class="mt-2 space-y-1">
       {% for rel in cited_by %}
-      <li><a href="{{ rel.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
+      <li><a href="{{ rel.href }}" class="text-teal-600 dark:text-teal-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
       {% endfor %}
     </ul>
     {% if cited_by_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">{{ i18n.one("web-and-more", cited_by_more) }}</p>{% endif %}
@@ -116,7 +195,11 @@
     <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-cites") }}</h2>
     <ul class="mt-2 space-y-1">
       {% for rel in cites %}
-      <li><a href="{{ rel.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
+      {% if rel.resolved %}
+      <li data-link-status="resolved"><a href="{{ rel.href }}" class="text-teal-600 dark:text-teal-400 hover:underline">{{ rel.label }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
+      {% else %}
+      <li data-link-status="missing"><span class="text-slate-600 dark:text-slate-400 break-all">{{ rel.label }}</span>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %} <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">{{ i18n.text("web-reader-not-found") }}</span></li>
+      {% endif %}
       {% endfor %}
     </ul>
     {% if cites_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">{{ i18n.one("web-and-more", cites_more) }}</p>{% endif %}
