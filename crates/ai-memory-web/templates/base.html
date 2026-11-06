@@ -15,20 +15,20 @@
     <a href="." class="app-brand"><img src="static/logo.png" alt="" width="34" height="34"><span>ai-memory<small>{{ i18n.text("web-agent-workspace") }}</small></span></a>
     <p class="nav-label">{{ i18n.text("web-workspace") }}</p>
     <nav aria-label="{{ i18n.text("web-main") }}" class="app-nav">
-      <a href="." data-nav="projects"><span aria-hidden="true">▦</span>{{ i18n.text("web-projects") }}</a>
-      <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
+      <a href="." data-nav="projects"><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>{{ i18n.text("web-projects") }}</a>
+      <a href="inbox" data-nav="inbox"><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg></span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
       <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="{{ i18n.text("web-projects-with-pending-messages") }}"></ul></div>
       <span id="inbox-notification-status" class="sr-only" role="status" aria-live="polite"></span>
-      <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>{{ i18n.text("web-workstreams") }}</a>
-      <a href="search" data-nav="search"><span aria-hidden="true">⌕</span>{{ i18n.text("web-search-memory") }}</a>
-      <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true">⌘</span>{{ i18n.text("web-knowledge-graph") }}</a>
+      <a href="workstreams" data-nav="workstreams" data-requires="admin" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M6 12h8a4 4 0 0 0 4 0"/></svg></span>{{ i18n.text("web-workstreams") }}</a>
+      <a href="search" data-nav="search"><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg></span>{{ i18n.text("web-search-memory") }}</a>
+      <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7l8 0M7.5 8l3.5 8.5M16.5 10l-3 6"/></svg></span>{{ i18n.text("web-knowledge-graph") }}</a>
       <p class="nav-label">{{ i18n.text("web-observe-improve") }}</p>
-      <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>{{ i18n.text("web-learning-review") }}</a>
-      <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>{{ i18n.text("web-server-health") }}</a>
+      <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg></span>{{ i18n.text("web-learning-review") }}</a>
+      <a href="health" data-nav="health" data-requires="admin" {% block nav_health_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg></span>{{ i18n.text("web-server-health") }}</a>
       <div id="pinned-projects" hidden><p class="nav-label" id="pinned-projects-label">{{ i18n.text("web-pin-section") }}</p><div id="pinned-project-links" role="group" aria-labelledby="pinned-projects-label" class="app-nav"></div></div>
       <p class="nav-label">{{ i18n.text("web-resources") }}</p>
-      <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>{{ i18n.text("web-documentation") }}</a>
-      <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>{{ i18n.text("web-changelog") }}</a>
+      <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5"/></svg></span>{{ i18n.text("web-documentation") }}</a>
+      <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg></span>{{ i18n.text("web-changelog") }}</a>
     </nav>
     <div class="nav-bottom"><span class="nav-orbit" aria-hidden="true">◈</span><strong>{{ i18n.text("web-context-that-stays") }}<small>{{ i18n.text("web-across-agents-across-sessions") }}</small></strong></div>
   </aside>
@@ -40,10 +40,11 @@
       <div class="topbar-spacer"></div>
       {% block header_actions %}
       {% block header_search %}
-      <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">{{ i18n.text("web-search-pages") }}</label><input id="header-search" name="q" type="search" placeholder="{{ i18n.text("web-search-memory-base") }}"><span aria-hidden="true">⌕</span></form>
+      <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">{{ i18n.text("web-search-pages") }}</label><input id="header-search" name="q" type="search" placeholder="{{ i18n.text("web-search-memory-base") }}"><span aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg></span></form>
       {% endblock %}
       <button type="button" id="ai-memory-logout" class="quiet-button">{{ i18n.text("web-log-out") }}</button>
       {% endblock %}
+      <button type="button" class="quiet-button" data-command-palette-open aria-keyshortcuts="Control+K Meta+K" aria-label="{{ i18n.text("web-palette-title") }}" title="{{ i18n.text("web-palette-title") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg></button>
       <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
       <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
         <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
@@ -78,7 +79,20 @@
     }
   })();
   </script>
-  {% include "_inbox_notifications.html" %}
+  <script>
+(function(){
+  if(!/(?:^|;\s*)ai_memory_csrf=/.test(document.cookie)){window.aiMemoryCapsReady=Promise.resolve(null);return;}
+  window.aiMemoryCapsReady=fetch((document.querySelector('meta[name="ai-memory-base-path"]')?.getAttribute("content")||"")+"/auth/me",{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json"}})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(me){
+      var caps=(me&&me.capabilities)||null;
+      if(caps&&!caps.admin){document.querySelectorAll("[data-requires=\"admin\"]").forEach(function(el){el.style.display="none";});}
+      return caps;
+    })
+    .catch(function(){return null;});
+})();
+</script>
+{% include "_inbox_notifications.html" %}
   <script>
   (function(){
     var KEY="ai-memory-pinned-projects",MAX=50;

@@ -34,6 +34,6 @@
   document.addEventListener("inbox:changed",refreshInboxNotifications);
   window.addEventListener("pagehide",function(){stopped=true;clearTimeout(timer);if(controller)controller.abort();});
   window.addEventListener("pageshow",function(event){if(event.persisted){stopped=false;refreshInboxNotifications();}});
-  refreshInboxNotifications();
+  (window.aiMemoryCapsReady||Promise.resolve(null)).then(function(caps){if(!caps||caps.normal_read===false)return;refreshInboxNotifications();});
 })();
 </script>
