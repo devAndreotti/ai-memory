@@ -24,6 +24,11 @@ version in [`docs/changelog/`](docs/changelog/):
 - The web UI's dark theme now uses a deeper palette: near-black background,
   warm off-white text, cyan accent and amber alerts. Only the theme tokens
   changed, so the layout and the light theme are the same as before.
+- The web UI uses thinner scrollbars in the theme's colours, and every select
+  (language picker, filters, mailbox selectors) shares one style. On a
+  project's mailbox page the message list and the new-message form now have
+  the same height, and the empty-state message stays centred in the visible
+  part of the page while scrolling.
 
 ## [3.4.0] - 2026-11-04
 
