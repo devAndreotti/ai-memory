@@ -13,7 +13,12 @@
 </div>
 
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-managed-workstreams-on-this-page") }}</p>
+<div class="empty-state" data-workstreams-empty>
+  <span aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28" fill="none" stroke="#0c786a" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="24" r="3"></circle><circle cx="25" cy="8" r="3"></circle><path d="M10 24h6a4 4 0 0 0 4-4v-8a4 4 0 0 1 2-3.5" stroke-dasharray="2 3"></path></svg></span>
+  <h2>{{ i18n.text("web-empty-workstreams-title") }}</h2>
+  <p>{{ i18n.text("web-no-managed-workstreams-on-this-page") }}</p>
+  <p>{{ i18n.text("web-empty-workstreams-body") }}</p>
+</div>
 {% else %}
 <div class="overflow-x-auto border-y border-slate-200 dark:border-slate-800">
   <table class="w-full text-left text-sm">

@@ -112,18 +112,16 @@
 {% if query == "" %}
 <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-enter-a-search-term-above") }}</p>
 {% else if hits.is_empty() && project_matches.is_empty() %}
-<div class="flex flex-col items-center gap-3 py-10 text-center" data-search-empty>
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="text-teal-600 dark:text-teal-400" aria-hidden="true">
-    <circle cx="11" cy="11" r="7"></circle>
-    <path d="M21 21l-4.35-4.35"></path>
-    <path d="M8.5 11h5"></path>
-  </svg>
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-results-for") }} <strong>{{ query }}</strong>{% if filtered %} {{ i18n.text("web-with-these-filters") }}{% endif %}.
+<div class="empty-state" data-search-empty>
+  <span aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="28" height="28" fill="none" stroke="#0c786a" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="14" cy="14" r="11" stroke-dasharray="2 3"></circle><circle cx="14" cy="14" r="6"></circle><path d="M18.5 18.5l8 8"></path></svg></span>
+  <h2>{{ i18n.text("web-empty-search-title") }}</h2>
+<p>{{ i18n.text("web-no-results-for") }} <strong>{{ query }}</strong>{% if filtered %} {{ i18n.text("web-with-these-filters") }}{% endif %}.
   {% if unknown_kind != "" %}{{ i18n.rich_one("web-search-unknown-kind", unknown_kind, "")|safe }}{% endif %}
   {% if self.scoped() %}
   <a href="{{ global_href }}" class="ml-2 inline-block rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900">{{ i18n.text("web-search-all-projects") }}</a>
   {% endif %}
 </p>
+<p>{% if self.scoped() %}{{ i18n.text("web-empty-search-body-scoped") }}{% else %}{{ i18n.text("web-empty-search-body") }}{% endif %}</p>
 </div>
 {% else %}
 {% if !project_matches.is_empty() %}

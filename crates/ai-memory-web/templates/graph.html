@@ -47,7 +47,20 @@
 {% endif %}
 
 {% if svg_nodes.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.label(empty_message) }}</p>
+<div class="empty-state mb-10" data-graph-empty>
+  <span aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28" fill="none" stroke="#0c786a" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="9" r="3"></circle><circle cx="25" cy="8" r="3"></circle><circle cx="16" cy="24" r="3"></circle><path d="M10 9.5h12" stroke-dasharray="2 3"></path><path d="M9 12l5 9" stroke-dasharray="2 3"></path><path d="M23.5 11l-6 10" stroke-dasharray="2 3"></path></svg></span>
+  {% if is_project %}
+  <h2>{{ i18n.text("web-empty-graph-project-title") }}</h2>
+  <p>{{ i18n.label(empty_message) }}</p>
+  <p>{{ i18n.text("web-empty-graph-project-body") }}</p>
+  {% if project_href != "" %}<p><a href="{{ project_href }}" class="font-medium text-teal-600 dark:text-teal-400 hover:underline">{{ i18n.text("web-empty-graph-back-to-project") }}</a></p>{% endif %}
+  {% else %}
+  <h2>{{ i18n.text("web-empty-graph-global-title") }}</h2>
+  <p>{{ i18n.label(empty_message) }}</p>
+  <p>{{ i18n.text("web-empty-graph-global-body") }}</p>
+  <p><a href="." class="font-medium text-teal-600 dark:text-teal-400 hover:underline">{{ i18n.text("web-empty-graph-browse-projects") }}</a></p>
+  {% endif %}
+</div>
 {% else %}
 <svg id="graph-svg" viewBox="0 0 800 800" class="w-full max-w-3xl mx-auto mb-10 text-slate-700 dark:text-slate-200" role="img" aria-labelledby="graph-heading">
   <title id="graph-heading">{{ i18n.label(heading) }}</title>

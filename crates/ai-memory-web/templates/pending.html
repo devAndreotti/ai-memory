@@ -46,7 +46,12 @@
 <p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
 
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pending-proposals") }}</p>
+<div class="empty-state" data-pending-empty>
+  <span aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28" fill="none" stroke="#0c786a" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="6" width="22" height="20" rx="3"></rect><path d="M11 16.5l3.5 3.5 7-7"></path></svg></span>
+  <h2>{{ i18n.text("web-empty-pending-title") }}</h2>
+  <p>{{ i18n.text("web-no-pending-proposals") }}</p>
+  <p>{{ i18n.text("web-empty-pending-body") }}</p>
+</div>
 {% else %}
 <ul id="pending-list" class="space-y-3">
   {% for row in rows %}
