@@ -1,26 +1,144 @@
 {% extends "base.html" %}
 {% block title %}{{ i18n.text("web-inbox-ai-memory") }}{% endblock %}
 {% block content %}
+<div class="inbox-redesign">
+<style>
+.inbox-redesign{display:flex;flex-direction:column;gap:16px}
+.inbox-redesign .ib-head{align-items:flex-end;margin-bottom:0}
+.inbox-redesign .ib-head h1{letter-spacing:-.02em}
+.inbox-redesign .mail-overview{padding:14px 18px}
+.inbox-redesign .mail-overview h2{font-size:13px;margin:0 0 4px}
+.inbox-redesign .ib-filters{align-items:center;display:flex;flex-wrap:wrap;gap:8px}
+.inbox-redesign .ib-chips{display:flex;flex-wrap:wrap;gap:8px}
+.inbox-redesign .ib-chip{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:999px;color:var(--dash-muted);font-size:13px;padding:6px 12px;text-decoration:none}
+.inbox-redesign .ib-chip:hover{border-color:var(--dash-accent);color:var(--dash-text)}
+.inbox-redesign .ib-chip[aria-current="page"]{background:color-mix(in srgb,var(--dash-accent) 12%,var(--dash-surface));border-color:color-mix(in srgb,var(--dash-accent) 30%,transparent);color:var(--dash-accent);font-weight:600}
+.inbox-redesign .ib-mailbox{align-items:center;display:flex;flex-wrap:wrap;gap:8px;margin-left:auto}
+.inbox-redesign .ib-mailbox .field-input{margin:0;min-width:220px;width:auto}
+.inbox-redesign .ib-mailbox .segmented-tabs{margin:0}
+.inbox-redesign .ib-grid{display:grid;gap:16px;grid-template-columns:minmax(0,1fr) 380px;align-items:start}
+.inbox-redesign .ib-card{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:12px;overflow:hidden}
+.inbox-redesign .ib-table{border-collapse:collapse;table-layout:fixed;width:100%}
+.inbox-redesign .ib-table th{border-bottom:1px solid var(--dash-line);color:var(--dash-muted);font-size:11px;font-weight:700;letter-spacing:.08em;padding:12px 18px;text-align:left;text-transform:uppercase}
+.inbox-redesign .ib-table th.ib-from,.inbox-redesign .ib-table td.ib-from{width:170px}
+.inbox-redesign .ib-table th.ib-state,.inbox-redesign .ib-table td.ib-state{text-align:right;width:130px}
+.inbox-redesign .ib-table td{border-bottom:1px solid var(--dash-line);color:var(--dash-text);font-size:13px;padding:14px 18px;vertical-align:middle;overflow-wrap:anywhere}
+.inbox-redesign .ib-table tr:last-child td{border-bottom:0}
+.inbox-redesign .ib-row{cursor:pointer}
+.inbox-redesign .ib-row:hover td{background:var(--dash-soft)}
+.inbox-redesign .ib-row.is-selected td{background:color-mix(in srgb,var(--dash-accent) 6%,var(--dash-surface))}
+.inbox-redesign .ib-row.is-selected td:first-child{box-shadow:inset 3px 0 0 var(--dash-accent)}
+.inbox-redesign .ib-row[data-state="cancelled"] td,.inbox-redesign .ib-row[data-state="claimed"] td{opacity:.85}
+.inbox-redesign .ib-select{background:none;border:0;color:inherit;cursor:pointer;display:block;font:inherit;padding:0;text-align:left;width:100%}
+.inbox-redesign .ib-select:focus-visible{border-radius:4px;outline:2px solid var(--dash-accent);outline-offset:4px}
+.inbox-redesign .ib-select strong{display:block;font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inbox-redesign .ib-preview{color:var(--dash-muted);display:block;font-size:12px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inbox-redesign .status-pill{border-radius:999px;font-size:12px;font-weight:600;margin-left:0;padding:4px 10px}
+.inbox-redesign .message-cancelled{background:var(--dash-soft);color:var(--dash-muted)}
+.inbox-redesign .message-editing{background:var(--dash-soft);border:1px dashed var(--dash-alert);color:var(--dash-alert)}
+.inbox-redesign .pagination{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px}
+.inbox-redesign .pagination:empty{display:none}
+.inbox-redesign .ib-panel{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:12px;display:flex;flex-direction:column;gap:14px;padding:20px;position:sticky;top:96px}
+.inbox-redesign .ib-panel .eyebrow{margin:0}
+.inbox-redesign .mail-row{border-top:0;display:flex;flex-direction:column;gap:12px}
+.inbox-redesign .mail-row[hidden]{display:none}
+.inbox-redesign .ib-subject{font-size:17px;font-weight:700;line-height:1.3;margin:0;overflow-wrap:anywhere}
+.inbox-redesign .ib-meta{color:var(--dash-muted);font-size:13px;margin:0;overflow-wrap:anywhere}
+.inbox-redesign .ib-meta b{color:var(--dash-text)}
+.inbox-redesign .mail-detail{background:none;display:flex;flex-direction:column;gap:12px;padding:0}
+.inbox-redesign .mail-detail .mail-id{color:var(--dash-muted);font-size:11px;margin:0}
+.inbox-redesign .mail-detail .message-body{background:var(--dash-soft);border:1px solid var(--dash-line);border-radius:10px;font-size:14px;line-height:1.6;margin:0;max-height:50vh;overflow:auto;padding:14px}
+.inbox-redesign .mail-actions{display:flex;flex-wrap:wrap;gap:8px}
+.inbox-redesign .mail-actions>*{flex:1;justify-content:center;text-align:center}
+.inbox-redesign .mail-editor{display:flex;flex-direction:column;gap:8px}
+.inbox-redesign .ib-empty{align-items:center;background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:16px;display:flex;flex-direction:column;gap:12px;justify-content:center;min-height:420px;padding:40px 16px;text-align:center}
+.inbox-redesign .ib-empty svg{height:auto;max-width:100%}
+.inbox-redesign .ib-empty h2{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:4px 0 0}
+.inbox-redesign .ib-empty p{color:var(--dash-muted);font-size:15px;line-height:1.6;margin:0;max-width:460px}
+.inbox-redesign .ib-empty .primary-button{margin-top:6px}
+.inbox-redesign .ib-svg-shadow{fill:var(--dash-soft)}
+.inbox-redesign .ib-svg-env{fill:var(--dash-soft);stroke:var(--dash-line)}
+.inbox-redesign .ib-svg-flap{fill:none;stroke:var(--dash-line)}
+.inbox-redesign .ib-svg-badge{fill:var(--dash-surface);stroke:var(--dash-accent)}
+.inbox-redesign .ib-svg-accent{fill:none;stroke:var(--dash-accent)}
+.inbox-redesign .ib-svg-trail{fill:none;stroke:var(--dash-muted)}
+.inbox-redesign .ib-svg-dot{fill:var(--dash-accent)}
+.inbox-redesign .ib-drawer{background:var(--dash-surface);border:0;border-left:1px solid var(--dash-line);color:var(--dash-text);height:100%;margin:0 0 0 auto;max-height:100%;max-width:100vw;padding:0;width:480px}
+.inbox-redesign .ib-drawer::backdrop{background:color-mix(in srgb,var(--dash-text) 35%,transparent)}
+.inbox-redesign .ib-drawer .composer{border:0;border-radius:0;box-shadow:none;min-height:100%;position:static}
+.inbox-redesign .ib-drawer .composer-heading{align-items:flex-start}
+.inbox-redesign .ib-close{background:none;border:1px solid var(--dash-line);border-radius:8px;color:var(--dash-muted);cursor:pointer;font-size:18px;line-height:1;margin-left:auto;padding:6px 10px}
+.inbox-redesign .ib-close:hover{color:var(--dash-text)}
+@media (max-width:960px){
+.inbox-redesign .ib-grid{grid-template-columns:minmax(0,1fr)}
+.inbox-redesign .ib-panel{position:static}
+.inbox-redesign .ib-mailbox{margin-left:0;width:100%}
+.inbox-redesign .ib-mailbox .field-input{flex:1;min-width:0}
+}
+@media (max-width:640px){
+.inbox-redesign .ib-table th.ib-from,.inbox-redesign .ib-table td.ib-from{display:none}
+.inbox-redesign .ib-table th.ib-state,.inbox-redesign .ib-table td.ib-state{width:110px}
+.inbox-redesign .ib-table td,.inbox-redesign .ib-table th{padding-inline:12px}
+}
+</style>
+<noscript><style>.inbox-redesign .mail-row[hidden]{display:flex}.inbox-redesign .ib-drawer{display:block;height:auto;margin:0;position:static;width:auto}</style></noscript>
 {% if project != "" %}<nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><span>{{ workspace }}</span><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">{{ i18n.text("web-inbox") }}</span></nav>{% endif %}
-<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-keep-work-moving") }}</p><h1>{{ i18n.text("web-agent-inbox") }}</h1><p>{% if project != "" %}{{ i18n.text("web-viewing-mailbox") }} <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}{{ i18n.text("web-create-a-project-to-start-exchanging-messages-with-agents") }}{% endif %}</p></div><a href="{{ inbox_href }}#compose" id="compose-shortcut" class="primary-button">{{ i18n.text("web-new-message") }}</a></div>
+<div class="page-heading ib-head"><div><p class="eyebrow">{{ i18n.text("web-inbox2-eyebrow") }}</p><h1>{{ i18n.text("web-inbox2-title") }}</h1><p>{% if project != "" %}{{ i18n.text("web-viewing-mailbox") }} <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}{{ i18n.text("web-create-a-project-to-start-exchanging-messages-with-agents") }}{% endif %}</p></div><button type="button" id="compose-shortcut" class="primary-button" data-compose-open aria-haspopup="dialog" aria-controls="compose"><span aria-hidden="true">+</span> {{ i18n.text("web-inbox2-new-message") }}</button></div>
 <section class="surface mail-overview" aria-labelledby="mail-overview-title">
   <h2 id="mail-overview-title">{{ i18n.text("web-waiting-for-agents") }}</h2>
   {% if pending_total > 0 %}<p class="section-note"><strong>{{ pending_total }} {{ i18n.text("web-queued") }}</strong> · {% if pending_projects == 1 %}{{ i18n.text("web-1-project") }}{% else %}{{ pending_projects }} {{ i18n.text("web-projects-inbox") }}{% endif %}{{ i18n.text("web-opening-a-mailbox-does-not-collect-its-messages") }}</p>
   <nav class="mailbox-links" aria-label="{{ i18n.text("web-projects-with-queued-messages") }}">{% for scope in scopes %}{% if scope.pending > 0 %}<a class="mailbox-link" href="{{ scope.inbox_href }}" data-mailbox-workspace="{{ scope.workspace }}" data-mailbox-project="{{ scope.project }}" {% if scope.selected && inbox %}aria-current="page"{% endif %}><span>{{ scope.workspace }} / <strong>{{ scope.project }}</strong></span><span>{{ scope.pending }} {{ i18n.text("web-queued") }} <span aria-hidden="true">→</span></span></a>{% endif %}{% endfor %}</nav>
   {% else %}<p class="section-note">{{ i18n.text("web-no-messages-waiting-for-agents-in-projects-you-can-access") }}</p>{% endif %}
 </section>
-<div class="inbox-layout">
-  <section class="surface inbox-list" aria-labelledby="mail-title">
-    <div class="panel-heading"><label class="field-label" for="mail-project">{{ i18n.text("web-project-mailbox") }}</label><select id="mail-project" class="field-input">{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}{% if scope.pending > 0 %} · {{ scope.pending }} {{ i18n.text("web-queued") }}{% endif %}</option>{% endfor %}</select>
+<div class="ib-filters">
+  <nav class="ib-chips" aria-label="{{ i18n.text("web-message-state") }}">{% for chip in state_chips %}<a class="ib-chip" href="{{ chip.href }}" data-state="{{ chip.state }}" {% if chip.selected %}aria-current="page"{% endif %}>{{ chip.label }}</a>{% endfor %}</nav>
+  <div class="ib-mailbox">
     <nav class="segmented-tabs" aria-label="{{ i18n.text("web-mailbox") }}"><a id="mail-title" href="{{ inbox_href }}" {% if inbox %}aria-current="page"{% endif %}>{{ i18n.text("web-received") }}</a><a href="{{ outbox_href }}" {% if !inbox %}aria-current="page"{% endif %}>{{ i18n.text("web-sent") }}</a></nav>
-    <form action="inbox" method="get" class="mail-state-filter"><input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}"><input type="hidden" name="box" value="{% if inbox %}inbox{% else %}outbox{% endif %}"><label for="mail-state" class="field-label">{{ i18n.text("web-message-state") }}</label><select id="mail-state" name="state" class="field-input"><option value="" {% if state == "" %}selected{% endif %}>{{ i18n.text("web-all-messages") }}</option><option value="pending" {% if state == "pending" %}selected{% endif %}>{{ i18n.text("web-awaiting-collection") }}</option><option value="claimed" {% if state == "claimed" %}selected{% endif %}>{{ i18n.text("web-collected") }}</option><option value="cancelled" {% if state == "cancelled" %}selected{% endif %}>{{ i18n.text("web-cancelled") }}</option><option value="editing" {% if state == "editing" %}selected{% endif %}>{{ i18n.text("web-editing") }}</option></select><noscript><button class="secondary-button" type="submit">{{ i18n.text("web-filter") }}</button></noscript></form></div>
-    {% if inbox && editing_count > 0 %}<p class="section-note held-note" role="status"><strong>{{ i18n.count("web-held-count", editing_count) }}</strong> {{ i18n.count("web-held-instructions", editing_count) }} <a href="{{ editing_href }}">{{ i18n.count("web-held-show", editing_count) }}</a></p>{% endif %}
-    {% if rows.is_empty() %}<div class="empty-state mail-empty"><span aria-hidden="true">✉</span><h2>{{ i18n.text("web-a-little-breathing-room") }}</h2><p>{% if state != "" %}{{ i18n.text("web-no-messages-match-this-state-in-the-selected-mailbox") }}{% else if inbox %}{{ i18n.text("web-no-messages-received-by-this-project-yet") }}{% else %}{{ i18n.text("web-no-messages-sent-from-this-project-yet") }}{% endif %}</p><p>{{ i18n.text("web-choose-an-agent-and-leave-a-clear-request-for-its-next-inbox-check") }}</p></div>{% else %}
-    <div class="mail-rows">{% for row in rows %}<details class="mail-row" data-state="{{ row.state }}" data-message-id="{{ row.id }}" data-subject="{{ row.raw_subject }}"><summary><span class="mail-avatar" aria-hidden="true">✉</span><span class="mail-preview"><strong>{{ row.subject }}</strong><span>{{ row.from }} → {{ row.to }}</span><small>{{ row.agent }} · {{ row.when }}</small></span><span class="status-pill message-{{ row.state }}">{{ row.state_label }}</span><span class="mail-chevron" aria-hidden="true">⌄</span></summary><div class="mail-detail"><p class="mail-id mono">{{ row.id }}</p><p class="message-body">{{ row.body }}</p>{% if row.state == "claimed" %}<p class="section-note">{{ i18n.text("web-collected-by-an-agent-this-is-not-confirmation-that-the-request-has-been-completed") }}</p>{% endif %}{% if inbox && !needs_write_token %}{% if row.state == "pending" %}<div class="mail-actions"><button type="button" class="secondary-button" data-message-action="begin">{{ i18n.text("web-edit") }}</button></div>{% else if row.state == "editing" %}<p class="section-note held-hint">{{ i18n.text("web-held-while-it-is-edited-agents-cannot-collect-it-until-it-is-saved-or-discarded") }}</p><div class="mail-actions"><button type="button" class="secondary-button" data-message-action="resume">{{ i18n.text("web-continue-editing") }}</button> <button type="button" class="secondary-button" data-message-action="release">{{ i18n.text("web-discard-changes") }}</button></div>{% endif %}{% endif %}</div></details>{% endfor %}</div>{% endif %}
+    <label class="sr-only" for="mail-project">{{ i18n.text("web-project-mailbox") }}</label><select id="mail-project" class="field-input">{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}{% if scope.pending > 0 %} · {{ scope.pending }} {{ i18n.text("web-queued") }}{% endif %}</option>{% endfor %}</select>
+  </div>
+</div>
+{% if inbox && editing_count > 0 %}<p class="section-note held-note" role="status"><strong>{{ i18n.count("web-held-count", editing_count) }}</strong> {{ i18n.count("web-held-instructions", editing_count) }} <a href="{{ editing_href }}">{{ i18n.count("web-held-show", editing_count) }}</a></p>{% endif %}
+{% if rows.is_empty() %}
+<section class="ib-empty" aria-labelledby="mail-empty-title">
+  <svg width="280" height="170" viewBox="0 0 280 170" aria-hidden="true" focusable="false">
+    <ellipse class="ib-svg-shadow" cx="140" cy="158" rx="118" ry="8"/>
+    <path class="ib-svg-env" d="M58 58 L140 22 L222 58 L222 128 Q222 138 212 138 L68 138 Q58 138 58 128 Z" stroke-width="1.5"/>
+    <path class="ib-svg-flap" d="M58 58 L140 104 L222 58" stroke-width="1.5" stroke-linejoin="round"/>
+    <path class="ib-svg-flap" d="M140 22 L140 104" stroke-width="1" stroke-dasharray="3 4"/>
+    <circle class="ib-svg-badge" cx="222" cy="36" r="16" stroke-width="1.5"/>
+    <path class="ib-svg-accent" d="M215 36 l5 5 l9 -10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path class="ib-svg-trail" d="M30 96 q14 -10 26 0 t26 0" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 5"/>
+    <circle class="ib-svg-dot" cx="250" cy="110" r="3" opacity=".4"/>
+  </svg>
+  <h2 id="mail-empty-title">{{ i18n.text("web-inbox2-empty-title") }}</h2>
+  <p>{% if state != "" %}{{ i18n.text("web-inbox2-empty-filtered") }}{% else if inbox %}{{ i18n.text("web-inbox2-empty-body") }}{% else %}{{ i18n.text("web-inbox2-empty-sent") }}{% endif %}</p>
+  <button type="button" class="primary-button" data-compose-open aria-haspopup="dialog" aria-controls="compose">{{ i18n.text("web-inbox2-empty-action") }}</button>
+</section>
+{% if previous != "" || next != "" %}<nav class="pagination" aria-label="{{ i18n.text("web-message-pages") }}">{% if previous != "" %}<a href="{{ previous }}" class="secondary-button">{{ i18n.text("web-newer") }}</a>{% endif %}{% if next != "" %}<a href="{{ next }}" class="secondary-button">{{ i18n.text("web-older") }}</a>{% endif %}</nav>{% endif %}
+{% else %}
+<div class="ib-grid">
+  <section class="ib-card inbox-list" aria-labelledby="mail-title">
+    <table class="ib-table">
+      <caption class="sr-only">{% if inbox %}{{ i18n.text("web-received") }}{% else %}{{ i18n.text("web-sent") }}{% endif %} · {{ workspace }} / {{ project }}</caption>
+      <thead><tr><th scope="col">{{ i18n.text("web-inbox2-col-subject") }}</th><th scope="col" class="ib-from">{% if inbox %}{{ i18n.text("web-inbox2-col-from") }}{% else %}{{ i18n.text("web-inbox2-col-to") }}{% endif %}</th><th scope="col" class="ib-state">{{ i18n.text("web-inbox2-col-state") }}</th></tr></thead>
+      <tbody>{% for row in rows %}<tr class="ib-row{% if loop.first %} is-selected{% endif %}" data-select="{{ row.id }}" data-state="{{ row.state }}"><td><button type="button" class="ib-select" aria-controls="msg-{{ row.id }}" aria-pressed="{% if loop.first %}true{% else %}false{% endif %}"><strong>{{ row.subject }}</strong><span class="ib-preview">{{ row.body|truncate(160) }}</span></button></td><td class="ib-from">{% if inbox %}{{ row.from }}{% else %}{{ row.to }}{% endif %}</td><td class="ib-state"><span class="status-pill message-{{ row.state }}">{{ row.state_label }}</span></td></tr>{% endfor %}</tbody>
+    </table>
     <nav class="pagination" aria-label="{{ i18n.text("web-message-pages") }}">{% if previous != "" %}<a href="{{ previous }}" class="secondary-button">{{ i18n.text("web-newer") }}</a>{% endif %}{% if next != "" %}<a href="{{ next }}" class="secondary-button">{{ i18n.text("web-older") }}</a>{% endif %}</nav>
   </section>
-  <aside id="compose" class="surface composer" aria-labelledby="compose-title">
-    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">{{ i18n.text("web-direct-to-an-agent") }}</p><h2 id="compose-title">{{ i18n.text("web-new-message-inbox") }}</h2></div></div>
+  <aside class="ib-panel mail-rows" aria-labelledby="mail-selected-title">
+    <p class="eyebrow" id="mail-selected-title">{{ i18n.text("web-inbox2-selected") }}</p>
+    {% for row in rows %}<article class="mail-row" id="msg-{{ row.id }}" data-state="{{ row.state }}" data-message-id="{{ row.id }}" data-subject="{{ row.raw_subject }}" data-from="{{ row.from }}" {% if !loop.first %}hidden{% endif %}>
+      <h2 class="ib-subject">{{ row.subject }}</h2>
+      <p class="ib-meta">{{ i18n.text("web-inbox2-from") }} <b>{{ row.from }}</b> · {{ row.when }}</p>
+      <p class="ib-meta">{{ i18n.text("web-inbox2-to") }} <b>{{ row.to }}</b> · {{ row.agent }} <span class="status-pill message-{{ row.state }}">{{ row.state_label }}</span></p>
+      <div class="mail-detail"><p class="mail-id mono">{{ row.id }}</p><p class="message-body">{{ row.body }}</p>{% if row.state == "claimed" %}<p class="section-note">{{ i18n.text("web-collected-by-an-agent-this-is-not-confirmation-that-the-request-has-been-completed") }}</p>{% endif %}{% if inbox && !needs_write_token %}{% if row.state == "pending" %}<div class="mail-actions"><button type="button" class="secondary-button" data-message-action="begin">{{ i18n.text("web-edit") }}</button> <button type="button" class="primary-button" data-compose-open data-compose-to="{{ row.from }}" aria-haspopup="dialog" aria-controls="compose">{{ i18n.text("web-inbox2-reply") }}</button></div>{% else if row.state == "editing" %}<p class="section-note held-hint">{{ i18n.text("web-held-while-it-is-edited-agents-cannot-collect-it-until-it-is-saved-or-discarded") }}</p><div class="mail-actions"><button type="button" class="secondary-button" data-message-action="resume">{{ i18n.text("web-continue-editing") }}</button> <button type="button" class="secondary-button" data-message-action="release">{{ i18n.text("web-discard-changes") }}</button></div>{% else %}<div class="mail-actions"><button type="button" class="primary-button" data-compose-open data-compose-to="{{ row.from }}" aria-haspopup="dialog" aria-controls="compose">{{ i18n.text("web-inbox2-reply") }}</button></div>{% endif %}{% endif %}</div>
+    </article>{% endfor %}
+  </aside>
+</div>
+{% endif %}
+<dialog id="compose" class="ib-drawer" aria-labelledby="compose-title">
+  <div class="surface composer">
+    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">{{ i18n.text("web-direct-to-an-agent") }}</p><h2 id="compose-title">{{ i18n.text("web-new-message-inbox") }}</h2></div><button type="button" class="ib-close" data-compose-close aria-label="{{ i18n.text("web-inbox2-close") }}"><span aria-hidden="true">×</span></button></div>
     <form id="message-composer" action="messages" method="post">
       <label class="field-label" for="message-from">{{ i18n.text("web-from-project") }}</label><select id="message-from" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
       <label class="field-label" for="message-to-project">{{ i18n.text("web-to-project") }}</label><select id="message-to-project" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
@@ -36,7 +154,8 @@
       <button class="primary-button send-button" type="submit" {% if !can_send %}disabled{% endif %}>{{ i18n.text("web-queue-message") }} <span aria-hidden="true">↗</span></button>
       <p id="message-result" role="status" aria-live="polite" tabindex="-1"></p>
     </form>
-  </aside>
+  </div>
+</dialog>
 </div>
 <script>
 (function(){
@@ -44,6 +163,7 @@
   var project=document.getElementById("mail-project"),form=document.getElementById("message-composer"),body=document.getElementById("message-body"),result=document.getElementById("message-result");
   var fromProject=document.getElementById("message-from"),toProject=document.getElementById("message-to-project"),toAgent=document.getElementById("message-to"),button=form.querySelector('button[type="submit"]'),sending=false;
   var agents=document.getElementById("message-agent-options").content.querySelectorAll("option"),agentHint=document.getElementById("message-agent-hint");
+  var drawer=document.getElementById("compose"),opener=null;
   function updateSendButton(){button.disabled=sending||!toAgent.querySelector("option[data-agent]");}
   function filterAgents(){
     var scope=toProject.selectedOptions[0],placeholder=document.createElement("option");placeholder.value="";toAgent.replaceChildren(placeholder);
@@ -53,10 +173,22 @@
     agentHint.textContent=available?{{ i18n.js("web-only-agents-registered-in-the-destination-project-are-shown")|safe }}:{{ i18n.js("web-no-agents-registered-in-this-project-yet-capture-a-session-or-choose-another-destinat")|safe }};
     updateSendButton();
   }
+  function openCompose(trigger){
+    opener=trigger||document.getElementById("compose-shortcut");
+    var target=trigger&&trigger.dataset.composeTo;
+    if(target){var match=Array.from(toProject.options).findIndex(function(o){return o.textContent===target;});if(match>=0&&match!==toProject.selectedIndex){toProject.selectedIndex=match;filterAgents();}}
+    if(!drawer.open){if(typeof drawer.showModal==="function")drawer.showModal();else drawer.setAttribute("open","");}
+    (target?toAgent.disabled?document.getElementById("message-subject"):toAgent:fromProject).focus();
+  }
+  function closeCompose(){if(drawer.open){if(typeof drawer.close==="function")drawer.close();else{drawer.removeAttribute("open");drawer.dispatchEvent(new Event("close"));}}}
+  document.addEventListener("click",function(event){var trigger=event.target.closest("[data-compose-open]");if(trigger){event.preventDefault();openCompose(trigger);}});
+  drawer.querySelector("[data-compose-close]").addEventListener("click",closeCompose);
+  drawer.addEventListener("click",function(event){if(event.target===drawer)closeCompose();});
+  drawer.addEventListener("keydown",function(event){if(event.key==="Escape"&&typeof drawer.showModal!=="function"){event.preventDefault();closeCompose();}});
+  drawer.addEventListener("close",function(){if(location.hash==="#compose")history.replaceState(null,"",location.href.split("#")[0]);if(opener&&document.contains(opener))opener.focus();opener=null;});
+  if(location.hash==="#compose")openCompose(null);
   fromProject.addEventListener("change",function(){toProject.selectedIndex=fromProject.selectedIndex;filterAgents();});
   toProject.addEventListener("change",filterAgents);
-  document.getElementById("compose-shortcut").href=location.href.split("#")[0]+"#compose";
-  document.getElementById("mail-state").addEventListener("change",function(){this.form.requestSubmit();});
   project.addEventListener("change",function(){var o=project.selectedOptions[0],url=new URL("inbox",document.baseURI);url.searchParams.set("workspace",o.dataset.workspace);url.searchParams.set("project",o.dataset.project);var current=new URL(location.href);if(current.searchParams.has("state"))url.searchParams.set("state",current.searchParams.get("state"));if(current.searchParams.has("box"))url.searchParams.set("box",current.searchParams.get("box"));location.assign(url.href);});
   body.addEventListener("input",function(){document.getElementById("message-count").textContent=Array.from(body.value).length+" / 8,000";});
   form.addEventListener("submit",async function(event){
@@ -80,6 +212,17 @@
     }catch(error){result.className="send-error";result.textContent=error.name==="AbortError"?{{ i18n.js("web-delivery-is-unconfirmed-check-sent-before-trying-again-to-avoid-a-duplicate")|safe }}:(error.message||{{ i18n.js("web-delivery-is-unconfirmed-check-sent-before-trying-again")|safe }});}
     finally{clearTimeout(timeout);if(token)token.value="";sending=false;updateSendButton();result.focus();}
   });
+})();
+</script>
+<script>
+(function(){
+  var table=document.querySelector(".inbox-redesign .ib-table"),panel=document.querySelector(".inbox-redesign .ib-panel");if(!table||!panel)return;
+  function select(id){
+    table.querySelectorAll("tr[data-select]").forEach(function(tr){var on=tr.dataset.select===id;tr.classList.toggle("is-selected",on);tr.querySelector(".ib-select").setAttribute("aria-pressed",on?"true":"false");});
+    panel.querySelectorAll(".mail-row").forEach(function(article){article.hidden=article.dataset.messageId!==id;});
+    if(window.matchMedia("(max-width: 960px)").matches)panel.scrollIntoView({block:"start",behavior:"smooth"});
+  }
+  table.addEventListener("click",function(event){var tr=event.target.closest("tr[data-select]");if(tr)select(tr.dataset.select);});
 })();
 </script>
 <script>
@@ -109,7 +252,9 @@
     var detail=row.querySelector(".mail-detail"),id=row.dataset.messageId;
     detail.querySelectorAll(".mail-actions,.message-body,.held-hint,.edit-error").forEach(function(node){node.remove();});
     row.dataset.state="editing";
-    var pill=row.querySelector(".status-pill");pill.textContent={{ i18n.js("web-editing")|safe }};pill.className="status-pill message-editing";
+    var pills=[row.querySelector(".status-pill")],tableRow=document.querySelector('.ib-table tr[data-select="'+id+'"]');
+    if(tableRow){tableRow.dataset.state="editing";pills.push(tableRow.querySelector(".status-pill"));}
+    pills.forEach(function(pill){if(pill){pill.textContent={{ i18n.js("web-editing")|safe }};pill.className="status-pill message-editing";}});
     var form=document.createElement("form"),subjectInput=document.createElement("input"),bodyInput=document.createElement("textarea"),status=document.createElement("p"),actions=document.createElement("div"),save=document.createElement("button"),discard=document.createElement("button"),hint=document.createElement("p");
     form.className="mail-editor";
     subjectInput.className="field-input";subjectInput.maxLength=200;subjectInput.value=subject;

@@ -33,6 +33,14 @@ pub(crate) struct RecipientOption {
     pub selected: bool,
 }
 
+/// One state filter chip in the inbox filter row.
+pub(crate) struct StateChip {
+    pub state: String,
+    pub label: String,
+    pub href: String,
+    pub selected: bool,
+}
+
 pub(crate) struct MessageRow {
     pub id: String,
     pub subject: String,
@@ -60,6 +68,7 @@ pub(crate) struct InboxView {
     pub rows: Vec<MessageRow>,
     pub inbox: bool,
     pub editing_count: usize,
+    pub state_chips: Vec<StateChip>,
     pub editing_href: String,
     pub state: String,
     pub inbox_href: String,

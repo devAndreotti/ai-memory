@@ -3,6 +3,7 @@
 {% block title %}{{ i18n.text("web-search-search") }} {{ query }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block content %}
+<div class="ui3-search">
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
   <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
@@ -13,8 +14,33 @@
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-search-search-2") }}</span>
 </nav>
 
+<style>
+  .ui3-search h1{font-size:34px;line-height:1.15;font-weight:700;letter-spacing:-.02em;color:var(--dash-text)}
+  .ui3-search .ui3-eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;color:var(--dash-accent);margin-bottom:4px}
+  .ui3-search .ui3-form{display:flex;flex-direction:column;gap:12px;margin-bottom:28px}
+  .ui3-search .ui3-bar{display:flex;gap:10px;align-items:center}
+  .ui3-search .ui3-box{flex:1;min-width:0;height:48px;display:flex;align-items:center;gap:10px;padding:0 16px;border:1px solid var(--dash-line);border-radius:12px;background:var(--dash-surface);color:var(--dash-muted)}
+  .ui3-search .ui3-box:focus-within{border-color:var(--dash-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--dash-accent) 18%,transparent)}
+  .ui3-search .ui3-box input{flex:1;min-width:0;height:100%;border:0;outline:0;background:transparent;font-size:16px;color:var(--dash-text)}
+  .ui3-search .ui3-count{flex-shrink:0;font-size:12px;white-space:nowrap}
+  .ui3-search .ui3-go{height:48px;padding:0 20px;border-radius:12px;font-size:13px}
+  .ui3-search .ui3-chips{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px}
+  .ui3-search .ui3-chip{appearance:none;-webkit-appearance:none;max-width:100%;border-radius:999px;padding:6px 30px 6px 12px;font-size:13px;color:var(--dash-muted);background-color:var(--dash-surface);border:1px solid var(--dash-line);cursor:pointer;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%;background-size:5px 5px;background-repeat:no-repeat}
+  .ui3-search .ui3-chip:focus-visible{outline:2px solid var(--dash-accent);outline-offset:2px}
+  .ui3-search .ui3-chip:has(option:checked:not([value=""])),.ui3-search .ui3-chip[data-active]{color:var(--dash-accent);background-color:var(--dash-accent-soft);border-color:color-mix(in srgb,var(--dash-accent) 30%,transparent);font-weight:600}
+  .ui3-search .ui3-explain{margin-left:auto;display:inline-flex;align-items:center;gap:6px;color:var(--dash-muted)}
+  .ui3-search .ui3-explain input{accent-color:var(--dash-accent)}
+  .ui3-search .ui3-hit{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:14px;padding:18px 20px;box-shadow:var(--dash-shadow)}
+  .ui3-search .ui3-hits{display:flex;flex-direction:column;gap:12px}
+  .ui3-search .ui3-hit-meta{font-size:12px;color:var(--dash-muted);overflow-wrap:anywhere}
+  .ui3-search .ui3-hit-title{display:block;margin:4px 0;font-size:17px;font-weight:700;color:var(--dash-accent)}
+  .ui3-search .ui3-hit-title:hover{text-decoration:underline}
+  .ui3-search .ui3-snippet{font-size:14px;line-height:1.6;color:var(--dash-text);overflow-wrap:anywhere}
+  .ui3-search .ui3-snippet mark{background:var(--dash-alert-bg);color:inherit;border-radius:3px;padding:0 2px}
+</style>
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">
+  <p class="ui3-eyebrow">{{ i18n.text("web-search") }}</p>
+  <h1>
     {% if query != "" %}
     {{ i18n.text("web-search-search") }} <span class="text-teal-600 dark:text-teal-400">{{ query }}</span>
     {% else %}
@@ -31,60 +57,53 @@
   {% endif %}
 </div>
 
-<form action="search" method="get" class="mb-8 flex flex-wrap items-center gap-2">
-  <label for="search-scope" class="sr-only">{{ i18n.text("web-search-in") }}</label>
-  <select
-    id="search-scope"
-    name="scope"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal-500"
-  >
-    <option value=""{% if !self.scoped() %} selected{% endif %}>{{ i18n.text("web-all-projects") }}</option>
-    {% for group in scope_groups %}
-    <optgroup label="{{ group.workspace }}">
-      {% for option in group.projects %}
-      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+<form action="search" method="get" class="ui3-form">
+  <div class="ui3-bar">
+    <div class="ui3-box">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+      <label for="search-q" class="sr-only">{{ i18n.text("web-search-pages") }}</label>
+      <input
+        id="search-q"
+        name="q"
+        type="search"
+        value="{{ query }}"
+        placeholder="{{ i18n.text("web-search-pages-search") }}"
+      >
+      {% if query != "" && !truncated %}<span class="ui3-count" aria-live="polite">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</span>{% endif %}
+    </div>
+    <button type="submit" class="primary-button ui3-go">{{ i18n.text("web-search") }}</button>
+  </div>
+  <div class="ui3-chips">
+    <label for="search-scope" class="sr-only">{{ i18n.text("web-search-in") }}</label>
+    <select id="search-scope" name="scope" class="ui3-chip"{% if self.scoped() %} data-active{% endif %}>
+      <option value=""{% if !self.scoped() %} selected{% endif %}>{{ i18n.text("web-all-projects") }}</option>
+      {% for group in scope_groups %}
+      <optgroup label="{{ group.workspace }}">
+        {% for option in group.projects %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </optgroup>
       {% endfor %}
-    </optgroup>
-    {% endfor %}
-  </select>
-  <label for="search-kind" class="sr-only">{{ i18n.text("web-kind") }}</label>
-  <select
-    id="search-kind"
-    name="kind"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal-500"
-  >
-    <option value="">{{ i18n.text("web-any-kind") }}</option>
-    {% for option in kind_options %}
-    <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
-    {% endfor %}
-  </select>
-  <label for="search-tier" class="sr-only">{{ i18n.text("web-tier") }}</label>
-  <select
-    id="search-tier"
-    name="tier"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal-500"
-  >
-    <option value="">{{ i18n.text("web-any-tier") }}</option>
-    {% for option in tier_options %}
-    <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
-    {% endfor %}
-  </select>
-  <label for="search-q" class="sr-only">{{ i18n.text("web-search-pages") }}</label>
-  <input
-    id="search-q"
-    name="q"
-    type="search"
-    value="{{ query }}"
-    placeholder="{{ i18n.text("web-search-pages-search") }}"
-    class="flex-1 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500"
-  >
-  <label class="flex items-center gap-1 text-sm text-slate-600 dark:text-slate-400">
-    <input type="checkbox" name="explain" value="1"{% if explain %} checked{% endif %}>
-    {{ i18n.text("web-explain-ranking") }}
-  </label>
-  <button type="submit" class="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700">
-    {{ i18n.text("web-search") }}
-  </button>
+    </select>
+    <label for="search-kind" class="sr-only">{{ i18n.text("web-kind") }}</label>
+    <select id="search-kind" name="kind" class="ui3-chip">
+      <option value="">{{ i18n.text("web-any-kind") }}</option>
+      {% for option in kind_options %}
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+      {% endfor %}
+    </select>
+    <label for="search-tier" class="sr-only">{{ i18n.text("web-tier") }}</label>
+    <select id="search-tier" name="tier" class="ui3-chip">
+      <option value="">{{ i18n.text("web-any-tier") }}</option>
+      {% for option in tier_options %}
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+      {% endfor %}
+    </select>
+    <label class="ui3-explain">
+      <input type="checkbox" name="explain" value="1"{% if explain %} checked{% endif %}>
+      {{ i18n.text("web-explain-ranking") }}
+    </label>
+  </div>
 </form>
 
 {% if explain && query != "" %}
@@ -155,15 +174,12 @@
 {% else %}
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</p>
 {% endif %}
-<ul class="divide-y divide-slate-100 dark:divide-slate-800">
+<ul class="ui3-hits">
   {% for hit in hits %}
-  <li class="py-4" data-hit-path="{{ hit.path }}">
-    <a href="{{ hit.href }}"
-       class="text-base font-medium text-teal-700 dark:text-teal-400 hover:underline block mb-1">
-      {{ hit.title }}
-    </a>
-    <div class="text-sm text-slate-600 dark:text-slate-400 mb-1">{{ hit.snippet|safe }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
+  <li class="ui3-hit" data-hit-path="{{ hit.path }}">
+    <div class="ui3-hit-meta">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
+    <a href="{{ hit.href }}" class="ui3-hit-title">{{ hit.title }}</a>
+    <div class="ui3-snippet">{{ hit.snippet|safe }}</div>
     {% if let Some(trace) = hit.trace %}
     <div class="mt-2 overflow-x-auto" data-trace>
       <p class="text-xs text-slate-500 dark:text-slate-400">#{{ trace.position }} {{ i18n.text("web-rank") }} <span class="font-mono">{{ trace.rank }}</span> {{ i18n.text("web-fused") }} <span class="font-mono">{{ trace.fused }}</span> {{ i18n.text("web-authority") }} <span class="font-mono">{{ trace.authority }}</span>{% if let Some(boost) = trace.intent_boost %} {{ i18n.text("web-intent-boost") }} <span class="font-mono">{{ boost }}</span>{% endif %}{% if let Some(score) = trace.rerank_score %} {{ i18n.text("web-rerank") }} <span class="font-mono">{{ score }}</span>{% endif %}</p>
@@ -185,4 +201,5 @@
 </section>
 {% endif %}
 {% endif %}
+</div>
 {% endblock %}

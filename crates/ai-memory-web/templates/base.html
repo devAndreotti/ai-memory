@@ -11,6 +11,7 @@
 </head>
 <body class="dashboard-shell">
   <a id="skip-link" href="#main-content" class="skip-link">{{ i18n.text("web-skip-to-content") }}</a>
+  {% block sidebar %}
   <aside class="app-sidebar" id="app-navigation" aria-label="{{ i18n.text("web-workspace-navigation") }}">
     <a href="." class="app-brand"><img src="static/logo.png" alt="" width="34" height="34"><span>ai-memory<small>{{ i18n.text("web-agent-workspace") }}</small></span></a>
     <p class="nav-label">{{ i18n.text("web-workspace") }}</p>
@@ -33,6 +34,8 @@
     <div class="nav-bottom"><span class="nav-orbit" aria-hidden="true">◈</span><strong>{{ i18n.text("web-context-that-stays") }}<small>{{ i18n.text("web-across-agents-across-sessions") }}</small></strong></div>
   </aside>
   <button class="nav-backdrop" id="nav-backdrop" aria-label="{{ i18n.text("web-close-navigation") }}" hidden></button>
+  {% endblock %}
+  {% block topbar %}
   <header class="app-topbar">
     <div class="app-topbar-content">
       <button class="menu-button" id="nav-toggle" aria-controls="app-navigation" aria-expanded="false" aria-label="{{ i18n.text("web-open-navigation") }}">☰</button>
@@ -57,18 +60,23 @@
       </div>
     </div>
   </header>
+  {% endblock %}
   <main id="main-content" tabindex="-1" class="app-content">{% block content %}{% endblock %}</main>
   <footer class="app-footer"><span>ai-memory <span aria-hidden="true">·</span> {{ i18n.text("web-project-memory-agent-operations") }}</span>{% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}</footer>
   <script>
   (function(){
     document.getElementById("skip-link").href=location.href.split("#")[0]+"#main-content";
     var toggle=document.getElementById("nav-toggle"),backdrop=document.getElementById("nav-backdrop"),nav=document.getElementById("app-navigation");
+    // Standalone pages (login) override the sidebar and top bar blocks, so every piece below is optional.
+    if(toggle&&backdrop&&nav){
     function close(){document.body.classList.remove("nav-open");toggle.setAttribute("aria-expanded","false");backdrop.hidden=true;}
     toggle.addEventListener("click",function(){var open=toggle.getAttribute("aria-expanded")!=="true";document.body.classList.toggle("nav-open",open);toggle.setAttribute("aria-expanded",String(open));backdrop.hidden=!open;if(open)nav.querySelector("a").focus();});
     backdrop.addEventListener("click",close);
     document.addEventListener("keydown",function(e){if(e.key==="Escape"&&document.body.classList.contains("nav-open")){close();toggle.focus();}});
     nav.querySelectorAll("a[data-nav]").forEach(function(a){var path=new URL(a.href).pathname.replace(/\/$/,"");var current=location.pathname.replace(/\/$/,"");if(path===current||(a.dataset.nav==="projects"&&current.indexOf(path+"/w/")===0))a.setAttribute("aria-current","page");a.addEventListener("click",close);});
-    document.getElementById("interface-language").addEventListener("change",function(event){
+    }
+    var language=document.getElementById("interface-language");
+    if(language)language.addEventListener("change",function(event){
       var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";
       document.cookie="ai_memory_language="+encodeURIComponent(event.target.value)+"; Path="+(base||"")+"/; Max-Age=31536000; SameSite=Lax"+(location.protocol==="https:"?"; Secure":"");
       location.reload();
@@ -92,40 +100,75 @@
     .catch(function(){return null;});
 })();
 </script>
-{% include "_inbox_notifications.html" %}
+{% block inbox_notifications %}{% include "_inbox_notifications.html" %}{% endblock %}
   <script>
   (function(){
-    var KEY="ai-memory-pinned-projects",MAX=50;
+    var KEY="ai-memory-pinned-projects",MAX=50,DEFAULT_ICON="folder",DEFAULT_COLOR="#0c786a";
+    // Each icon is a list of 24x24 stroke paths; projects.html reuses them for the chooser.
+    var ICONS={
+      folder:["M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"],
+      book:["M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z","M4 19V5"],
+      bolt:["M13 2L4 14h7l-1 8 9-12h-7z"],
+      flask:["M9 3h6","M10 3v6l-5.5 9.5A2 2 0 0 0 6.2 21.5h11.6a2 2 0 0 0 1.7-3L14 9V3","M7.5 15h9"],
+      shield:["M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"],
+      star:["M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"],
+      code:["M8 8l-4 4 4 4","M16 8l4 4-4 4","M14 5l-4 14"],
+      layers:["M12 3l9 5-9 5-9-5z","M3 13l9 5 9-5"]
+    };
+    var COLORS=["#0c786a","#22c7c5","#e0aa3e","#e06c64","#8b6cf6","#617186"];
     function valid(v){return typeof v==="string"&&v.length<=512&&v.indexOf("/")>0&&v.indexOf("/")<v.length-1;}
-    function read(){
-      try{var raw=JSON.parse(localStorage.getItem(KEY)||"[]");if(!Array.isArray(raw))return [];var seen={};return raw.filter(function(v){if(!valid(v)||seen[v])return false;seen[v]=1;return true;}).slice(0,MAX);}catch(_){return [];}
+    // Older builds stored bare "workspace/project" strings; they become objects with the defaults.
+    function normalize(v){
+      if(typeof v==="string")v={key:v};
+      if(!v||typeof v!=="object"||!valid(v.key))return null;
+      return {key:v.key,icon:Object.prototype.hasOwnProperty.call(ICONS,v.icon)?v.icon:DEFAULT_ICON,color:COLORS.indexOf(v.color)>=0?v.color:DEFAULT_COLOR};
     }
-    function write(list){try{localStorage.setItem(KEY,JSON.stringify(list.slice(0,MAX)));}catch(_){}}
+    function clean(list){var seen={},out=[];(Array.isArray(list)?list:[]).forEach(function(v){var n=normalize(v);if(n&&!seen[n.key]){seen[n.key]=1;out.push(n);}});return out.slice(0,MAX);}
+    function write(list){try{localStorage.setItem(KEY,JSON.stringify(clean(list)));}catch(_){}}
+    function read(){
+      var raw;
+      try{raw=JSON.parse(localStorage.getItem(KEY)||"[]");}catch(_){return [];}
+      var pins=clean(raw);
+      if(Array.isArray(raw)&&raw.some(function(v){return typeof v==="string";}))write(pins);
+      return pins;
+    }
+    function icon(name,size){
+      var ns="http://www.w3.org/2000/svg",svg=document.createElementNS(ns,"svg");
+      svg.setAttribute("width",String(size||18));svg.setAttribute("height",String(size||18));svg.setAttribute("viewBox","0 0 24 24");
+      svg.setAttribute("fill","none");svg.setAttribute("stroke","currentColor");svg.setAttribute("stroke-width","1.8");
+      svg.setAttribute("stroke-linecap","round");svg.setAttribute("stroke-linejoin","round");svg.setAttribute("aria-hidden","true");
+      (ICONS[name]||ICONS[DEFAULT_ICON]).forEach(function(d){var path=document.createElementNS(ns,"path");path.setAttribute("d",d);svg.appendChild(path);});
+      return svg;
+    }
     function render(){
       var box=document.getElementById("pinned-projects"),links=document.getElementById("pinned-project-links");
       if(!box||!links)return;
       var pins=read(),current=location.pathname.replace(/\/$/,"");
       links.textContent="";
-      pins.forEach(function(key){
-        var i=key.indexOf("/"),ws=key.slice(0,i),proj=key.slice(i+1);
+      pins.forEach(function(pin){
+        var key=pin.key,i=key.indexOf("/"),ws=key.slice(0,i),proj=key.slice(i+1);
         var a=document.createElement("a");
         a.href="w/"+encodeURIComponent(ws)+"/"+encodeURIComponent(proj);
         a.title=key;
-        var icon=document.createElement("span");icon.setAttribute("aria-hidden","true");icon.textContent="★";
+        var mark=document.createElement("span");mark.className="pinned-nav-icon";mark.setAttribute("aria-hidden","true");mark.style.color=pin.color;mark.appendChild(icon(pin.icon,18));
         var label=document.createElement("span");label.className="truncate";label.textContent=proj;
-        a.appendChild(icon);a.appendChild(label);
+        var dot=document.createElement("span");dot.className="pinned-nav-dot";dot.setAttribute("aria-hidden","true");dot.style.background=pin.color;
+        a.appendChild(mark);a.appendChild(label);a.appendChild(dot);
         var path=new URL(a.href).pathname.replace(/\/$/,"");
         if(current===path||current.indexOf(path+"/")===0)a.setAttribute("aria-current","page");
         links.appendChild(a);
       });
       box.hidden=pins.length===0;
     }
-    window.aiMemoryPinnedProjects=read;
+    // Keys only: the command palette lists pinned projects by key.
+    window.aiMemoryPinnedProjects=function(){return read().map(function(p){return p.key;});};
+    window.aiMemoryPinnedProjectEntries=read;
+    window.aiMemoryPinIcons={names:Object.keys(ICONS),colors:COLORS.slice(),render:icon,defaults:{icon:DEFAULT_ICON,color:DEFAULT_COLOR}};
     window.aiMemorySetPinnedProjects=function(list){write(list);render();document.dispatchEvent(new CustomEvent("ai-memory-pins-changed"));};
     window.addEventListener("storage",function(e){if(e.key===KEY||e.key===null){render();document.dispatchEvent(new CustomEvent("ai-memory-pins-changed"));}});
     render();
   })();
   </script>
-  {% include "_command_palette.html" %}
+  {% block command_palette %}{% include "_command_palette.html" %}{% endblock %}
 </body>
 </html>

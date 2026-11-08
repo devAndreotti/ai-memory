@@ -2,58 +2,115 @@
 
 {% block title %}{{ i18n.text("web-sign-in-ai-memory") }}{% endblock %}
 
-{% block topbar_caption %}{% endblock %}
-{% block header_actions %}{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block topbar %}{% endblock %}
+{% block inbox_notifications %}{% endblock %}
+{% block command_palette %}{% endblock %}
 {% block footer_version %}{% endblock %}
 
 {% block content %}
-<div class="max-w-md mx-auto mt-6">
-  <div class="flex items-center justify-between gap-4">
-    <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-sign-in") }}</h1>
-    <div class="flex gap-0.5 rounded-md border border-slate-300 dark:border-slate-700 p-0.5 text-xs" role="group" aria-label="{{ i18n.text("web-theme") }}">
-      <button type="button" data-theme-choice="light" aria-pressed="false" title="{{ i18n.text("web-light-theme") }}" class="rounded px-2 py-1">{{ i18n.text("web-light") }}</button>
-      <button type="button" data-theme-choice="dark" aria-pressed="false" title="{{ i18n.text("web-dark-theme") }}" class="rounded px-2 py-1">{{ i18n.text("web-dark") }}</button>
-      <button type="button" data-theme-choice="system" aria-pressed="false" title="{{ i18n.text("web-follow-system-theme") }}" class="rounded px-2 py-1">{{ i18n.text("web-system") }}</button>
+<style>
+.app-content{margin-left:0;padding:0;max-width:none}
+.app-footer{margin-left:0}
+.login-page{min-height:calc(100vh - 56px);display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);background:var(--dash-bg)}
+.login-brand{position:relative;overflow:hidden;display:flex;flex-direction:column;justify-content:space-between;gap:40px;padding:56px;color:#fff;background:linear-gradient(160deg,#0c786a 0%,#0a5f54 100%)}
+.login-logo{display:flex;align-items:center;gap:10px;font-family:"Management Display",system-ui,sans-serif;font-size:20px;font-weight:700;letter-spacing:-.02em}
+.login-network{position:absolute;right:-40px;bottom:-30px;opacity:.9;pointer-events:none}
+.login-pitch{position:relative;max-width:420px}
+.login-pitch p:first-child{font-size:12px;letter-spacing:.14em;font-weight:700;color:#bdeee6;text-transform:uppercase}
+.login-pitch h2{margin:12px 0 10px;font-size:34px;line-height:1.15;font-weight:700;letter-spacing:-.02em}
+.login-pitch p:last-child{font-size:15px;line-height:1.6;color:#d7f3ee}
+.login-panel{display:flex;flex-direction:column;justify-content:center;padding:56px 64px;background:var(--dash-surface)}
+.login-panel-inner{width:100%;max-width:400px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.login-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.login-head .eyebrow{margin-bottom:6px}
+.login-head h1{font-size:30px;font-weight:700;line-height:1.2}
+.login-subtitle{color:var(--dash-muted);font-size:14px}
+.login-error{font-size:13px;padding:10px 12px;border-radius:7px;color:var(--dash-alert);background:var(--dash-alert-bg)}
+.login-error.hidden{display:none}
+#login-form{display:flex;flex-direction:column;gap:14px;margin-top:4px}
+.login-field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+.login-field input{width:100%;box-sizing:border-box;height:46px;padding:0 14px;font-size:15px;border-radius:10px}
+.login-password{position:relative}
+.login-password input{padding-right:84px}
+#toggle-password{position:absolute;right:6px;top:50%;transform:translateY(-50%);min-height:34px;padding:6px 10px;border-radius:7px;font-size:12px;font-weight:600;color:var(--dash-accent);background:transparent;cursor:pointer}
+#toggle-password:hover{background:var(--dash-accent-soft)}
+.login-submit{width:100%;padding:13px;margin-top:6px;font-size:15px;border-radius:10px}
+.login-help{font-size:12px;line-height:1.6;color:var(--dash-muted);margin-top:6px}
+@media(max-width:860px){
+  .login-page{grid-template-columns:1fr;min-height:0}
+  .login-brand{padding:28px 22px;gap:22px;min-height:0}
+  .login-network{width:260px;height:186px;right:-50px;bottom:-40px;opacity:.5}
+  .login-pitch h2{font-size:24px}
+  .login-pitch p:last-child{font-size:13px}
+  .login-panel{padding:30px 16px 36px}
+}
+.login-prefs{display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+.login-prefs select{font-size:12px;padding:6px 30px 6px 10px}
+@media(max-width:420px){.login-head{flex-direction:column}.login-prefs{align-items:flex-start}}
+</style>
+<div class="login-page">
+  <section class="login-brand" aria-hidden="true">
+    <div class="login-logo">
+      <svg width="34" height="34" viewBox="0 0 30 30" aria-hidden="true"><rect x="2" y="2" width="26" height="26" rx="8" fill="rgba(255,255,255,.14)"/><path d="M9 20V10l6-3 6 3v10l-6 3-6-3z" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/><circle cx="15" cy="15" r="2.4" fill="#fff"/></svg>
+      <span>ai-memory</span>
     </div>
-  </div>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-use-your-ai-memory-username-and-password") }}</p>
-
-  <p id="auth-error" class="mt-4 hidden text-sm text-amber-800 dark:text-amber-300" role="alert"></p>
-
-  <form id="login-form" class="mt-4 space-y-3" autocomplete="on"
-        data-next="{{ next }}"
-        data-change-password="{{ change_password_href }}">
-    <div>
-      <label for="username" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">{{ i18n.text("web-username") }}</label>
-      <input
-        id="username"
-        name="username"
-        type="text"
-        autocomplete="username"
-        autofocus
-        required
-        class="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500"
-      >
+    <svg class="login-network" width="420" height="300" viewBox="0 0 420 300" aria-hidden="true">
+      <circle cx="210" cy="150" r="118" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="1.5" stroke-dasharray="4 6"/>
+      <circle cx="210" cy="150" r="78" fill="none" stroke="rgba(255,255,255,.3)" stroke-width="1.5"/>
+      <g stroke="rgba(255,255,255,.45)" stroke-width="1.5"><line x1="210" y1="150" x2="110" y2="92"/><line x1="210" y1="150" x2="318" y2="100"/><line x1="210" y1="150" x2="296" y2="226"/><line x1="210" y1="150" x2="120" y2="214"/></g>
+      <circle cx="210" cy="150" r="22" fill="#fff"/>
+      <g fill="#7fe0d2"><circle cx="110" cy="92" r="9"/><circle cx="318" cy="100" r="7"/><circle cx="296" cy="226" r="10"/><circle cx="120" cy="214" r="6"/></g>
+    </svg>
+    <div class="login-pitch">
+      <p>{{ i18n.text("web-ui1-login-brand-eyebrow") }}</p>
+      <h2>{{ i18n.text("web-ui1-login-headline") }}</h2>
+      <p>{{ i18n.text("web-ui1-login-subtext") }}</p>
     </div>
-    <div>
-      <label for="password" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">{{ i18n.text("web-password") }}</label>
-      <div class="relative">
-        <input
-          id="password"
-          name="password"
-          type="password"
-          autocomplete="current-password"
-          required
-          class="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 pr-16 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500"
-        >
-        <button type="button" id="toggle-password" aria-controls="password" aria-pressed="false" class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-xs text-teal-700 dark:text-teal-400 hover:underline">{{ i18n.text("web-show-password") }}</button>
+  </section>
+  <section class="login-panel">
+    <div class="login-panel-inner">
+      <div class="login-head">
+        <div>
+          <p class="eyebrow">{{ i18n.text("web-ui1-login-eyebrow") }}</p>
+          <h1>{{ i18n.text("web-sign-in") }}</h1>
+        </div>
+        <div class="login-prefs">
+        <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
+        <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
+          <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
+          <option value="pt-BR" lang="pt-BR" {% if i18n.tag() == "pt-BR" %}selected{% endif %}>Português (Brasil)</option>
+        </select>
+        <div class="theme-switch" role="group" aria-label="{{ i18n.text("web-theme") }}">
+          <button type="button" data-theme-choice="light" aria-pressed="false" title="{{ i18n.text("web-light-theme") }}">{{ i18n.text("web-light") }}</button>
+          <button type="button" data-theme-choice="dark" aria-pressed="false" title="{{ i18n.text("web-dark-theme") }}">{{ i18n.text("web-dark") }}</button>
+          <button type="button" data-theme-choice="system" aria-pressed="false" title="{{ i18n.text("web-follow-system-theme") }}">{{ i18n.text("web-system") }}</button>
+        </div>
+        </div>
       </div>
+      <p class="login-subtitle">{{ i18n.text("web-use-your-ai-memory-username-and-password") }}</p>
+
+      <p id="auth-error" class="login-error hidden" role="alert"></p>
+
+      <form id="login-form" autocomplete="on"
+            data-next="{{ next }}"
+            data-change-password="{{ change_password_href }}">
+        <div class="login-field">
+          <label for="username">{{ i18n.text("web-username") }}</label>
+          <input id="username" name="username" type="text" autocomplete="username" autofocus required>
+        </div>
+        <div class="login-field">
+          <label for="password">{{ i18n.text("web-password") }}</label>
+          <div class="login-password">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button type="button" id="toggle-password" aria-controls="password" aria-pressed="false">{{ i18n.text("web-show-password") }}</button>
+          </div>
+        </div>
+        <button type="submit" class="primary-button login-submit">{{ i18n.text("web-sign-in") }}</button>
+      </form>
+      <p class="login-help">{{ i18n.text("web-login-help") }}</p>
     </div>
-    <button type="submit" class="w-full rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700">
-      {{ i18n.text("web-sign-in") }}
-    </button>
-  </form>
-  <p class="mt-6 text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-login-help") }}</p>
+  </section>
 </div>
 <script>
 (function () {

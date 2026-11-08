@@ -5,24 +5,61 @@
 {% block nav_health_current %}aria-current="page"{% endblock %}
 
 {% block content %}
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-server-health") }}</h1>
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-counters-queues-and-model-state-for-this-server-process-read-only-each-fix-is-a-comma") }}</p>
+<style>
+  .ui3-health .ui3-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:20px}
+  .ui3-health h1{font-size:34px;line-height:1.15;font-weight:700;letter-spacing:-.02em;color:var(--dash-text);margin:2px 0 6px}
+  .ui3-health .ui3-lede{font-size:14px;line-height:1.55;color:var(--dash-muted);max-width:720px}
+  .ui3-health .ui3-pill{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;border-radius:999px;padding:4px 11px;font-size:12px;font-weight:600}
+  .ui3-health .ui3-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+  .ui3-health .ui3-pill--ok{color:var(--dash-accent);background:var(--dash-accent-soft)}
+  .ui3-health .ui3-pill--warn{color:var(--dash-alert);background:var(--dash-alert-bg)}
+  .ui3-health .ui3-pill--lg{font-size:13px;padding:7px 14px}
+  .ui3-health .ui3-pill--warn ~ .ui3-pill--warn,.ui3-health .ui3-pill--warn ~ .ui3-pill--ok{display:none}
+  .ui3-health .ui3-card{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:14px;padding:18px;box-shadow:var(--dash-shadow);min-width:0}
+  .ui3-health .ui3-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+  .ui3-health .ui3-card-head h2{font-size:14px;font-weight:700;color:var(--dash-text)}
+  .ui3-health .ui3-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:14px}
+  .ui3-health .ui3-rows{display:flex;flex-direction:column;gap:10px;font-size:13px}
+  .ui3-health .ui3-row{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px}
+  .ui3-health .ui3-row dt{color:var(--dash-muted)}
+  .ui3-health .ui3-row dd{font-weight:600;color:var(--dash-text);font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere;min-width:0}
+  .ui3-health .ui3-checks{display:flex;flex-direction:column;gap:10px}
+  .ui3-health .ui3-check{border-left:3px solid var(--dash-alert)}
+  .ui3-health .ui3-check[data-status="error"]{border-left-color:currentColor}
+  .ui3-health .ui3-check code{font-family:ui-monospace,Consolas,monospace;background:var(--dash-soft);border-radius:5px;padding:1px 6px}
+  .ui3-health .ui3-eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;color:var(--dash-accent)}
+  .ui3-health .ui3-subhead{font-size:11px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;color:var(--dash-muted);margin:0 0 10px}
+  .ui3-health .ui3-notice{margin-bottom:18px;border-radius:12px;padding:12px 14px;font-size:13px;color:var(--dash-alert);background:var(--dash-alert-bg);border:1px solid color-mix(in srgb,var(--dash-alert) 30%,transparent)}
+</style>
+<div class="ui3-health">
+<div class="ui3-head">
+  <div>
+    <p class="ui3-eyebrow">{{ i18n.text("web-ui3-health-eyebrow") }}</p>
+    <h1>{{ i18n.text("web-server-health") }}</h1>
+    <p class="ui3-lede">{{ i18n.text("web-counters-queues-and-model-state-for-this-server-process-read-only-each-fix-is-a-comma") }}</p>
+  </div>
+  {% if checks.is_empty() %}
+  <span class="ui3-pill ui3-pill--ok ui3-pill--lg">{{ i18n.text("web-ui3-health-all-pass") }}</span>
+  {% else %}
+  <span class="ui3-pill ui3-pill--warn ui3-pill--lg">{{ i18n.count("web-ui3-health-attention-count", checks.len()) }}</span>
+  {% endif %}
+</div>
 
 {% if !wired %}
-<p class="mb-6 rounded-md border border-amber-300 dark:border-amber-700 p-3 text-sm text-amber-800 dark:text-amber-300">{{ i18n.text("web-this-server-did-not-wire-its-process-counters-into-the-web-ui-hook-spool-and-provider") }}</p>
+<p class="ui3-notice">{{ i18n.text("web-this-server-did-not-wire-its-process-counters-into-the-web-ui-hook-spool-and-provider") }}</p>
 {% endif %}
 
-<section class="mb-8" aria-label="{{ i18n.text("web-checks") }}">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-checks") }}</h2>
+<section class="mb-6" aria-label="{{ i18n.text("web-checks") }}">
+  <h2 class="ui3-subhead">{{ i18n.text("web-checks") }}</h2>
   {% if checks.is_empty() %}
-  <p class="text-sm text-green-700 dark:text-green-400" data-check="none">{{ i18n.text("web-every-server-side-check-passes") }}</p>
+  <p class="ui3-card text-sm text-teal-700 dark:text-teal-300" data-check="none">{{ i18n.text("web-every-server-side-check-passes") }}</p>
   {% else %}
-  <ul class="space-y-3">
+  <ul class="ui3-checks">
     {% for check in checks %}
-    <li class="rounded-md border border-slate-200 dark:border-slate-800 p-3" data-check="{{ check.id }}">
-      <p class="text-sm"><span class="font-mono text-xs uppercase {% if check.status == "error" %}text-red-700 dark:text-red-400{% else %}text-amber-700 dark:text-amber-400{% endif %}">{{ i18n.status(check.status) }}</span> {{ check.detail }}</p>
+    <li class="ui3-card ui3-check {% if check.status == "error" %}text-rose-600 dark:text-rose-400{% endif %}" data-check="{{ check.id }}" data-status="{{ check.status }}">
+      <p class="text-sm"><span class="ui3-pill {% if check.status == "error" %}bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400{% else %}ui3-pill--warn{% endif %}">{{ i18n.status(check.status) }}</span> <span style="color:var(--dash-text)">{{ check.detail }}</span></p>
       {% if let Some(fix) = check.fix %}
-      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">{{ i18n.text("web-fix") }} <code class="font-mono">{{ fix }}</code></p>
+      <p class="mt-2 text-sm" style="color:var(--dash-muted)">{{ i18n.text("web-fix") }} <code class="font-mono">{{ fix }}</code></p>
       {% endif %}
     </li>
     {% endfor %}
@@ -30,15 +67,28 @@
   {% endif %}
 </section>
 
+<div class="ui3-grid">
 {% for section in sections %}
-<section class="mb-6" aria-label="{{ section.title }}">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ section.title }}</h2>
-  <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm">
+{% let si = loop.index0 %}
+<section class="ui3-card" aria-label="{{ section.title }}">
+  <div class="ui3-card-head">
+    <h2>{{ section.title }}</h2>
+    <span>
+      {% for check in checks %}
+      {% if (si == 0 && check.id.starts_with("hook_")) || (si == 1 && (check.id.starts_with("write_") || check.id.starts_with("spool_") || check.id.starts_with("journal_"))) || (si == 2 && (check.id.starts_with("llm_") || check.id.starts_with("consolidation_"))) || (si == 3 && (check.id.starts_with("embedding_") || check.id.ends_with("_vectors"))) || (si == 4 && check.id.starts_with("storage_")) %}
+      <span class="ui3-pill ui3-pill--warn">{{ i18n.text("web-ui3-health-attention") }}</span>
+      {% endif %}
+      {% endfor %}
+      <span class="ui3-pill ui3-pill--ok">{{ i18n.text("web-ui3-health-ok") }}</span>
+    </span>
+  </div>
+  <dl class="ui3-rows">
     {% for row in section.rows %}
-    <dt class="text-slate-500 dark:text-slate-400">{{ row.label }}</dt>
-    <dd class="font-mono text-slate-800 dark:text-slate-200 break-words">{{ row.value }}</dd>
+    <div class="ui3-row"><dt>{{ row.label }}</dt><dd>{{ row.value }}</dd></div>
     {% endfor %}
   </dl>
 </section>
 {% endfor %}
+</div>
+</div>
 {% endblock %}

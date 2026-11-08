@@ -130,42 +130,96 @@
 <div class="project-cards-grid" id="project-cards">
 {% for card in projects %}
 <article class="project-card" data-project-search="{{ card.workspace }} {{ card.project }} {{ card.agent_summary }}" data-open="{{ card.open_session_count }}" data-inbox="{{ card.pending_inbox }}" {% if project_state == "open" && card.open_session_count == 0 %}hidden{% endif %}>
-  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="{{ i18n.two("web-open-value0-value1", card.workspace, card.project) }}" href="{{ card.href }}">{{ card.project }}</a></h3></div><div class="ml-auto flex shrink-0 items-center gap-2">{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="{{ i18n.text("web-messages-waiting-for-an-agent") }}">{{ card.pending_inbox }} {{ i18n.text("web-inbox-projects") }}</a>{% endif %}<button type="button" class="project-pin grid h-8 w-8 place-items-center rounded-md border border-slate-200 text-base text-slate-400 hover:border-teal-500 hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal-600 dark:border-slate-700 dark:text-slate-500 dark:hover:text-teal-300" data-pin-key="{{ card.workspace }}/{{ card.project }}" aria-pressed="false" aria-label="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}" title="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}"><span aria-hidden="true">☆</span></button></div></div>
+  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="{{ i18n.two("web-open-value0-value1", card.workspace, card.project) }}" href="{{ card.href }}">{{ card.project }}</a></h3></div><div class="ml-auto flex shrink-0 items-center gap-2">{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="{{ i18n.text("web-messages-waiting-for-an-agent") }}">{{ card.pending_inbox }} {{ i18n.text("web-inbox-projects") }}</a>{% endif %}<button type="button" class="project-pin" data-pin-key="{{ card.workspace }}/{{ card.project }}" aria-pressed="false" aria-haspopup="dialog" aria-expanded="false" aria-controls="pin-popover" aria-label="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}" title="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}" data-label-unpinned="{{ i18n.two("web-pin-toggle", card.workspace, card.project) }}" data-label-pinned="{{ i18n.two("web-ui1-pin-edit", card.workspace, card.project) }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></svg></button></div></div>
   <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}{{ i18n.text("web-no-agent-sessions-yet") }}{% endif %}</p>
   <div class="project-card-metrics"><div class="project-card-metric"><span>{{ i18n.text("web-sessions-agent") }}</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-captured-events") }}</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-compiled-pages") }}</span><strong>{{ card.page_count }} <small>{{ i18n.count("web-count-page", card.page_count) }}</small></strong></div><div class="project-card-metric"><span>{{ i18n.text("web-open-sessions") }}</span><strong>{{ card.open_session_count }}</strong></div></div>
   <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}{{ i18n.one("web-last-capture-value", card.last_updated_relative) }}{% else %}{{ i18n.text("web-no-capture-yet") }}{% endif %}</span><a href="{{ card.href }}?tab=agents">{{ i18n.text("web-explore-agents") }}</a></div>
 </article>
 {% endfor %}
 </div>
+<div id="pin-popover" class="pin-popover" role="dialog" aria-label="{{ i18n.text("web-ui1-pin-dialog-label") }}" hidden>
+  <h3 id="pin-popover-title"></h3>
+  <fieldset><legend>{{ i18n.text("web-ui1-pin-icon-legend") }}</legend><div class="pin-icon-grid" role="group" aria-label="{{ i18n.text("web-ui1-pin-icon-legend") }}"><button type="button" data-pin-icon="folder" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-folder") }}" title="{{ i18n.text("web-ui1-pin-icon-folder") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><button type="button" data-pin-icon="book" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-book") }}" title="{{ i18n.text("web-ui1-pin-icon-book") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5"/></svg></button><button type="button" data-pin-icon="bolt" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-bolt") }}" title="{{ i18n.text("web-ui1-pin-icon-bolt") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></button><button type="button" data-pin-icon="flask" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-flask") }}" title="{{ i18n.text("web-ui1-pin-icon-flask") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6"/><path d="M10 3v6l-5.5 9.5A2 2 0 0 0 6.2 21.5h11.6a2 2 0 0 0 1.7-3L14 9V3"/><path d="M7.5 15h9"/></svg></button><button type="button" data-pin-icon="shield" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-shield") }}" title="{{ i18n.text("web-ui1-pin-icon-shield") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/></svg></button><button type="button" data-pin-icon="star" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-star") }}" title="{{ i18n.text("web-ui1-pin-icon-star") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></svg></button><button type="button" data-pin-icon="code" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-code") }}" title="{{ i18n.text("web-ui1-pin-icon-code") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 8l-4 4 4 4"/><path d="M16 8l4 4-4 4"/><path d="M14 5l-4 14"/></svg></button><button type="button" data-pin-icon="layers" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-icon-layers") }}" title="{{ i18n.text("web-ui1-pin-icon-layers") }}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg></button></div></fieldset>
+  <fieldset><legend>{{ i18n.text("web-ui1-pin-color-legend") }}</legend><div class="pin-color-row" role="group" aria-label="{{ i18n.text("web-ui1-pin-color-legend") }}"><button type="button" data-pin-color="#0c786a" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-teal") }}" title="{{ i18n.text("web-ui1-pin-color-teal") }}" style="background:#0c786a"></button><button type="button" data-pin-color="#22c7c5" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-cyan") }}" title="{{ i18n.text("web-ui1-pin-color-cyan") }}" style="background:#22c7c5"></button><button type="button" data-pin-color="#e0aa3e" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-amber") }}" title="{{ i18n.text("web-ui1-pin-color-amber") }}" style="background:#e0aa3e"></button><button type="button" data-pin-color="#e06c64" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-rose") }}" title="{{ i18n.text("web-ui1-pin-color-rose") }}" style="background:#e06c64"></button><button type="button" data-pin-color="#8b6cf6" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-violet") }}" title="{{ i18n.text("web-ui1-pin-color-violet") }}" style="background:#8b6cf6"></button><button type="button" data-pin-color="#617186" aria-pressed="false" aria-label="{{ i18n.text("web-ui1-pin-color-slate") }}" title="{{ i18n.text("web-ui1-pin-color-slate") }}" style="background:#617186"></button></div></fieldset>
+  <div class="pin-popover-actions"><button type="button" class="pin-popover-danger" id="pin-popover-unpin" hidden>{{ i18n.text("web-ui1-unpin") }}</button><button type="button" class="secondary-button" id="pin-popover-cancel">{{ i18n.text("web-ui1-pin-cancel") }}</button><button type="button" class="primary-button" id="pin-popover-save" data-label-new="{{ i18n.text("web-ui1-pin-confirm") }}" data-label-edit="{{ i18n.text("web-ui1-pin-save") }}">{{ i18n.text("web-ui1-pin-confirm") }}</button></div>
+</div>
 <p class="project-result-count" id="project-result-count" role="status" aria-live="polite"></p><div id="project-filter-empty" class="empty-state" hidden><h3>{{ i18n.text("web-no-projects-match-these-filters") }}</h3><p>{{ i18n.text("web-try-another-name-or-switch-back-to-all-projects") }}</p></div>
 <script>
 (function(){var input=document.getElementById("project-filter"),state=document.getElementById("project-state"),cards=Array.from(document.querySelectorAll("article[data-project-search]"));function filter(){var term=input.value.trim().toLocaleLowerCase(),count=0;cards.forEach(function(card){var match=card.dataset.projectSearch.toLocaleLowerCase().includes(term)&&(state.value==="all"||(state.value==="open"&&Number(card.dataset.open)>0)||(state.value==="inbox"&&Number(card.dataset.inbox)>0));card.hidden=!match;if(match)count++;});document.getElementById("project-filter-empty").hidden=count!==0;document.getElementById("project-result-count").textContent=term||state.value!=="all"?{{ i18n.js_two("web-project-filter-summary", "{shown}", "{total}")|safe }}.replace("{shown}",count).replace("{total}",cards.length):"";}input.addEventListener("input",filter);state.addEventListener("change",filter);filter();})();
 (function(){
-  var KEY="ai-memory-pinned-projects",buttons=Array.from(document.querySelectorAll("button.project-pin[data-pin-key]"));
-  if(!buttons.length)return;
-  function read(){
-    if(window.aiMemoryPinnedProjects)return window.aiMemoryPinnedProjects();
-    try{var raw=JSON.parse(localStorage.getItem(KEY)||"[]");return Array.isArray(raw)?raw.filter(function(v){return typeof v==="string";}):[];}catch(_){return [];}
-  }
-  function write(list){
-    if(window.aiMemorySetPinnedProjects){window.aiMemorySetPinnedProjects(list);return;}
-    try{localStorage.setItem(KEY,JSON.stringify(list));}catch(_){}
-  }
+  var buttons=Array.from(document.querySelectorAll("button.project-pin[data-pin-key]")),pop=document.getElementById("pin-popover");
+  if(!buttons.length||!pop)return;
+  var title=document.getElementById("pin-popover-title"),save=document.getElementById("pin-popover-save"),unpin=document.getElementById("pin-popover-unpin"),cancel=document.getElementById("pin-popover-cancel");
+  var iconButtons=Array.from(pop.querySelectorAll("[data-pin-icon]")),colorButtons=Array.from(pop.querySelectorAll("[data-pin-color]"));
+  var opener=null,choice={icon:"folder",color:"#0c786a"};
+  function pins(){return window.aiMemoryPinnedProjectEntries?window.aiMemoryPinnedProjectEntries():[];}
+  function find(list,key){for(var i=0;i<list.length;i++)if(list[i].key===key)return i;return -1;}
+  function store(list){if(window.aiMemorySetPinnedProjects)window.aiMemorySetPinnedProjects(list);}
   function sync(){
-    var pins=read();
+    var list=pins(),helpers=window.aiMemoryPinIcons;
     buttons.forEach(function(button){
-      var on=pins.indexOf(button.dataset.pinKey)>=0;
+      var at=find(list,button.dataset.pinKey),on=at>=0,pin=on?list[at]:null;
       button.setAttribute("aria-pressed",String(on));
-      button.firstElementChild.textContent=on?"★":"☆";
-      button.classList.toggle("text-teal-700",on);button.classList.toggle("dark:text-teal-300",on);
-      button.classList.toggle("text-slate-400",!on);button.classList.toggle("dark:text-slate-500",!on);
+      var label=on?button.dataset.labelPinned:button.dataset.labelUnpinned;
+      button.setAttribute("aria-label",label);button.title=label;
+      button.style.setProperty("--pin-color",on?pin.color:"");
+      if(helpers){
+        var svg=helpers.render(on?pin.icon:"star",18);
+        if(on){svg.setAttribute("fill","currentColor");svg.setAttribute("fill-opacity",".18");}
+        button.replaceChildren(svg);
+      }
     });
   }
-  buttons.forEach(function(button){button.addEventListener("click",function(){
-    var pins=read(),key=button.dataset.pinKey,at=pins.indexOf(key);
-    if(at>=0)pins.splice(at,1);else pins.push(key);
-    write(pins);sync();
-  });});
+  function paint(){
+    pop.style.setProperty("--pin-color",choice.color);
+    iconButtons.forEach(function(b){b.setAttribute("aria-pressed",String(b.dataset.pinIcon===choice.icon));});
+    colorButtons.forEach(function(b){b.setAttribute("aria-pressed",String(b.dataset.pinColor===choice.color));});
+  }
+  function place(){
+    if(!opener||pop.hidden)return;
+    var r=opener.getBoundingClientRect(),w=pop.offsetWidth,h=pop.offsetHeight,gap=6;
+    var left=Math.max(8,Math.min(r.right-w,window.innerWidth-w-8));
+    var top=r.bottom+gap;if(top+h>window.innerHeight-8&&r.top-gap-h>=8)top=r.top-gap-h;
+    pop.style.left=left+"px";pop.style.top=Math.max(8,top)+"px";
+  }
+  function close(restore){
+    if(pop.hidden)return;
+    pop.hidden=true;
+    if(opener){opener.setAttribute("aria-expanded","false");if(restore!==false)opener.focus();}
+    opener=null;
+  }
+  function open(button){
+    if(opener===button&&!pop.hidden){close();return;}
+    close(false);
+    var list=pins(),at=find(list,button.dataset.pinKey),defaults=(window.aiMemoryPinIcons&&window.aiMemoryPinIcons.defaults)||{icon:"folder",color:"#0c786a"};
+    choice=at>=0?{icon:list[at].icon,color:list[at].color}:{icon:defaults.icon,color:defaults.color};
+    opener=button;title.textContent=button.dataset.pinKey;
+    unpin.hidden=at<0;
+    save.textContent=at>=0?save.dataset.labelEdit:save.dataset.labelNew;
+    paint();
+    pop.hidden=false;button.setAttribute("aria-expanded","true");
+    place();
+    (pop.querySelector('[data-pin-icon][aria-pressed="true"]')||save).focus();
+  }
+  buttons.forEach(function(button){button.addEventListener("click",function(e){e.stopPropagation();open(button);});});
+  iconButtons.forEach(function(b){b.addEventListener("click",function(){choice.icon=b.dataset.pinIcon;paint();});});
+  colorButtons.forEach(function(b){b.addEventListener("click",function(){choice.color=b.dataset.pinColor;paint();});});
+  save.addEventListener("click",function(){
+    if(!opener)return;
+    var list=pins(),key=opener.dataset.pinKey,at=find(list,key),entry={key:key,icon:choice.icon,color:choice.color};
+    if(at>=0)list[at]=entry;else list.push(entry);
+    store(list);close();
+  });
+  unpin.addEventListener("click",function(){
+    if(!opener)return;
+    var list=pins(),at=find(list,opener.dataset.pinKey);
+    if(at>=0)list.splice(at,1);
+    store(list);close();
+  });
+  cancel.addEventListener("click",function(){close();});
+  pop.addEventListener("keydown",function(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();close();}});
+  document.addEventListener("click",function(e){if(!pop.hidden&&!pop.contains(e.target))close(false);});
+  window.addEventListener("resize",place);window.addEventListener("scroll",place,{passive:true});
   document.addEventListener("ai-memory-pins-changed",sync);
   // base.html defines the shared pin helpers after this page's content.
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",sync);else sync();

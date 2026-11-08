@@ -882,3 +882,83 @@ web-empty-workstreams-title = Ainda não há workstreams
 web-empty-workstreams-body = Inicie uma sessão com ai-memory run e o workstream dela aparece aqui, pronto para continuar em qualquer harness.
 web-empty-pending-title = Nada para revisar
 web-empty-pending-body = O ciclo de aprendizado não tem propostas aguardando. As novas edições de página que ele sugerir aparecerão aqui para aprovação.
+web-ui1-pin-dialog-label = Estilo do projeto fixado
+web-ui1-pin-edit = Alterar ou remover o projeto fixado { $value0 }/{ $value1 }
+web-ui1-pin-icon-legend = Ícone
+web-ui1-pin-color-legend = Cor
+web-ui1-pin-icon-folder = Pasta
+web-ui1-pin-icon-book = Livro
+web-ui1-pin-icon-bolt = Raio
+web-ui1-pin-icon-flask = Frasco
+web-ui1-pin-icon-shield = Escudo
+web-ui1-pin-icon-star = Estrela
+web-ui1-pin-icon-code = Código
+web-ui1-pin-icon-layers = Camadas
+web-ui1-pin-color-teal = Verde-azulado
+web-ui1-pin-color-cyan = Ciano
+web-ui1-pin-color-amber = Âmbar
+web-ui1-pin-color-rose = Rosa
+web-ui1-pin-color-violet = Violeta
+web-ui1-pin-color-slate = Ardósia
+web-ui1-pin-confirm = Fixar
+web-ui1-pin-save = Salvar
+web-ui1-unpin = Desafixar
+web-ui1-pin-cancel = Cancelar
+web-ui1-login-eyebrow = ACESSO
+web-ui1-login-brand-eyebrow = Contexto que permanece
+web-ui1-login-headline = Seus agentes lembram do que importa.
+web-ui1-login-subtext = Decisões, regras e sessões ficam num só lugar, entre um agente e outro.
+web-inbox2-eyebrow = MENSAGENS ENTRE PROJETOS
+web-inbox2-title = Caixa de entrada
+web-inbox2-new-message = Nova mensagem
+web-inbox2-chip-all = Todas
+web-inbox2-chip-pending = { $count } aguardando coleta
+web-inbox2-chip-claimed = { $count ->
+    [one] { $count } coletada
+   *[other] { $count } coletadas
+    }
+web-inbox2-chip-cancelled = { $count ->
+    [one] { $count } cancelada
+   *[other] { $count } canceladas
+    }
+web-inbox2-chip-editing = { $count } em edição
+web-inbox2-col-subject = Assunto
+web-inbox2-col-from = De
+web-inbox2-col-to = Para
+web-inbox2-col-state = Estado
+web-inbox2-selected = MENSAGEM SELECIONADA
+web-inbox2-from = De
+web-inbox2-to = Para
+web-inbox2-reply = Responder
+web-inbox2-close = Fechar nova mensagem
+web-inbox2-empty-title = Nada por aqui por enquanto
+web-inbox2-empty-body = Quando um projeto precisar de algo de outro, o pedido chega aqui para o próximo agente que consultar a caixa.
+web-inbox2-empty-filtered = Nenhuma mensagem neste estado na caixa selecionada. Escolha outro estado ou envie um novo pedido.
+web-inbox2-empty-sent = Este projeto ainda não enviou mensagens. Os pedidos que ele enviar a outros projetos aparecem aqui.
+web-inbox2-empty-action = Enviar a outro projeto
+web-ui3-health-eyebrow = Operação
+web-ui3-health-all-pass = Todas as verificações passam
+web-ui3-health-attention = Requer atenção
+web-ui3-health-ok = ok
+web-ui3-health-attention-count = { $count ->
+    [one] 1 verificação requer atenção
+   *[other] { $count } verificações requerem atenção
+    }
+web-ui3-ws-eyebrow = Trabalho entre harnesses
+web-ui3-ws-recent = Linhas de trabalho recentes
+web-ui3-ws-empty-run = Quando você iniciar uma tarefa com `ai-memory run`, ela aparece aqui e pode ser retomada por outro agente.
+web-ui3-ws-resume = Retomar
+web-ui3-ws-resume-none = Sem linha de trabalho ativa, não há o que retomar. Use a busca para achar uma sessão anterior.
+web-ui3-ws-search-sessions = Pesquisar na memória
+web-ui3-pending-title = Revisão de aprendizado
+web-ui3-pending-page-title = Revisão de aprendizado — ai-memory
+web-ui3-pending-empty-title = Nenhuma proposta pendente
+web-ui3-pending-empty-body = Quando as sessões revelarem uma regra ou decisão que vale guardar, ela aparece aqui para você aprovar ou rejeitar.
+web-ui3-graph-eyebrow = Links entre páginas
+web-ui3-graph-selected = Página selecionada
+web-ui3-graph-select-hint = Aponte ou foque um nó para ver a página dele aqui. Clique no nó para abri-la.
+web-ui3-graph-open = Abrir página
+web-ui3-graph-links = links
+web-ui3-graph-zoom-in = Aproximar
+web-ui3-graph-zoom-out = Afastar
+web-ui3-graph-centre = Centralizar

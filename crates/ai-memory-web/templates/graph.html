@@ -21,6 +21,7 @@
 {% endblock %}
 
 {% block content %}
+<div class="ui3-graph">
 {% if is_project %}
 <nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
   <a href="." class="hover:text-teal-600 dark:hover:text-teal-400">{{ i18n.text("web-home") }}</a>
@@ -39,7 +40,26 @@
 </nav>
 {% endif %}
 
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.label(heading) }}</h1>
+<style>
+  .ui3-graph h1{font-size:34px;line-height:1.15;font-weight:700;letter-spacing:-.02em;color:var(--dash-text);margin-bottom:6px}
+  .ui3-graph .ui3-eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;color:var(--dash-accent);margin-bottom:4px}
+  .ui3-graph .ui3-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin-bottom:40px}
+  @media (min-width:1024px){.ui3-graph .ui3-layout{grid-template-columns:minmax(0,1fr) 300px}}
+  .ui3-graph .ui3-canvas{position:relative;border:1px solid var(--dash-line);border-radius:14px;overflow:hidden;box-shadow:var(--dash-shadow);background-color:var(--dash-surface);background-image:radial-gradient(var(--dash-line) 1px,transparent 1.2px);background-size:22px 22px}
+  .ui3-graph .ui3-canvas svg{display:block;width:100%;height:auto;max-height:78vh;color:var(--dash-text)}
+  .ui3-graph .ui3-tools{position:absolute;left:14px;bottom:14px;display:flex;gap:6px}
+  .ui3-graph .ui3-tools button{min-width:34px;height:32px;padding:0 10px;font-size:13px;color:var(--dash-muted);background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:8px;cursor:pointer}
+  .ui3-graph .ui3-tools button:hover{color:var(--dash-accent);background:var(--dash-accent-soft)}
+  .ui3-graph .ui3-panel{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:14px;padding:18px;box-shadow:var(--dash-shadow);display:flex;flex-direction:column;gap:12px;align-self:start;min-width:0}
+  .ui3-graph .ui3-panel h2{font-size:17px;font-weight:700;color:var(--dash-text);overflow-wrap:anywhere}
+  .ui3-graph .ui3-panel code{font-size:12px;color:var(--dash-muted);overflow-wrap:anywhere}
+  .ui3-graph .ui3-panel p{font-size:13px;line-height:1.6;color:var(--dash-muted)}
+  .ui3-graph .ui3-chip{display:inline-flex;align-self:flex-start;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:600;color:var(--dash-accent);background:var(--dash-accent-soft)}
+  .ui3-graph .ui3-panel a{font-size:13px;font-weight:600;color:var(--dash-accent)}
+  .ui3-graph #graph-svg a:focus circle,.ui3-graph #graph-svg a:hover circle,.ui3-graph #graph-svg a[data-selected] circle{stroke:var(--dash-text);stroke-width:3}
+</style>
+<p class="ui3-eyebrow">{{ i18n.text("web-ui3-graph-eyebrow") }}</p>
+<h1>{{ i18n.label(heading) }}</h1>
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.label(blurb) }}</p>
 
 {% if truncated %}
@@ -62,7 +82,9 @@
   {% endif %}
 </div>
 {% else %}
-<svg id="graph-svg" viewBox="0 0 800 800" class="w-full max-w-3xl mx-auto mb-10 text-slate-700 dark:text-slate-200" role="img" aria-labelledby="graph-heading">
+<div class="ui3-layout">
+<div class="ui3-canvas">
+<svg id="graph-svg" viewBox="0 0 800 800" role="img" aria-labelledby="graph-heading">
   <title id="graph-heading">{{ i18n.label(heading) }}</title>
   {% for edge in svg_edges %}
   <line x1="{{ edge.x1 }}" y1="{{ edge.y1 }}" x2="{{ edge.x2 }}" y2="{{ edge.y2 }}" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.5" />
@@ -77,10 +99,63 @@
   </a>
   {% endfor %}
 </svg>
+<div class="ui3-tools" id="graph-tools" hidden>
+  <button type="button" data-zoom="0.8" aria-label="{{ i18n.text("web-ui3-graph-zoom-in") }}">+</button>
+  <button type="button" data-zoom="1.25" aria-label="{{ i18n.text("web-ui3-graph-zoom-out") }}">−</button>
+  <button type="button" data-zoom="0">{{ i18n.text("web-ui3-graph-centre") }}</button>
+</div>
+</div>
+<aside class="ui3-panel" aria-live="polite" aria-labelledby="graph-panel-label">
+  <p id="graph-panel-label" class="ui3-eyebrow">{{ i18n.text("web-ui3-graph-selected") }}</p>
+  <div id="graph-panel-empty"><p>{{ i18n.text("web-ui3-graph-select-hint") }}</p></div>
+  <div id="graph-panel-body" class="flex flex-col gap-3" hidden>
+    <h2 id="graph-panel-title"></h2>
+    <code id="graph-panel-path"></code>
+    <span id="graph-panel-links" class="ui3-chip" hidden></span>
+    <a id="graph-panel-open" href="#">{{ i18n.text("web-ui3-graph-open") }} →</a>
+  </div>
+</aside>
+</div>
 {% if !graph_data.is_empty() %}
 <script type="application/json" id="graph-data">{{ graph_data|safe }}</script>
 <script>{% include "_graph_force.html" %}</script>
 {% endif %}
+<script>
+(function () {
+  var svg = document.getElementById("graph-svg"), tools = document.getElementById("graph-tools");
+  if (!svg) { return; }
+  var byHref = Object.create(null), holder = document.getElementById("graph-data");
+  try { JSON.parse(holder ? holder.textContent : "{}").nodes.forEach(function (d) { byHref[d.href] = d; }); } catch (e) {}
+  var linksLabel = {{ i18n.js("web-ui3-graph-links")|safe }}, current = null;
+  function pick(link) {
+    if (!link || link === current) { return; }
+    if (current) { current.removeAttribute("data-selected"); }
+    current = link; link.setAttribute("data-selected", "");
+    var href = link.getAttribute("href"), d = byHref[href], t = link.querySelector("title");
+    document.getElementById("graph-panel-title").textContent = d ? d.label : (t ? t.textContent : href);
+    document.getElementById("graph-panel-path").textContent = d ? d.id : (t ? t.textContent : "");
+    var chip = document.getElementById("graph-panel-links");
+    chip.hidden = !d; if (d) { chip.textContent = d.degree + " " + linksLabel; }
+    document.getElementById("graph-panel-open").setAttribute("href", href);
+    document.getElementById("graph-panel-empty").hidden = true;
+    document.getElementById("graph-panel-body").hidden = false;
+  }
+  ["mouseover", "focusin"].forEach(function (type) {
+    svg.addEventListener(type, function (e) { pick(e.target.closest && e.target.closest("a")); });
+  });
+  var box = [0, 0, 800, 800];
+  tools.hidden = false;
+  tools.addEventListener("click", function (e) {
+    var f = parseFloat(e.target.getAttribute("data-zoom"));
+    if (isNaN(f)) { return; }
+    if (f === 0) { box = [0, 0, 800, 800]; } else {
+      var w = Math.min(1600, Math.max(100, box[2] * f)), cx = box[0] + box[2] / 2, cy = box[1] + box[3] / 2;
+      box = [cx - w / 2, cy - w / 2, w, w];
+    }
+    svg.setAttribute("viewBox", box.join(" "));
+  });
+})();
+</script>
 {% endif %}
 
 <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-edges") }}</h2>
@@ -106,4 +181,5 @@
   </table>
 </div>
 {% endif %}
+</div>
 {% endblock %}

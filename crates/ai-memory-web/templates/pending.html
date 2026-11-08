@@ -1,12 +1,22 @@
 {% extends "base.html" %}
 
-{% block title %}{{ i18n.text("web-pending-writes-ai-memory") }}{% endblock %}
+{% block title %}{{ i18n.text("web-ui3-pending-page-title") }}{% endblock %}
 
 {% block nav_pending_current %}aria-current="page"{% endblock %}
 
 {% block content %}
+<style>
+  .ui3-pending h1{font-size:34px;line-height:1.15;font-weight:700;letter-spacing:-.02em;color:var(--dash-text)}
+  .ui3-pending .ui3-eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;color:var(--dash-accent);margin-bottom:4px}
+  .ui3-pending .ui3-empty{background:var(--dash-surface);border:1px solid var(--dash-line);border-radius:16px;box-shadow:var(--dash-shadow);display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;padding:40px 20px}
+  .ui3-pending .ui3-empty svg{max-width:100%;height:auto}
+  .ui3-pending .ui3-empty h2{font-size:22px;font-weight:700;color:var(--dash-text)}
+  .ui3-pending .ui3-empty p{font-size:15px;line-height:1.6;color:var(--dash-muted);max-width:460px}
+</style>
+<div class="ui3-pending">
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-pending-writes") }}</h1>
+  <p class="ui3-eyebrow">{{ i18n.text("web-pending-writes") }}</p>
+  <h1>{{ i18n.text("web-ui3-pending-title") }}</h1>
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">
     {{ i18n.text("web-auto-improvement-proposals-that-wait-for-a-decision-open-a-proposal-to-read-it-then-a") }}
   </p>
@@ -46,11 +56,19 @@
 <p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
 
 {% if rows.is_empty() %}
-<div class="empty-state" data-pending-empty>
-  <span aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28" fill="none" stroke="#0c786a" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="6" width="22" height="20" rx="3"></rect><path d="M11 16.5l3.5 3.5 7-7"></path></svg></span>
-  <h2>{{ i18n.text("web-empty-pending-title") }}</h2>
-  <p>{{ i18n.text("web-no-pending-proposals") }}</p>
-  <p>{{ i18n.text("web-empty-pending-body") }}</p>
+<div class="ui3-empty" data-pending-empty>
+  <svg width="260" height="160" viewBox="0 0 260 160" aria-hidden="true">
+    <ellipse cx="130" cy="148" rx="106" ry="8" style="fill:var(--dash-accent-soft)"/>
+    <rect x="60" y="30" width="140" height="100" rx="14" stroke-width="1.5" style="fill:var(--dash-surface);stroke:var(--dash-line)"/>
+    <rect x="78" y="52" width="60" height="7" rx="3.5" style="fill:var(--dash-line)"/>
+    <rect x="78" y="68" width="104" height="5" rx="2.5" style="fill:var(--dash-soft)"/>
+    <rect x="78" y="80" width="88" height="5" rx="2.5" style="fill:var(--dash-soft)"/>
+    <circle cx="196" cy="40" r="20" stroke-width="1.6" style="fill:var(--dash-accent-soft);stroke:var(--dash-accent)"/>
+    <path d="M188 40 l6 6 l11 -12" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="stroke:var(--dash-accent)"/>
+    <path d="M40 112 q20 -12 40 0 t40 0" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 5" style="stroke:var(--dash-muted)"/>
+  </svg>
+  <h2>{{ i18n.text("web-ui3-pending-empty-title") }}</h2>
+  <p>{{ i18n.text("web-ui3-pending-empty-body") }}</p>
 </div>
 {% else %}
 <ul id="pending-list" class="space-y-3">
@@ -129,6 +147,7 @@
   {% endfor %}
 </ul>
 {% endif %}
+</div>
 
 <script>
 (function () {

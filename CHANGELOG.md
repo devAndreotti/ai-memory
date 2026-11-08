@@ -36,6 +36,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- Form controls (inputs, selects, textareas) use the top-bar search box style.
+- Pinned projects take an icon and a colour, chosen in a small dialog.
+- The agent inbox has a table, status chips and a selected-message panel; a new
+  message opens in a drawer.
+- The login page is standalone (no application sidebar or top bar) with a brand panel.
+- Health is shown as cards; the learning review, workstreams, graph, search and
+  documentation pages have the new layouts and empty states.
 - Blue action colours in the web UI are now the teal brand accent.
 - The login page has a theme switch, a show/hide password button, autofocus,
   and no application header.

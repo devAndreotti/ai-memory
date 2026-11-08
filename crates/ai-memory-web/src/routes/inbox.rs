@@ -3,7 +3,7 @@
 use crate::{
     state::WebState,
     templates::{agent_label, encode_segment, project_href},
-    views::{InboxView, MessageRow, RecipientOption, ScopeOption},
+    views::{InboxView, MessageRow, RecipientOption, ScopeOption, StateChip},
 };
 use ai_memory_core::{
     ActorContext, AgentKind, AuthLevel, Capability, MessageBox, MessageState, NewAgentMessage,
@@ -171,6 +171,58 @@ pub(crate) async fn handler(
         },
         _ => 0,
     };
+    // Per-state totals for the filter chips. Each count is capped so a large
+    // mailbox costs at most one bounded page per state; the chip then reads "100+".
+    const CHIP_CAP: usize = 100;
+    let (pending_rows, claimed_rows, cancelled_rows) = match &scope {
+        Some(scope) => {
+            let count = |s| {
+                state.reader.message_history_filtered(
+                    scope.workspace_id,
+                    scope.project_id,
+                    mailbox,
+                    Some(s),
+                    CHIP_CAP,
+                    0,
+                )
+            };
+            match tokio::try_join!(
+                count(MessageState::Pending),
+                count(MessageState::Claimed),
+                count(MessageState::Cancelled),
+            ) {
+                Ok((p, c, x)) => (p.len(), c.len(), x.len()),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        None => (0, 0, 0),
+    };
+    let chip_base = mailbox_href(&workspace, &project, !inbox, 0);
+    let current_state = message_state.map_or("", |s| s.as_str());
+    let chip = |key: &str, value: &str, n: usize| StateChip {
+        label: if n >= CHIP_CAP {
+            i18n.count(key, format!("{CHIP_CAP}+"))
+        } else {
+            i18n.count(key, n)
+        },
+        href: format!("{chip_base}&state={value}"),
+        selected: current_state == value,
+        state: value.into(),
+    };
+    let mut state_chips = vec![
+        StateChip {
+            label: i18n.text("web-inbox2-chip-all"),
+            href: format!("{chip_base}&state="),
+            selected: current_state.is_empty(),
+            state: String::new(),
+        },
+        chip("web-inbox2-chip-pending", "pending", pending_rows),
+        chip("web-inbox2-chip-claimed", "claimed", claimed_rows),
+        chip("web-inbox2-chip-cancelled", "cancelled", cancelled_rows),
+    ];
+    if inbox && (editing_count > 0 || current_state == "editing") {
+        state_chips.push(chip("web-inbox2-chip-editing", "editing", editing_count));
+    }
     let rows = messages
         .into_iter()
         .map(|m| {
@@ -240,6 +292,7 @@ pub(crate) async fn handler(
         pending_projects: scopes.iter().filter(|s| s.pending > 0).count(),
         scopes,
         editing_count,
+        state_chips,
         editing_href: format!(
             "{}&state=editing",
             mailbox_href(&workspace, &project, false, 0)
