@@ -18086,7 +18086,9 @@ pub(crate) mod tests {
         // on a pre-V26 database, not just V28 applied in isolation.
         let mut conn = Connection::open(&db_path).unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        crate::migrations::run_to(&mut conn, 28).unwrap();
+        // No fork, V28 é a migração de auditoria; quem acrescenta `devin` ao CHECK de sessions é a V30
+        // (a que também recria a tabela com a lista completa de agentes). A checagem vale depois da V30.
+        crate::migrations::run_to(&mut conn, 30).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         // Era-appropriate raw insert (see `seed_historical_session`):

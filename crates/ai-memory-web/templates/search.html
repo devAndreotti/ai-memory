@@ -171,8 +171,6 @@
 <h2 class="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-search-group-content") }} <span class="rounded-full bg-slate-100 dark:bg-slate-800 px-2 py-0.5 font-mono normal-case text-slate-600 dark:text-slate-300">{{ hit_count }}</span></h2>
 {% if truncated %}
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ i18n.one("web-search-first-results", max_results) }}</p>
-{% else %}
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</p>
 {% endif %}
 <ul class="ui3-hits">
   {% for hit in hits %}

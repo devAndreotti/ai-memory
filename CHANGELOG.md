@@ -25,6 +25,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - A command palette opens with Ctrl+K or Cmd+K and lists projects and navigation items.
 - Projects can be pinned from the home page; pinned projects appear in the sidebar.
 - Search results are grouped into Projects, Paths and Text matches.
+- Search snippets show no markdown syntax.
 - The sidebar uses SVG icons. Health and Workstreams are shown only to administrators,
   and the top bar has a button that opens the command palette.
 

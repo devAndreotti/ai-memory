@@ -469,13 +469,34 @@ pub fn highlighted_snippet_html(snippet: &str) -> String {
         let Some(close) = after.find(FTS_HIGHLIGHT_END) else {
             break;
         };
-        push_html_escaped(&mut out, &rest[..at]);
+        push_html_escaped(&mut out, &strip_markdown_marks(&rest[..at]));
         out.push_str("<mark>");
-        push_html_escaped(&mut out, &after[..close]);
+        push_html_escaped(&mut out, &strip_markdown_marks(&after[..close]));
         out.push_str("</mark>");
         rest = &after[close + FTS_HIGHLIGHT_END.len()..];
     }
-    push_html_escaped(&mut out, rest);
+    push_html_escaped(&mut out, &strip_markdown_marks(rest));
+    out
+}
+
+/// Tira a sintaxe de markdown de um trecho para exibição: negrito, código, links `[[..]]` e marcas de título.
+/// O texto da página não muda; só os marcadores que não fazem sentido numa lista de resultados.
+#[must_use]
+pub fn strip_markdown_marks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+        let body = if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+            &trimmed[hashes + 1..]
+        } else {
+            line
+        };
+        out.push_str(&body.replace("**", "").replace("__", "").replace('`', "").replace("[[", "").replace("]]", ""));
+    }
     out
 }
 
@@ -16750,6 +16771,18 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snippet_drops_markdown_but_keeps_highlights() {
+        let raw = "# O que é\n**Contexto:** a \u{1e}memória\u{1f} precisa de [[pagina]] e `codigo`";
+        let html = super::highlighted_snippet_html(raw);
+        assert!(!html.contains("**"), "{html}");
+        assert!(!html.contains("[["), "{html}");
+        assert!(!html.contains('`'), "{html}");
+        assert!(html.contains("O que é"), "{html}");
+        assert!(html.contains("<mark>memória</mark>"), "{html}");
+        assert_eq!(super::strip_markdown_marks("snake_case_name"), "snake_case_name");
+    }
+
 
     #[tokio::test]
     async fn answer_evidence_metadata_uses_session_time_only_in_the_same_scope() {
